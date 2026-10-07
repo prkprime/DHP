@@ -105,6 +105,41 @@ class EclipseMatEquivalenceParityTest {
         var obj = reader.read(sampleObjectId, snapshot);
         assertThat(obj).isNotNull();
         assertThat(obj.getObjectId()).isEqualTo(sampleObjectId);
+
+        // Find a string instance or primitive array to verify binary payload decoding
+        int charArrayId = -1;
+        int stringId = -1;
+        for (int i = 0; i < Math.min(1000, objectCount); i++) {
+            IClass cls = (IClass) snapshot.getClassOf(i);
+            if (cls != null) {
+                if ("char[]".equals(cls.getName()) && charArrayId == -1) {
+                    charArrayId = i;
+                }
+                if ("java.lang.String".equals(cls.getName()) && stringId == -1) {
+                    stringId = i;
+                }
+            }
+            if (charArrayId != -1 && stringId != -1) break;
+        }
+
+        if (stringId != -1) {
+            var stringObj = reader.read(stringId, snapshot);
+            assertThat(stringObj).isNotNull();
+            assertThat(stringObj).isInstanceOf(org.eclipse.mat.snapshot.model.IInstance.class);
+            var instance = (org.eclipse.mat.snapshot.model.IInstance) stringObj;
+            assertThat(instance.getFields()).isNotEmpty();
+        }
+
+        if (charArrayId != -1) {
+            var arrayObj = reader.read(charArrayId, snapshot);
+            assertThat(arrayObj).isInstanceOf(org.eclipse.mat.parser.model.PrimitiveArrayImpl.class);
+            var primArray = (org.eclipse.mat.parser.model.PrimitiveArrayImpl) arrayObj;
+            if (primArray.getLength() > 0) {
+                Object chars = reader.readPrimitiveArrayContent(primArray, 0, Math.min(5, primArray.getLength()));
+                assertThat(chars).isNotNull();
+                assertThat(chars).isInstanceOf(char[].class);
+            }
+        }
         reader.close();
     }
 }

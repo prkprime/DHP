@@ -54,6 +54,54 @@ public class DhpHeapObjectReader implements IObjectReader {
             return new InstanceImpl(objectId, address, null, Collections.emptyList());
         }
 
+        // Retrieve file position index if available
+        LongLookup posLookup = (LongLookup) snapshot.getSnapshotInfo().getProperty("dhp.o2pos");
+        long filePos = 0L;
+        if (posLookup != null) {
+            try {
+                filePos = posLookup.get(objectId);
+            } catch (Exception ignored) {}
+        }
+
+        // If object is an array, return PrimitiveArrayImpl or ObjectArrayImpl with file offset
+        if (targetClass.isArrayType()) {
+            ClassImpl cImpl = (ClassImpl) targetClass;
+            String name = cImpl.getName();
+            int primType = -1;
+            for (int i = 0; i < IPrimitiveArray.TYPE.length; i++) {
+                if (IPrimitiveArray.TYPE[i].equals(name)) {
+                    primType = i;
+                    break;
+                }
+            }
+
+            if (primType >= 0) {
+                // Primitive array: header is [id: idSize][serial: 4][size: 4][type: 1]
+                int arrayLen = 0;
+                long dataPos = 0;
+                if (raf != null && filePos > 0) {
+                    raf.seek(filePos + 1 + idSize + 4);
+                    arrayLen = raf.readInt();
+                    dataPos = filePos + 1 + idSize + 4 + 4 + 1;
+                }
+                PrimitiveArrayImpl arr = new PrimitiveArrayImpl(objectId, address, cImpl, arrayLen, primType);
+                arr.setInfo(dataPos);
+                return arr;
+            } else {
+                // Object array: header is [id: idSize][serial: 4][size: 4][classId: idSize]
+                int arrayLen = 0;
+                long dataPos = 0;
+                if (raf != null && filePos > 0) {
+                    raf.seek(filePos + 1 + idSize + 4);
+                    arrayLen = raf.readInt();
+                    dataPos = filePos + 1 + idSize + 4 + 4 + idSize;
+                }
+                ObjectArrayImpl arr = new ObjectArrayImpl(objectId, address, cImpl, arrayLen);
+                arr.setInfo(dataPos);
+                return arr;
+            }
+        }
+
         // If no file stream available (or synthetic object), return shallow instance
         if (raf == null || address == 0) {
             ClassImpl cImpl = (ClassImpl) targetClass;
@@ -62,19 +110,29 @@ public class DhpHeapObjectReader implements IObjectReader {
                     : new InstanceImpl(objectId, address, cImpl, Collections.emptyList());
         }
 
-        // Seek to instance data using snapshot's index or fallback
         // Class hierarchy in top-down order (Object -> SuperClass -> Class)
         List<IClass> hierarchy = resolveClassHierarchy(snapshot, targetClass);
         Collections.reverse(hierarchy); // Now base classes first, target class last
 
         List<Field> instanceFields = new ArrayList<>();
-        // Note: In typical MAT usage, InstanceImpl.readFully() invokes read(objectId, snapshot)
-        // If file position lookup is available, we read fields sequentially:
-        for (IClass cls : hierarchy) {
-            for (FieldDescriptor fd : cls.getFieldDescriptors()) {
-                int type = fd.getType();
-                Object val = readDefaultOrMockValue(type, snapshot);
-                instanceFields.add(new Field(fd.getName(), type, val));
+        if (raf != null && filePos > 0) {
+            // Seek past INSTANCE_DUMP header: [id: idSize][serial: 4][classId: idSize][bytesFollowing: 4]
+            // Note: filePos was recorded at segment start tag, so segment tag byte + header
+            raf.seek(filePos + 1 + idSize + 4 + idSize + 4);
+            for (IClass cls : hierarchy) {
+                for (FieldDescriptor fd : cls.getFieldDescriptors()) {
+                    int type = fd.getType();
+                    Object val = readBinaryValue(type, snapshot);
+                    instanceFields.add(new Field(fd.getName(), type, val));
+                }
+            }
+        } else {
+            for (IClass cls : hierarchy) {
+                for (FieldDescriptor fd : cls.getFieldDescriptors()) {
+                    int type = fd.getType();
+                    Object val = readDefaultOrMockValue(type, snapshot);
+                    instanceFields.add(new Field(fd.getName(), type, val));
+                }
             }
         }
 
@@ -84,6 +142,29 @@ public class DhpHeapObjectReader implements IObjectReader {
         } else {
             return new InstanceImpl(objectId, address, classImpl, instanceFields);
         }
+    }
+
+    private Object readBinaryValue(int type, ISnapshot snapshot) throws IOException {
+        return switch (type) {
+            case IObject.Type.OBJECT -> {
+                long id = (idSize == 4) ? (raf.readInt() & 0xFFFFFFFFL) : raf.readLong();
+                yield id == 0 ? null : new ObjectReference(snapshot, id);
+            }
+            case IObject.Type.BOOLEAN -> raf.readByte() != 0;
+            case IObject.Type.BYTE -> raf.readByte();
+            case IObject.Type.CHAR -> raf.readChar();
+            case IObject.Type.SHORT -> raf.readShort();
+            case IObject.Type.INT -> raf.readInt();
+            case IObject.Type.LONG -> raf.readLong();
+            case IObject.Type.FLOAT -> raf.readFloat();
+            case IObject.Type.DOUBLE -> raf.readDouble();
+            default -> null;
+        };
+    }
+
+    @FunctionalInterface
+    public interface LongLookup extends java.io.Serializable {
+        long get(int id) throws Exception;
     }
 
     private List<IClass> resolveClassHierarchy(ISnapshot snapshot, IClass clazz) throws SnapshotException {
@@ -123,20 +204,25 @@ public class DhpHeapObjectReader implements IObjectReader {
             return result;
         }
 
-        // If array info has file position offline descriptor, read bytes
-        byte[] buffer = new byte[length * elementSize];
-        // Populate typed array
-        int idx = 0;
-        for (int i = 0; i < length; i++) {
-            switch (type) {
-                case IObject.Type.BOOLEAN -> Array.set(result, i, false);
-                case IObject.Type.BYTE -> Array.set(result, i, (byte) 0);
-                case IObject.Type.CHAR -> Array.set(result, i, ' ');
-                case IObject.Type.SHORT -> Array.set(result, i, (short) 0);
-                case IObject.Type.INT -> Array.set(result, i, 0);
-                case IObject.Type.LONG -> Array.set(result, i, 0L);
-                case IObject.Type.FLOAT -> Array.set(result, i, 0.0f);
-                case IObject.Type.DOUBLE -> Array.set(result, i, 0.0d);
+        Object info = array.getInfo();
+        if (info instanceof Long filePos && filePos > 0) {
+            long dataOffset = filePos + ((long) offset * elementSize);
+            raf.seek(dataOffset);
+            byte[] buffer = new byte[length * elementSize];
+            raf.readFully(buffer);
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(buffer).order(java.nio.ByteOrder.BIG_ENDIAN);
+
+            for (int i = 0; i < length; i++) {
+                switch (type) {
+                    case IObject.Type.BOOLEAN -> Array.set(result, i, bb.get() != 0);
+                    case IObject.Type.BYTE -> Array.set(result, i, bb.get());
+                    case IObject.Type.CHAR -> Array.set(result, i, bb.getChar());
+                    case IObject.Type.SHORT -> Array.set(result, i, bb.getShort());
+                    case IObject.Type.INT -> Array.set(result, i, bb.getInt());
+                    case IObject.Type.LONG -> Array.set(result, i, bb.getLong());
+                    case IObject.Type.FLOAT -> Array.set(result, i, bb.getFloat());
+                    case IObject.Type.DOUBLE -> Array.set(result, i, bb.getDouble());
+                }
             }
         }
         return result;
@@ -145,7 +231,20 @@ public class DhpHeapObjectReader implements IObjectReader {
     @Override
     public synchronized long[] readObjectArrayContent(ObjectArrayImpl array, int offset, int length)
             throws IOException, SnapshotException {
-        return new long[length];
+        long[] result = new long[length];
+        if (raf == null || length == 0) {
+            return result;
+        }
+
+        Object info = array.getInfo();
+        if (info instanceof Long filePos && filePos > 0) {
+            long dataOffset = filePos + ((long) offset * idSize);
+            raf.seek(dataOffset);
+            for (int i = 0; i < length; i++) {
+                result[i] = (idSize == 4) ? (raf.readInt() & 0xFFFFFFFFL) : raf.readLong();
+            }
+        }
+        return result;
     }
 
     @Override

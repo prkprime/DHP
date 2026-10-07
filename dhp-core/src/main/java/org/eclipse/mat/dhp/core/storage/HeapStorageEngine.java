@@ -36,6 +36,7 @@ public interface HeapStorageEngine extends Closeable {
     int getObjectIdByAddress(long address) throws SQLException;
     long getObjectClassId(int objectId) throws SQLException;
     long getObjectUsedSize(int objectId) throws SQLException;
+    default long getTotalHeapSize() throws SQLException { return 0L; }
     long getObjectFilePosition(int objectId) throws SQLException;
 
     int[] getOutboundReferences(int objectId) throws SQLException;

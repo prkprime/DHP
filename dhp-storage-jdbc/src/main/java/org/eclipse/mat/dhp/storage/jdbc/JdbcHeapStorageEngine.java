@@ -391,6 +391,17 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     @Override
+    public long getTotalHeapSize() throws SQLException {
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT coalesce(sum(used_size), 0) FROM dhp_objects")) {
+            if (rs.next()) {
+                return rs.getLong(1);
+            }
+        }
+        return 0L;
+    }
+
+    @Override
     public long getObjectFilePosition(int objectId) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement("SELECT file_position FROM dhp_objects WHERE object_id = ?")) {
             ps.setInt(1, objectId);

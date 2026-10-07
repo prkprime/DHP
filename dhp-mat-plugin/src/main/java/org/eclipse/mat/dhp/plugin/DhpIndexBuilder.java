@@ -17,6 +17,7 @@ import org.eclipse.mat.parser.IIndexBuilder;
 import org.eclipse.mat.parser.IPreliminaryIndex;
 import org.eclipse.mat.parser.model.ClassImpl;
 import org.eclipse.mat.parser.model.XGCRootInfo;
+import org.eclipse.mat.parser.model.XSnapshotInfo;
 import org.eclipse.mat.snapshot.model.Field;
 import org.eclipse.mat.snapshot.model.FieldDescriptor;
 import org.eclipse.mat.snapshot.model.GCRootInfo;
@@ -120,6 +121,7 @@ public class DhpIndexBuilder implements IIndexBuilder {
                 );
                 if (classObjId >= 0) {
                     classImpl.setObjectId(classObjId);
+                    classImpl.setHeapSizePerInstance(cls.instanceSize());
                     int superClassObjId = cls.superClassId() != 0 ? storage.getObjectIdByAddress(cls.superClassId()) : -1;
                     int classLoaderObjId = storage.getObjectIdByAddress(cls.classLoaderId());
                     if (superClassObjId >= 0) classImpl.setSuperClassIndex(superClassObjId);
@@ -192,6 +194,22 @@ public class DhpIndexBuilder implements IIndexBuilder {
                     objectCount,
                     storage::getObjectUsedSize
             ));
+
+            // 7. Update SnapshotInfo metadata
+            XSnapshotInfo info = preliminaryIndex.getSnapshotInfo();
+            if (info != null) {
+                info.setNumberOfObjects(objectCount);
+                info.setNumberOfClasses(classesById.size());
+                info.setNumberOfGCRoots(gcRootsMap.size());
+                try {
+                    String idSizeStr = storage.getSnapshotInfo("idSize");
+                    if (idSizeStr != null) {
+                        info.setIdentifierSize(Integer.parseInt(idSizeStr));
+                    }
+                    info.setUsedHeapSize(storage.getTotalHeapSize());
+                } catch (Exception ignored) {}
+                info.setProperty("dhp.o2pos", (DhpHeapObjectReader.LongLookup & java.io.Serializable) storage::getObjectFilePosition);
+            }
 
             log.info("DHP Preliminary Indexes successfully populated for Eclipse MAT.");
         } catch (SQLException e) {
