@@ -118,6 +118,13 @@ public class DuplicateRecordHandlingTest {
         segDos.writeInt(4);
         segDos.writeInt(0x9000);
 
+        // Referenced target object at 0x9000
+        segDos.writeByte(HprofConstants.DumpSegment.INSTANCE_DUMP);
+        segDos.writeInt(0x9000);
+        segDos.writeInt(0);
+        segDos.writeInt(100);
+        segDos.writeInt(0);
+
         byte[] segBytes = segBaos.toByteArray();
         dos.writeByte(HprofConstants.Record.HEAP_DUMP_SEGMENT);
         dos.writeInt(0);

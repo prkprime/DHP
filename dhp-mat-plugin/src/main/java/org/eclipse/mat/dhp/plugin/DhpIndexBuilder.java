@@ -104,6 +104,17 @@ public class DhpIndexBuilder implements IIndexBuilder {
             // 1. Classes
             HashMapIntObject<ClassImpl> classesById = new HashMapIntObject<>();
             var allClasses = storage.getAllClasses();
+            var classStats = storage.getClassStats();
+
+            java.lang.reflect.Field countField = null;
+            java.lang.reflect.Field totalSizeField = null;
+            try {
+                countField = ClassImpl.class.getDeclaredField("instanceCount");
+                countField.setAccessible(true);
+                totalSizeField = ClassImpl.class.getDeclaredField("totalSize");
+                totalSizeField.setAccessible(true);
+            } catch (Exception ignored) {}
+
             for (HeapRecords.ClassRecord cls : allClasses) {
                 int classObjId = storage.getObjectIdByAddress(cls.classId());
                 FieldDescriptor[] fields = new FieldDescriptor[cls.fields().size()];
@@ -122,10 +133,20 @@ public class DhpIndexBuilder implements IIndexBuilder {
                 if (classObjId >= 0) {
                     classImpl.setObjectId(classObjId);
                     classImpl.setHeapSizePerInstance(cls.instanceSize());
+                    classImpl.setUsedHeapSize(storage.getObjectUsedSize(classObjId));
+                    classImpl.setCacheEntry(classObjId);
                     int superClassObjId = cls.superClassId() != 0 ? storage.getObjectIdByAddress(cls.superClassId()) : -1;
                     int classLoaderObjId = storage.getObjectIdByAddress(cls.classLoaderId());
                     if (superClassObjId >= 0) classImpl.setSuperClassIndex(superClassObjId);
                     if (classLoaderObjId >= 0) classImpl.setClassLoaderIndex(classLoaderObjId);
+
+                    var stat = classStats.get(classObjId);
+                    if (stat != null && countField != null && totalSizeField != null) {
+                        try {
+                            countField.setInt(classImpl, stat.instanceCount());
+                            totalSizeField.setLong(classImpl, stat.totalSize());
+                        } catch (Exception ignored) {}
+                    }
                     classesById.put(classObjId, classImpl);
                 } else {
                     log.warn("Class not found in storage: classId={}, name={}, classObjId={}", 
@@ -220,6 +241,10 @@ public class DhpIndexBuilder implements IIndexBuilder {
     @Override
     public void clean(int[] purgedMapping, IProgressListener listener) throws IOException {
         log.info("GarbageCleaner cleaned reachable object set.");
+    }
+
+    public HeapStorageEngine getStorage() {
+        return storage;
     }
 
     @Override

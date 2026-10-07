@@ -50,6 +50,14 @@ public interface HeapStorageEngine extends Closeable {
     long getRetainedSize(int objectId) throws SQLException;
     int[] getImmediateDominatedIds(int objectId) throws SQLException;
 
+    // Bulk graph & class instance queries
+    default boolean isArray(int objectId) throws SQLException { return false; }
+    default boolean[] getAllArrayFlags(int objectCount) throws SQLException { return new boolean[objectCount]; }
+    default int[][] loadAllOutboundReferences(int objectCount) throws SQLException { return new int[objectCount][0]; }
+    default long[] loadAllObjectUsedSizes(int objectCount) throws SQLException { return new long[objectCount]; }
+    default int[] getObjectsByClassId(int classObjId) throws SQLException { return new int[0]; }
+    default java.util.Map<Integer, ClassStats> getClassStats() throws SQLException { return java.util.Collections.emptyMap(); }
+
     record RawObjectRecord(
             int objectId,
             long objectAddress,
@@ -69,5 +77,11 @@ public interface HeapStorageEngine extends Closeable {
             int objectId,
             int dominatorId,
             long retainedSize
+    ) {}
+
+    record ClassStats(
+            int classObjId,
+            int instanceCount,
+            long totalSize
     ) {}
 }

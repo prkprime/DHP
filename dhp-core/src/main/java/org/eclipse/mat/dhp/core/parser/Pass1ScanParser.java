@@ -1,5 +1,6 @@
 package org.eclipse.mat.dhp.core.parser;
 
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import org.eclipse.mat.dhp.core.model.HeapRecords;
 import org.eclipse.mat.dhp.core.model.HprofConstants;
 import org.slf4j.Logger;
@@ -28,6 +29,7 @@ public class Pass1ScanParser {
     private final Map<Long, Long> classSerialNumberToId = new HashMap<>();
     private final Map<Long, Long> classIdToNameId = new HashMap<>();
     private final Map<Long, HeapRecords.ClassRecord> classes = new HashMap<>();
+    private final LongArrayList objectAddresses = new LongArrayList();
     private final List<HeapRecords.GcRootRecord> gcRoots = new ArrayList<>();
     private final Map<Long, Long> classToSuperClass = new HashMap<>();
 
@@ -114,6 +116,9 @@ public class Pass1ScanParser {
                 ));
             }
         }
+
+        // Recalculate runtime instance sizes with exact header + field alignment (MAT parity)
+        calculateRuntimeInstanceSizes(header.idSize());
 
         log.info("Pass 1 Completed: Parsed {} strings, {} classes, {} GC roots",
                 strings.size(), classes.size(), gcRoots.size());
@@ -231,6 +236,7 @@ public class Pass1ScanParser {
                 }
                 case HprofConstants.DumpSegment.INSTANCE_DUMP -> {
                     long objAddr = reader.readId();
+                    objectAddresses.add(objAddr);
                     reader.skipBytes(4); // stack trace
                     long classId = reader.readId();
                     int bytesFollow = reader.readInt();
@@ -238,6 +244,7 @@ public class Pass1ScanParser {
                 }
                 case HprofConstants.DumpSegment.OBJECT_ARRAY_DUMP -> {
                     long objAddr = reader.readId();
+                    objectAddresses.add(objAddr);
                     reader.skipBytes(4); // stack trace
                     int arrayLength = reader.readInt();
                     long elementClassId = reader.readId();
@@ -245,6 +252,7 @@ public class Pass1ScanParser {
                 }
                 case HprofConstants.DumpSegment.PRIMITIVE_ARRAY_DUMP -> {
                     long objAddr = reader.readId();
+                    objectAddresses.add(objAddr);
                     reader.skipBytes(4); // stack trace
                     int arrayLength = reader.readInt();
                     int elementType = reader.readByte();
@@ -254,6 +262,10 @@ public class Pass1ScanParser {
                 default -> throw new IOException("Unknown dump segment type: " + subTag + " at position " + reader.getPosition());
             }
         }
+    }
+
+    public LongArrayList getObjectAddresses() {
+        return objectAddresses;
     }
 
     public HeapRecords.Header getHeader() {
@@ -331,5 +343,71 @@ public class Pass1ScanParser {
             }
         }
         return 0L;
+    }
+
+    private void calculateRuntimeInstanceSizes(int idSize) {
+        int pointerSize = idSize;
+        int refSize = idSize;
+        int objectAlign = 8;
+
+        Map<Long, Integer> calculatedSizes = new HashMap<>();
+        for (HeapRecords.ClassRecord cls : new ArrayList<>(classes.values())) {
+            int size = calculateInstanceSize(cls, pointerSize, refSize, objectAlign, calculatedSizes);
+            classes.put(cls.classId(), new HeapRecords.ClassRecord(
+                    cls.classId(),
+                    cls.superClassId(),
+                    cls.classLoaderId(),
+                    cls.name(),
+                    size,
+                    cls.fields(),
+                    cls.staticFields()
+            ));
+        }
+    }
+
+    private int calculateInstanceSize(HeapRecords.ClassRecord cls, int pointerSize, int refSize, int objectAlign, Map<Long, Integer> cache) {
+        if (cls.name().endsWith("[]")) {
+            return refSize;
+        }
+        if (cache.containsKey(cls.classId())) {
+            return cache.get(cls.classId());
+        }
+        int unaligned = calculateSizeRecursive(cls, pointerSize, refSize, cache);
+        int aligned = alignUpToX(unaligned, objectAlign);
+        cache.put(cls.classId(), aligned);
+        return aligned;
+    }
+
+    private int calculateSizeRecursive(HeapRecords.ClassRecord cls, int pointerSize, int refSize, Map<Long, Integer> cache) {
+        if (cls.superClassId() == 0L) {
+            return pointerSize + refSize; // Object header: mark word + klass pointer
+        }
+        HeapRecords.ClassRecord superClass = classes.get(cls.superClassId());
+        int ownFieldsSize = 0;
+        for (HeapRecords.FieldDescriptor field : cls.fields()) {
+            ownFieldsSize += sizeOfField(field.type(), refSize);
+        }
+        int superSize = (superClass != null && superClass.classId() != cls.classId())
+                ? calculateSizeRecursive(superClass, pointerSize, refSize, cache)
+                : (pointerSize + refSize);
+        return alignUpToX(ownFieldsSize + superSize, refSize);
+    }
+
+    private static int sizeOfField(int type, int refSize) {
+        if (type == HprofConstants.Type.OBJECT) {
+            return refSize;
+        }
+        return switch (type) {
+            case HprofConstants.Type.BOOLEAN, HprofConstants.Type.BYTE -> 1;
+            case HprofConstants.Type.CHAR, HprofConstants.Type.SHORT -> 2;
+            case HprofConstants.Type.FLOAT, HprofConstants.Type.INT -> 4;
+            case HprofConstants.Type.DOUBLE, HprofConstants.Type.LONG -> 8;
+            default -> refSize;
+        };
+    }
+
+    private static int alignUpToX(int n, int x) {
+        int r = n % x;
+        return r == 0 ? n : n + x - r;
     }
 }

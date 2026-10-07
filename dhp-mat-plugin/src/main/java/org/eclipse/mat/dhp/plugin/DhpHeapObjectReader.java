@@ -69,7 +69,7 @@ public class DhpHeapObjectReader implements IObjectReader {
             String name = cImpl.getName();
             int primType = -1;
             for (int i = 0; i < IPrimitiveArray.TYPE.length; i++) {
-                if (IPrimitiveArray.TYPE[i].equals(name)) {
+                if (name.equals(IPrimitiveArray.TYPE[i])) {
                     primType = i;
                     break;
                 }

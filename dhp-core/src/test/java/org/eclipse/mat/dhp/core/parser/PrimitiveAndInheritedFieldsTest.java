@@ -162,6 +162,19 @@ class PrimitiveAndInheritedFieldsTest {
         segDos.writeDouble(2.71828); // double
         segDos.writeInt(0x9000); // baseRef -> 0x9000
 
+        // INSTANCE_DUMPs for referenced target objects 0x9000 and 0x9001
+        segDos.writeByte(HprofConstants.DumpSegment.INSTANCE_DUMP);
+        segDos.writeInt(0x9000);
+        segDos.writeInt(0);
+        segDos.writeInt(100);
+        segDos.writeInt(0);
+
+        segDos.writeByte(HprofConstants.DumpSegment.INSTANCE_DUMP);
+        segDos.writeInt(0x9001);
+        segDos.writeInt(0);
+        segDos.writeInt(100);
+        segDos.writeInt(0);
+
         byte[] segBytes = segBaos.toByteArray();
         dos.writeByte(HprofConstants.Record.HEAP_DUMP_SEGMENT);
         dos.writeInt(0); // timeStamp

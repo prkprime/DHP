@@ -94,8 +94,13 @@ class EclipseMatEquivalenceParityTest {
                         int classId = preliminary.object2classId.get((Integer) args[0]);
                         return preliminary.classesById.get(classId);
                     }
+                    if ("isClassLoader".equals(name)) return false;
+                    if ("isArray".equals(name)) return false;
                     if ("getGCRoots".equals(name)) return preliminary.gcRoots.getAllKeys();
                     if ("getOutboundReferrers".equals(name)) return preliminary.outbound.get((Integer) args[0]);
+                    if (method.getReturnType().equals(boolean.class)) return false;
+                    if (method.getReturnType().equals(int.class)) return 0;
+                    if (method.getReturnType().equals(long.class)) return 0L;
                     return null;
                 }
         );

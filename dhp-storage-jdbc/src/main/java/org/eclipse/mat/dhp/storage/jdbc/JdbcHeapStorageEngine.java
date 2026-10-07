@@ -15,7 +15,9 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * High-performance JDBC storage engine supporting SQLite and PostgreSQL
@@ -119,7 +121,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     "super_class_id BIGINT, " +
                     "class_loader_id BIGINT, " +
                     "class_name VARCHAR(1024) NOT NULL, " +
-                    "instance_size INT NOT NULL" +
+                    "instance_size INT NOT NULL, " +
+                    "fields_data TEXT" +
                     ");");
 
             // Bulk ingestion tables: NO PRIMARY KEYS or secondary indexes upfront
@@ -190,8 +193,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public void saveClasses(Collection<HeapRecords.ClassRecord> classes) throws SQLException {
         String sql = isPostgres
-                ? "INSERT INTO dhp_classes(class_id, super_class_id, class_loader_id, class_name, instance_size) VALUES(?, ?, ?, ?, ?) ON CONFLICT (class_id) DO NOTHING"
-                : "INSERT OR REPLACE INTO dhp_classes(class_id, super_class_id, class_loader_id, class_name, instance_size) VALUES(?, ?, ?, ?, ?)";
+                ? "INSERT INTO dhp_classes(class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT (class_id) DO NOTHING"
+                : "INSERT OR REPLACE INTO dhp_classes(class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data) VALUES(?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             for (HeapRecords.ClassRecord cls : classes) {
                 ps.setLong(1, cls.classId());
@@ -199,6 +202,12 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                 ps.setLong(3, cls.classLoaderId());
                 ps.setString(4, cls.name());
                 ps.setInt(5, cls.instanceSize());
+                StringBuilder sb = new StringBuilder();
+                for (var f : cls.fields()) {
+                    if (!sb.isEmpty()) sb.append(';');
+                    sb.append(f.name()).append(':').append(f.type());
+                }
+                ps.setString(6, sb.toString());
                 ps.addBatch();
             }
             ps.executeBatch();
@@ -210,7 +219,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     public List<HeapRecords.ClassRecord> getAllClasses() throws SQLException {
         List<HeapRecords.ClassRecord> list = new ArrayList<>();
         try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size FROM dhp_classes")) {
+             ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data FROM dhp_classes")) {
             while (rs.next()) {
                 list.add(new HeapRecords.ClassRecord(
                         rs.getLong(1),
@@ -218,7 +227,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                         rs.getLong(3),
                         rs.getString(4),
                         rs.getInt(5),
-                        List.of(),
+                        parseFieldsData(rs.getString(6)),
                         List.of()
                 ));
             }
@@ -229,7 +238,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public HeapRecords.ClassRecord getClassById(long classId) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size FROM dhp_classes WHERE class_id = ?")) {
+                "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data FROM dhp_classes WHERE class_id = ?")) {
             ps.setLong(1, classId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
@@ -239,13 +248,31 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                             rs.getLong(3),
                             rs.getString(4),
                             rs.getInt(5),
-                            List.of(),
+                            parseFieldsData(rs.getString(6)),
                             List.of()
                     );
                 }
             }
         }
         return null;
+    }
+
+    private static List<HeapRecords.FieldDescriptor> parseFieldsData(String fieldsData) {
+        if (fieldsData == null || fieldsData.isEmpty()) {
+            return List.of();
+        }
+        List<HeapRecords.FieldDescriptor> list = new ArrayList<>();
+        for (String token : fieldsData.split(";")) {
+            int idx = token.lastIndexOf(':');
+            if (idx > 0) {
+                String fName = token.substring(0, idx);
+                try {
+                    int fType = Integer.parseInt(token.substring(idx + 1));
+                    list.add(new HeapRecords.FieldDescriptor(fName, fType));
+                } catch (NumberFormatException ignored) {}
+            }
+        }
+        return list;
     }
 
     @Override
@@ -508,6 +535,106 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             }
         }
         return list.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    @Override
+    public boolean isArray(int objectId) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement("SELECT is_array FROM dhp_objects WHERE object_id = ?")) {
+            ps.setInt(1, objectId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getInt(1) == 1;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public boolean[] getAllArrayFlags(int objectCount) throws SQLException {
+        boolean[] flags = new boolean[objectCount];
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT object_id FROM dhp_objects WHERE is_array = 1")) {
+            while (rs.next()) {
+                int id = rs.getInt(1);
+                if (id >= 0 && id < objectCount) {
+                    flags[id] = true;
+                }
+            }
+        }
+        return flags;
+    }
+
+    @Override
+    public int[][] loadAllOutboundReferences(int objectCount) throws SQLException {
+        int[][] outAdj = new int[objectCount][];
+        int[] counts = new int[objectCount];
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT from_object_id, count(*) FROM dhp_outbound_references GROUP BY from_object_id")) {
+            while (rs.next()) {
+                int from = rs.getInt(1);
+                if (from >= 0 && from < objectCount) {
+                    counts[from] = rs.getInt(2);
+                }
+            }
+        }
+        for (int i = 0; i < objectCount; i++) {
+            outAdj[i] = new int[counts[i]];
+        }
+        int[] pos = new int[objectCount];
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT from_object_id, to_object_id FROM dhp_outbound_references ORDER BY from_object_id, seq")) {
+            while (rs.next()) {
+                int from = rs.getInt(1);
+                int to = rs.getInt(2);
+                if (from >= 0 && from < objectCount && pos[from] < outAdj[from].length) {
+                    outAdj[from][pos[from]++] = to;
+                }
+            }
+        }
+        return outAdj;
+    }
+
+    @Override
+    public long[] loadAllObjectUsedSizes(int objectCount) throws SQLException {
+        long[] sizes = new long[objectCount];
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT object_id, used_size FROM dhp_objects")) {
+            while (rs.next()) {
+                int id = rs.getInt(1);
+                if (id >= 0 && id < objectCount) {
+                    sizes[id] = rs.getLong(2);
+                }
+            }
+        }
+        return sizes;
+    }
+
+    @Override
+    public int[] getObjectsByClassId(int classObjId) throws SQLException {
+        List<Integer> list = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement("SELECT object_id FROM dhp_objects WHERE class_id = ? ORDER BY object_id")) {
+            ps.setInt(1, classObjId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    list.add(rs.getInt(1));
+                }
+            }
+        }
+        return list.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    @Override
+    public Map<Integer, ClassStats> getClassStats() throws SQLException {
+        Map<Integer, ClassStats> map = new HashMap<>();
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT class_id, count(*), coalesce(sum(used_size), 0) FROM dhp_objects GROUP BY class_id")) {
+            while (rs.next()) {
+                int classId = rs.getInt(1);
+                int count = rs.getInt(2);
+                long total = rs.getLong(3);
+                map.put(classId, new ClassStats(classId, count, total));
+            }
+        }
+        return map;
     }
 
     @Override
