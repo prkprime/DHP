@@ -420,7 +420,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     public int[] getInboundReferences(int objectId) throws SQLException {
         List<Integer> list = new ArrayList<>();
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT from_object_id FROM dhp_inbound_references WHERE to_object_id = ? ORDER BY seq ASC")) {
+                "SELECT from_object_id FROM dhp_inbound_references WHERE to_object_id = ?")) {
             ps.setInt(1, objectId);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
