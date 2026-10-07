@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+   <extension
+         id="dhp"
+         name="Dynamic Heap Parser"
+         point="org.eclipse.mat.parser.parser">
+      <parser
+            name="Dynamic Heap Parser Database Format"
+            fileExtension="dhp,properties"
+            indexBuilder="org.eclipse.mat.dhp.plugin.DhpIndexBuilder"
+            objectReader="org.eclipse.mat.dhp.plugin.DhpHeapObjectReader">
+      </parser>
+   </extension>
+</plugin>

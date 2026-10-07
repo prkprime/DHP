@@ -1,0 +1,31 @@
+# Dynamic Heap Dump Parser (DHP) - Configuration Sample
+# Database Connection Properties
+
+# Example for SQLite (high-speed local embedded database)
+db.url=jdbc:sqlite:./target/dump.dhp.db
+db.user=
+db.password=
+
+# Example for PostgreSQL:
+# db.url=jdbc:postgresql://localhost:5432/heapdb
+# db.user=postgres
+# db.password=secret
+
+# Example for Oracle:
+# db.url=jdbc:oracle:thin:@localhost:1521:XE
+# db.user=mat_user
+# db.password=mat_secret
+
+# Example for Microsoft SQL Server:
+# db.url=jdbc:sqlserver://localhost:1433;databaseName=heapdb;encrypt=false
+# db.user=sa
+# db.password=SecretPassword123!
+
+# Target HPROF dump file to parse
+dump.file=/path/to/heapdump.hprof
+
+# Dynamic Memory budget for parser (e.g. 512M, 4G, 16G)
+memory.budget=4G
+
+# Number of worker threads
+worker.threads=8

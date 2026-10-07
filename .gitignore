@@ -1,0 +1,33 @@
+# Build output directories
+target/
+**/target/
+dependency-reduced-pom.xml
+
+# SQLite & Database storage files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Log files
+*.log
+
+# Java class files
+*.class
+
+# IDE & Editor configuration
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# Heap dump files
+*.hprof
+*.hprof.gz
+
+# OS files
+.DS_Store
+Thumbs.db
