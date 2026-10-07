@@ -59,6 +59,7 @@ public class Pass2ObjectIngester {
 
         int currentObjectId = 0;
         LongOpenHashSet writtenObjects = new LongOpenHashSet();
+        LongOpenHashSet processedClassDumps = new LongOpenHashSet();
 
         // 1. Pre-register system classloader at address 0
         int systemClassLoaderObjId = currentObjectId++;
@@ -150,13 +151,14 @@ public class Pass2ObjectIngester {
 
                                 int sfCount = reader.readUnsignedShort();
                                 int classObjId = addressToId.get(classId);
+                                boolean isFirstClassDump = processedClassDumps.add(classId);
                                 int edgeSeq = 0;
                                 for (int i = 0; i < sfCount; i++) {
                                     reader.skipBytes(idSize); // fieldNameId
                                     int t = reader.readByte();
                                     if (t == HprofConstants.Type.OBJECT) {
                                         long refAddr = reader.readId();
-                                        if (refAddr != 0 && classObjId != -1) {
+                                        if (refAddr != 0 && classObjId != -1 && isFirstClassDump) {
                                             int targetId;
                                             if (addressToId.containsKey(refAddr)) {
                                                 targetId = addressToId.get(refAddr);
@@ -192,17 +194,19 @@ public class Pass2ObjectIngester {
                                     addressToId.put(objAddr, objId);
                                 }
 
+                                if (alreadyWritten) {
+                                    continue;
+                                }
+
+                                writtenObjects.add(objAddr);
                                 int assignedClassId = addressToId.containsKey(classAddr)
                                         ? addressToId.get(classAddr)
                                         : (javaLangClassObjId != -1 ? javaLangClassObjId : 0);
 
                                 long usedSize = bytesFollow + (2L * idSize); // approximate header size
-                                if (!alreadyWritten) {
-                                    writtenObjects.add(objAddr);
-                                    objectBatch.add(new HeapStorageEngine.RawObjectRecord(
-                                            objId, objAddr, assignedClassId, usedSize, objPos, false
-                                    ));
-                                }
+                                objectBatch.add(new HeapStorageEngine.RawObjectRecord(
+                                        objId, objAddr, assignedClassId, usedSize, objPos, false
+                                ));
 
                                 int edgeSeq = 0;
                                 if (assignedClassId > 0) {
@@ -262,17 +266,20 @@ public class Pass2ObjectIngester {
                                     addressToId.put(objAddr, objId);
                                 }
 
+                                if (alreadyWritten) {
+                                    reader.skipBytes((long) arrayLength * idSize);
+                                    continue;
+                                }
+
+                                writtenObjects.add(objAddr);
                                 int assignedClassId = addressToId.containsKey(elementClassAddr)
                                         ? addressToId.get(elementClassAddr)
                                         : 0;
 
                                 long usedSize = (long) arrayLength * idSize + (3L * idSize);
-                                if (!alreadyWritten) {
-                                    writtenObjects.add(objAddr);
-                                    objectBatch.add(new HeapStorageEngine.RawObjectRecord(
-                                            objId, objAddr, assignedClassId, usedSize, objPos, true
-                                    ));
-                                }
+                                objectBatch.add(new HeapStorageEngine.RawObjectRecord(
+                                        objId, objAddr, assignedClassId, usedSize, objPos, true
+                                ));
 
                                 int edgeSeq = 0;
                                 if (assignedClassId > 0) {
@@ -322,18 +329,20 @@ public class Pass2ObjectIngester {
                                     addressToId.put(objAddr, objId);
                                 }
 
+                                if (alreadyWritten) {
+                                    continue;
+                                }
+
+                                writtenObjects.add(objAddr);
                                 long primClassAddr = pass1.getPrimitiveArrayClassId(elementType);
                                 int assignedClassId = addressToId.containsKey(primClassAddr)
                                         ? addressToId.get(primClassAddr)
                                         : 0;
 
                                 long usedSize = (long) arrayLength * elementSize + (3L * idSize);
-                                if (!alreadyWritten) {
-                                    writtenObjects.add(objAddr);
-                                    objectBatch.add(new HeapStorageEngine.RawObjectRecord(
-                                            objId, objAddr, assignedClassId, usedSize, objPos, true
-                                    ));
-                                }
+                                objectBatch.add(new HeapStorageEngine.RawObjectRecord(
+                                        objId, objAddr, assignedClassId, usedSize, objPos, true
+                                ));
 
                                 if (assignedClassId > 0) {
                                     edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, 0, assignedClassId));
