@@ -1,0 +1,21 @@
+# Notices for Dynamic Heap Parser (DHP)
+
+Dynamic Heap Parser (DHP) is licensed under the Eclipse Public License v. 2.0 (EPL-2.0).
+
+## Eclipse Memory Analyzer (MAT) Attribution
+
+This project incorporates and builds upon source code, algorithms, and parser structures from the **Eclipse Memory Analyzer (MAT)** project:
+* Project Web Site: https://www.eclipse.dev/mat
+* Source Repository: https://github.com/eclipse-mat/mat
+* License: Eclipse Public License v. 2.0 (EPL-2.0)
+* Copyright (c) 2008, 2026 SAP AG, IBM Corporation, and others.
+
+Eclipse Memory Analyzer, and Memory Analyzer are trademarks of the Eclipse Foundation.
+
+## Declared Project Licenses
+
+This program and the accompanying materials are made available under the terms
+of the Eclipse Public License v. 2.0 which is available at
+https://www.eclipse.org/legal/epl-2.0.
+
+SPDX-License-Identifier: EPL-2.0
