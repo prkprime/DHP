@@ -44,13 +44,18 @@ public class DhpHeapObjectReader implements IObjectReader {
             hprofPath = snapshot.getSnapshotInfo().getPath();
         }
         File file = new File(hprofPath);
-        if (file.exists() && (file.getName().endsWith(".properties") || file.getName().endsWith(".dhp"))) {
+        File baseDir = file.getParentFile();
+        if (file.exists() && file.getName().toLowerCase().endsWith(".dhp")) {
             try (FileInputStream fis = new FileInputStream(file)) {
                 Properties props = new Properties();
                 props.load(fis);
                 String dumpPath = props.getProperty("dump.file");
-                if (dumpPath != null) {
-                    file = new File(dumpPath);
+                if (dumpPath != null && !dumpPath.isBlank()) {
+                    File candidate = new File(dumpPath);
+                    if (!candidate.isAbsolute() && baseDir != null) {
+                        candidate = new File(baseDir, dumpPath);
+                    }
+                    file = candidate;
                 }
             } catch (Exception ignored) {}
         }
@@ -65,7 +70,7 @@ public class DhpHeapObjectReader implements IObjectReader {
         String jdbcUrl = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.url");
         String user = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.user");
         String pass = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.password");
-        if (jdbcUrl == null && (snapshot.getSnapshotInfo().getPath().endsWith(".properties") || snapshot.getSnapshotInfo().getPath().endsWith(".dhp"))) {
+        if (jdbcUrl == null && snapshot.getSnapshotInfo().getPath().toLowerCase().endsWith(".dhp")) {
             File propFile = new File(snapshot.getSnapshotInfo().getPath());
             if (propFile.exists()) {
                 try (FileInputStream fis = new FileInputStream(propFile)) {
@@ -78,9 +83,19 @@ public class DhpHeapObjectReader implements IObjectReader {
             }
         }
         if (jdbcUrl != null && !jdbcUrl.isEmpty()) {
+            if (jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
+                String sub = jdbcUrl.substring("jdbc:sqlite:".length());
+                File dbFile = new File(sub);
+                if (!dbFile.isAbsolute() && baseDir != null) {
+                    jdbcUrl = "jdbc:sqlite:" + new File(baseDir, sub).getAbsolutePath();
+                }
+            }
             try {
+                try {
+                    Class.forName("org.sqlite.JDBC");
+                } catch (ClassNotFoundException ignored) {}
                 this.dbConn = java.sql.DriverManager.getConnection(jdbcUrl, user != null ? user : "", pass != null ? pass : "");
-                this.psPos = dbConn.prepareStatement("SELECT file_position FROM dhp_objects WHERE object_address = ?");
+                this.psPos = dbConn.prepareStatement("SELECT file_position FROM dhp_objects WHERE object_id = ?");
                 System.out.println("[DHP-Reader] Successfully connected to database: " + jdbcUrl);
             } catch (Exception e) {
                 System.err.println("[DHP-Reader] Could not connect to database " + jdbcUrl + ": " + e.getMessage());
@@ -103,9 +118,9 @@ public class DhpHeapObjectReader implements IObjectReader {
             try {
                 filePos = posLookup.get(objectId);
             } catch (Exception ignored) {}
-        } else if (psPos != null && address != 0) {
+        } else if (psPos != null && objectId >= 0) {
             try {
-                psPos.setLong(1, address);
+                psPos.setInt(1, objectId);
                 try (java.sql.ResultSet rs = psPos.executeQuery()) {
                     if (rs.next()) {
                         filePos = rs.getLong(1);

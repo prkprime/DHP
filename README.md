@@ -67,34 +67,82 @@ DHP parses massive Java heap dumps (100GB+) without requiring hundreds of gigaby
 
 ---
 
-## Quick Start
+## Quick Start & Setup Scripts
+
+DHP provides cross-platform setup scripts for Linux, macOS, and Windows.
 
 ### Prerequisites
 
 - **Java**: JDK 21 or higher
 - **Maven**: 3.9+
+- **curl** and **unzip** / PowerShell
 
-### Build
+### 1. One-Step Automated Setup
 
+Run the master setup script to install local Eclipse MAT JARs, compile the reactor modules, download/configure Eclipse MAT, and install the DHP plugin:
+
+**Linux / macOS:**
 ```bash
 git clone https://github.com/prkprime/DHP.git
 cd DHP
-mvn clean install
+./scripts/setup-all.sh
 ```
 
-### CLI Usage
+**Windows:**
+```bat
+git clone https://github.com/prkprime/DHP.git
+cd DHP
+scripts\setup-all.bat
+```
 
-Parse an `.hprof` dump directly into an optimized SQLite database:
+### 2. Modular Convenience Scripts
 
+- **Install Local Dependencies to Maven**:
+  - Linux/macOS: `./scripts/setup-deps.sh`
+  - Windows: `scripts\setup-deps.bat`
+- **Setup Eclipse MAT Tooling**:
+  - Linux/macOS: `./scripts/setup-mat.sh [target_dir]`
+  - Windows: `scripts\setup-mat.bat` or `scripts\setup-mat.ps1`
+- **Install DHP Plugin into MAT**:
+  - Linux/macOS: `./scripts/install-mat-plugin.sh`
+  - Windows: `scripts\install-mat-plugin.bat`
+- **Install P2 Dependencies into MAT**:
+  - Linux/macOS: `./scripts/install-p2-dependency.sh <repository-url> <iu-id>`
+  - Windows: `scripts\install-p2-dependency.bat <repository-url> <iu-id>`
+- **Run Headless Analysis on `.dhp`**:
+  - Linux/macOS: `./scripts/run-mat-headless.sh <dump.dhp> [reports...]`
+  - Windows: `scripts\run-mat-headless.bat <dump.dhp> [reports...]`
+
+---
+
+## CLI Usage
+
+The standalone fat JAR is located at `dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar`.
+
+### CLI Options
+
+| Flag | Aliases | Description |
+| :--- | :--- | :--- |
+| `-d` | `--dump` | Path to the input `.hprof` heap dump file |
+| `-c` | `--config` | Path to DHP descriptor file (`.dhp`) |
+| `--db` | `--url`, `--db-url`, `--jdbcurl` | Database name or JDBC connection URL |
+| `-m` | `--memory`, `--memory-budget` | Memory budget (e.g. `512M`, `2G`, `4GB`, or raw bytes). Defaults to 75% of JVM `-Xmx` |
+| `-t` | `-w`, `--threads`, `--workers` | Worker threads count |
+| `--clean` | `--drop-existing` | Drop pre-existing DHP tables in target database before ingestion |
+| `--export-dhp` | | Path to export `.dhp` MAT descriptor (defaults to `<prefix>.dhp`) |
+
+### Examples
+
+**Parse directly into SQLite WAL database:**
 ```bash
 java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
   --dump /path/to/heapdump.hprof \
-  --db jdbc:sqlite:/path/to/heapdump.db \
-  --memory 2G
+  --url jdbc:sqlite:/path/to/heapdump.dhp.db \
+  --memory 2G \
+  --threads 4
 ```
 
-Or stream directly to a PostgreSQL database for multi-user analysis:
-
+**Stream to PostgreSQL:**
 ```bash
 java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
   --dump /path/to/heapdump.hprof \
@@ -103,6 +151,23 @@ java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
   --password secret \
   --memory 4G
 ```
+
+---
+
+## Opening in Eclipse Memory Analyzer (MAT)
+
+DHP registers **strictly the `.dhp` extension** in Eclipse MAT to bypass the legacy memory-intensive `.idx` file generation entirely.
+
+1. Ingest your dump using CLI:
+   ```bash
+   java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar -d /path/to/dump.hprof
+   # Generates /path/to/dump.dhp and /path/to/dump.dhp.db
+   ```
+2. Open `/path/to/dump.dhp` directly in Eclipse MAT GUI or run headlessly:
+   ```bash
+   ./scripts/run-mat-headless.sh /path/to/dump.dhp org.eclipse.mat.api:suspects
+   ```
+3. Eclipse MAT opens the snapshot immediately without re-parsing, using direct SQL queries against SQLite/PostgreSQL and generating reports with zero disk index files!
 
 ---
 

@@ -89,7 +89,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 log.info("Successfully hooked DhpSnapshotFactory into Eclipse MAT SnapshotFactory!");
             }
         } catch (Throwable t) {
-            log.error("Failed to install DhpSnapshotFactory into SnapshotFactory: {}", t.getMessage(), t);
+            log.debug("DhpSnapshotFactory hooking skipped or unavailable in current runtime: {}", t.getMessage());
         }
     }
 
@@ -99,16 +99,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
 
     private boolean isDhpFile(File file) {
         if (file == null) return false;
-        String name = file.getName().toLowerCase();
-        if (name.endsWith(".dhp")) return true;
-        if (name.endsWith(".properties")) {
-            try (FileInputStream fis = new FileInputStream(file)) {
-                Properties p = new Properties();
-                p.load(fis);
-                return p.containsKey("db.url") || p.containsKey("dump.file");
-            } catch (Exception ignored) {}
-        }
-        return false;
+        return file.getName().toLowerCase().endsWith(".dhp");
     }
 
     @Override
@@ -132,10 +123,24 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             String prefix = p >= 0 ? baseName.substring(0, p + 1) : baseName + ".";
 
             String jdbcUrl = props.getProperty("db.url", "jdbc:sqlite:" + prefix + "dhp.db");
+            if (jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
+                String sub = jdbcUrl.substring("jdbc:sqlite:".length());
+                File dbFile = new File(sub);
+                if (!dbFile.isAbsolute() && file.getParentFile() != null) {
+                    jdbcUrl = "jdbc:sqlite:" + new File(file.getParentFile(), sub).getAbsolutePath();
+                }
+            }
             String user = props.getProperty("db.user", "");
             String password = props.getProperty("db.password", "");
             String hprofPath = props.getProperty("dump.file");
-            File hprofFile = hprofPath != null ? new File(hprofPath) : null;
+            File hprofFile = null;
+            if (hprofPath != null && !hprofPath.isBlank()) {
+                File candidate = new File(hprofPath);
+                if (!candidate.isAbsolute() && file.getParentFile() != null) {
+                    candidate = new File(file.getParentFile(), hprofPath);
+                }
+                hprofFile = candidate;
+            }
             long memoryBudget = 1024 * 1024 * 1024L;
             String memStr = props.getProperty("memory.budget");
             if (memStr != null) {
@@ -258,6 +263,16 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             if (javaLangClass != null) {
                 for (int key : classesById.getAllKeys()) {
                     classesById.get(key).setClassInstance(javaLangClass);
+                }
+            }
+
+            for (int key : classesById.getAllKeys()) {
+                ClassImpl c = classesById.get(key);
+                if (c.getSuperClassId() >= 0) {
+                    ClassImpl superC = classesById.get(c.getSuperClassId());
+                    if (superC != null) {
+                        superC.addSubClass(c);
+                    }
                 }
             }
 
@@ -455,11 +470,13 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                     id -> -1
             ));
 
-            // Prevent writing i2sv2.index by providing RetainedSizeCache with /dev/null backed storage
+            // Prevent writing i2sv2.index by providing RetainedSizeCache with /dev/null or safe temp backed storage
             try {
                 Class<?> rscClass = loadParserClass("org.eclipse.mat.parser.internal.snapshot.RetainedSizeCache");
                 Constructor<?> rscCtor = rscClass.getConstructor(File.class);
-                Object rsc = rscCtor.newInstance(new File("/dev/null"));
+                File rscFile = new File("/dev/null").exists() ? new File("/dev/null") : File.createTempFile("dhp_rsc", ".tmp");
+                rscFile.deleteOnExit();
+                Object rsc = rscCtor.newInstance(rscFile);
                 indexManager.setReader(IndexManager.Index.I2RETAINED, (IIndexReader) rsc);
             } catch (Throwable t) {
                 log.warn("Could not instantiate RetainedSizeCache: {}", t.getMessage());
@@ -534,7 +551,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
     @Override
     public List<SnapshotFormat> getSupportedFormats() {
         List<SnapshotFormat> list = new ArrayList<>();
-        list.add(new SnapshotFormat("Dynamic Heap Parser (.dhp)", new String[] { "dhp", "properties" }));
+        list.add(new SnapshotFormat("Dynamic Heap Parser (.dhp)", new String[] { "dhp" }));
         if (delegate != null) {
             list.addAll(delegate.getSupportedFormats());
         }

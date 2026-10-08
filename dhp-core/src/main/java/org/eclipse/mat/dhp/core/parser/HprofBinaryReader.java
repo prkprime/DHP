@@ -32,7 +32,13 @@ public class HprofBinaryReader implements AutoCloseable {
         StringBuilder sb = new StringBuilder();
         int b;
         while ((b = readByte()) != 0) {
+            if (b == -1) {
+                throw new IOException("Unexpected end of file while reading HPROF header");
+            }
             sb.append((char) b);
+            if (sb.length() > 128) {
+                throw new IOException("Invalid HPROF header: magic string exceeded 128 characters: " + sb);
+            }
         }
         String version = sb.toString();
         this.idSize = readInt();

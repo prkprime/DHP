@@ -66,7 +66,7 @@ class EclipseMatGeneralSnapshotTestSuiteTest {
 
     private SnapshotContext openDhpSnapshot(File dumpFile, Path tempDir, String dbPrefix) throws Exception {
         File dbFile = tempDir.resolve(dbPrefix + ".db").toFile();
-        File configFile = tempDir.resolve(dbPrefix + ".properties").toFile();
+        File configFile = tempDir.resolve(dbPrefix + ".dhp").toFile();
 
         Properties props = new Properties();
         props.setProperty("db.url", "jdbc:sqlite:" + dbFile.getAbsolutePath());

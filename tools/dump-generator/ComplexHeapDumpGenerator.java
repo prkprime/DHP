@@ -254,35 +254,50 @@ public class ComplexHeapDumpGenerator {
             outputFile.delete();
         }
 
+        double scale = 1.0;
+        if (args.length >= 2) {
+            try {
+                scale = Double.parseDouble(args[1]);
+            } catch (Exception ignored) {}
+        } else if (System.getProperty("heap.dump.scale") != null) {
+            try {
+                scale = Double.parseDouble(System.getProperty("heap.dump.scale"));
+            } catch (Exception ignored) {}
+        }
+
         System.out.println("================================================================================");
         System.out.println("Complex HPROF Heap Dump Generator");
         System.out.println("Target Destination: " + outputFile.getAbsolutePath());
-        System.out.println("Target Size Bounds: 2.0 GB (min) to 3.0 GB (max)");
+        if (scale >= 1.0) {
+            System.out.println("Target Size Bounds: 2.0 GB (min) to 3.0 GB (max)");
+        } else {
+            System.out.println(String.format("Target Scaled Mode: scale = %.2f", scale));
+        }
         System.out.println("================================================================================");
 
         // 1. Build Subsystems with carefully calibrated allocations:
-        // Total byte payload = 650M + 550M + 450M + 350M + 250M = 2,250 MB (~2.20 GiB / 2.36 GB file)
-        System.out.println("[Step 1/5] Building CacheSubsystem (~650 MB)...");
-        CacheSubsystem cacheSubsystem = new CacheSubsystem(650L * 1024 * 1024);
-        for (int i = 0; i < 500; i++) {
+        System.out.println(String.format("[Step 1/5] Building CacheSubsystem (~%.0f MB)...", 650.0 * scale));
+        CacheSubsystem cacheSubsystem = new CacheSubsystem((long) (650L * 1024 * 1024 * scale));
+        int custCount = (int) (500 * Math.max(0.1, scale));
+        for (int i = 0; i < custCount; i++) {
             cacheSubsystem.customerCache.put("cust_" + i, new EnterpriseCustomer(i, "user_" + i, "Corp_" + i, 2048));
         }
         GC_ROOTS.add(cacheSubsystem);
 
-        System.out.println("[Step 2/5] Building ReportBufferPool (~550 MB)...");
-        ReportBufferPool reportPool = new ReportBufferPool(550L * 1024 * 1024);
+        System.out.println(String.format("[Step 2/5] Building ReportBufferPool (~%.0f MB)...", 550.0 * scale));
+        ReportBufferPool reportPool = new ReportBufferPool((long) (550L * 1024 * 1024 * scale));
         GC_ROOTS.add(reportPool);
 
-        System.out.println("[Step 3/5] Building ImageProcessingCache (~450 MB)...");
-        ImageProcessingCache imageCache = new ImageProcessingCache(450L * 1024 * 1024);
+        System.out.println(String.format("[Step 3/5] Building ImageProcessingCache (~%.0f MB)...", 450.0 * scale));
+        ImageProcessingCache imageCache = new ImageProcessingCache((long) (450L * 1024 * 1024 * scale));
         GC_ROOTS.add(imageCache);
 
-        System.out.println("[Step 4/5] Building TransactionJournal (~350 MB)...");
-        TransactionJournal journal = new TransactionJournal(350L * 1024 * 1024);
+        System.out.println(String.format("[Step 4/5] Building TransactionJournal (~%.0f MB)...", 350.0 * scale));
+        TransactionJournal journal = new TransactionJournal((long) (350L * 1024 * 1024 * scale));
         GC_ROOTS.add(journal);
 
-        System.out.println("[Step 5/5] Building SessionStore & Complex Topologies (~250 MB + graphs)...");
-        SessionStore sessionStore = new SessionStore(250L * 1024 * 1024);
+        System.out.println(String.format("[Step 5/5] Building SessionStore & Complex Topologies (~%.0f MB + graphs)...", 250.0 * scale));
+        SessionStore sessionStore = new SessionStore((long) (250L * 1024 * 1024 * scale));
 
         // Add 5,000 Customer Accounts with deep inheritance
         for (int i = 0; i < 5000; i++) {
@@ -368,17 +383,20 @@ public class ComplexHeapDumpGenerator {
         System.out.println(String.format("Dump Size: %d bytes (%.3f GB)", bytes, gigabytes));
         System.out.println("================================================================================");
 
-        // Assert strictly between 2.0 GB and 3.0 GB
-        long minBytes = 2L * 1024L * 1024L * 1024L;
-        long maxBytes = 3L * 1024L * 1024L * 1024L;
+        if (scale >= 1.0) {
+            long minBytes = 2L * 1024L * 1024L * 1024L;
+            long maxBytes = 3L * 1024L * 1024L * 1024L;
 
-        if (bytes < minBytes) {
-            throw new IllegalStateException(String.format("Generated heap dump is under 2 GB! Size = %.3f GB", gigabytes));
-        }
-        if (bytes > maxBytes) {
-            throw new IllegalStateException(String.format("Generated heap dump is over 3 GB! Size = %.3f GB", gigabytes));
-        }
+            if (bytes < minBytes) {
+                throw new IllegalStateException(String.format("Generated heap dump is under 2 GB! Size = %.3f GB", gigabytes));
+            }
+            if (bytes > maxBytes) {
+                throw new IllegalStateException(String.format("Generated heap dump is over 3 GB! Size = %.3f GB", gigabytes));
+            }
 
-        System.out.println("SUCCESS: Heap dump size is strictly within the 2.0 GB - 3.0 GB range!");
+            System.out.println("SUCCESS: Heap dump size is strictly within the 2.0 GB - 3.0 GB range!");
+        } else {
+            System.out.println(String.format("SUCCESS: Scaled heap dump generated successfully (scale = %.2f, size = %.3f GB)", scale, gigabytes));
+        }
     }
 }

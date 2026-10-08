@@ -17,10 +17,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 class DhpIndexBuilderTest {
 
     @Test
-    void testIndexBuilderWithPropertiesConfigFile(@TempDir Path tempDir) throws IOException, SnapshotException {
+    void testIndexBuilderWithDhpConfigFile(@TempDir Path tempDir) throws IOException, SnapshotException {
         File dumpFile = new File("/tmp/eclipse-mat/plugins/org.eclipse.mat.tests/dumps/sun_jdk6_18_x64.hprof");
         File dbFile = tempDir.resolve("mat_test.db").toFile();
-        File configFile = tempDir.resolve("dump.properties").toFile();
+        File configFile = tempDir.resolve("dump.dhp").toFile();
 
         Properties props = new Properties();
         props.setProperty("db.url", "jdbc:sqlite:" + dbFile.getAbsolutePath());

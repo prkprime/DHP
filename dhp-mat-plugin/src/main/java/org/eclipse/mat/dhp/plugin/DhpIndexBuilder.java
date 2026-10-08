@@ -56,8 +56,7 @@ public class DhpIndexBuilder implements IIndexBuilder {
     @Override
     public void fill(IPreliminaryIndex preliminaryIndex, IProgressListener listener) throws SnapshotException, IOException {
         try {
-            boolean isConfigFile = dumpOrConfigFile.getName().endsWith(".dhp") 
-                    || dumpOrConfigFile.getName().endsWith(".properties");
+            boolean isConfigFile = dumpOrConfigFile.getName().toLowerCase().endsWith(".dhp");
 
             String jdbcUrl;
             String user = "";
@@ -71,11 +70,28 @@ public class DhpIndexBuilder implements IIndexBuilder {
                     props.load(fis);
                 }
                 jdbcUrl = props.getProperty("db.url", "jdbc:sqlite:" + prefix + "dhp.db");
+                if (jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
+                    String sub = jdbcUrl.substring("jdbc:sqlite:".length());
+                    File dbFile = new File(sub);
+                    if (!dbFile.isAbsolute() && dumpOrConfigFile.getParentFile() != null) {
+                        jdbcUrl = "jdbc:sqlite:" + new File(dumpOrConfigFile.getParentFile(), sub).getAbsolutePath();
+                    }
+                }
                 user = props.getProperty("db.user", "");
                 password = props.getProperty("db.password", "");
                 String hprofPath = props.getProperty("dump.file");
-                if (hprofPath != null) {
-                    hprofFile = new File(hprofPath);
+                if (hprofPath != null && !hprofPath.isBlank()) {
+                    File candidate = new File(hprofPath);
+                    if (!candidate.isAbsolute() && dumpOrConfigFile.getParentFile() != null) {
+                        candidate = new File(dumpOrConfigFile.getParentFile(), hprofPath);
+                    }
+                    hprofFile = candidate;
+                }
+                String memStr = props.getProperty("memory.budget");
+                if (memStr != null && !memStr.isBlank()) {
+                    try {
+                        memoryBudget = Long.parseLong(memStr.trim());
+                    } catch (Exception ignored) {}
                 }
             } else {
                 hprofFile = dumpOrConfigFile;

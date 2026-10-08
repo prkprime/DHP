@@ -7,7 +7,7 @@
          point="org.eclipse.mat.parser.parser">
       <parser
             name="Dynamic Heap Parser (.dhp)"
-            fileExtension="dhp,properties"
+            fileExtension="dhp"
             indexBuilder="org.eclipse.mat.dhp.plugin.DhpIndexBuilder"
             objectReader="org.eclipse.mat.dhp.plugin.DhpHeapObjectReader">
          <contentTypeBinding contentTypeId="org.eclipse.mat.dhp.contentType"/>
@@ -18,8 +18,8 @@
        <content-type
            id="org.eclipse.mat.dhp.contentType"
            base-type="org.eclipse.mat.JavaHeapDump"
-           file-extensions="dhp,properties"
-           file-patterns="*.dhp,*.properties"
+           file-extensions="dhp"
+           file-patterns="*.dhp"
            name="Dynamic Heap Parser (.dhp)"
            priority="high"/>
    </extension>

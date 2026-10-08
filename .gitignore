@@ -36,4 +36,15 @@ Thumbs.db
 test-cases/
 workspace/
 tools/dump-generator/bin/
+tools/mat/
+generated/
+dumps/
+reports/
+*.dhp
+*.index
+*.threads
 *.zip
+*.tmp
+*Leak_Suspects/
+*Top_Components/
+*System_Overview/

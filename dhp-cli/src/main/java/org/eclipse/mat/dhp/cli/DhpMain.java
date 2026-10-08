@@ -37,23 +37,23 @@ public class DhpMain implements Callable<Integer> {
     @Option(names = {"-d", "--dump"}, description = "Path to the input .hprof heap dump file")
     private File dumpFile;
 
-    @Option(names = {"-c", "--config"}, description = "Path to database configuration descriptor file (.dhp or .properties)")
+    @Option(names = {"-c", "--config"}, description = "Path to DHP descriptor file (.dhp)")
     private File configFile;
 
     @Option(names = {"--export-dhp"}, description = "Path to export .dhp MAT descriptor file (defaults to <dumpPrefix>.dhp)")
     private File exportDhpFile;
 
-    @Option(names = {"--jdbcurl"}, description = "JDBC Connection URL (e.g., jdbc:sqlite:heap.db or jdbc:postgresql://localhost:5432/heapdb)")
+    @Option(names = {"--url", "--jdbcurl", "--db-url"}, description = "JDBC Connection URL (e.g., jdbc:sqlite:heap.db or jdbc:postgresql://localhost:5432/heapdb)")
     private String jdbcUrl;
 
-    @Option(names = {"--host"}, description = "Database host")
+    @Option(names = {"--host"}, description = "Database host (used when building PostgreSQL URL without --url)")
     private String host;
 
-    @Option(names = {"--port"}, description = "Database port")
+    @Option(names = {"--port"}, description = "Database port (defaults to 5432 for PostgreSQL)")
     private Integer port;
 
-    @Option(names = {"--db"}, description = "Database name")
-    private String databaseName;
+    @Option(names = {"--db"}, description = "Database name or JDBC connection URL")
+    private String databaseOption;
 
     @Option(names = {"-u", "--user"}, description = "Database username")
     private String user = "";
@@ -61,10 +61,10 @@ public class DhpMain implements Callable<Integer> {
     @Option(names = {"-p", "--password"}, description = "Database password")
     private String password = "";
 
-    @Option(names = {"-m", "--memory-budget"}, description = "Memory budget in bytes (e.g. 5368709120 for 5GB). Defaults to 75%% of JVM -Xmx")
-    private Long memoryBudget;
+    @Option(names = {"-m", "--memory", "--memory-budget"}, description = "Memory budget (e.g. 512M, 2G, 4GB, or raw bytes). Defaults to 75%% of JVM -Xmx")
+    private String memoryBudgetString;
 
-    @Option(names = {"-t", "--threads"}, description = "Worker threads count")
+    @Option(names = {"-t", "--threads", "-w", "--workers"}, description = "Worker threads count")
     private Integer threads;
 
     @Option(names = {"--clean", "--drop-existing"}, description = "Clean/drop existing DHP tables in target database before ingestion")
@@ -82,9 +82,21 @@ public class DhpMain implements Callable<Integer> {
         }
 
         if (jdbcUrl == null || jdbcUrl.isBlank()) {
-            if (host != null && databaseName != null) {
+            if (databaseOption != null && !databaseOption.isBlank()) {
+                if (databaseOption.startsWith("jdbc:")) {
+                    jdbcUrl = databaseOption;
+                } else if (host != null) {
+                    int p = port != null ? port : 5432;
+                    jdbcUrl = "jdbc:postgresql://" + host + ":" + p + "/" + databaseOption;
+                }
+            }
+        }
+
+        if (jdbcUrl == null || jdbcUrl.isBlank()) {
+            if (host != null) {
                 int p = port != null ? port : 5432;
-                jdbcUrl = "jdbc:postgresql://" + host + ":" + p + "/" + databaseName;
+                String dbName = databaseOption != null ? databaseOption : "heapdb";
+                jdbcUrl = "jdbc:postgresql://" + host + ":" + p + "/" + dbName;
             } else {
                 // Default to optimized SQLite database alongside the dump
                 String baseName = dumpFile.getAbsolutePath();
@@ -101,6 +113,11 @@ public class DhpMain implements Callable<Integer> {
         System.out.println("================================================================================");
 
         long start = System.currentTimeMillis();
+
+        Long memoryBudget = null;
+        if (memoryBudgetString != null && !memoryBudgetString.isBlank()) {
+            memoryBudget = parseMemoryString(memoryBudgetString);
+        }
 
         MemoryGovernor governor = new MemoryGovernor(memoryBudget, threads);
 
@@ -153,6 +170,7 @@ public class DhpMain implements Callable<Integer> {
                 if (password != null && !password.isEmpty()) p.setProperty("db.password", password);
                 p.setProperty("dump.file", dumpFile.getAbsolutePath());
                 if (memoryBudget != null) p.setProperty("memory.budget", String.valueOf(memoryBudget));
+                if (threads != null) p.setProperty("worker.threads", String.valueOf(threads));
                 try (java.io.FileOutputStream fos = new java.io.FileOutputStream(targetDhp)) {
                     p.store(fos, "Dynamic Heap Parser (DHP) Descriptor");
                     System.out.println("Exported MAT DHP descriptor: " + targetDhp.getAbsolutePath());
@@ -173,25 +191,65 @@ public class DhpMain implements Callable<Integer> {
         try (FileInputStream fis = new FileInputStream(file)) {
             props.load(fis);
         }
-        if (jdbcUrl == null) jdbcUrl = props.getProperty("db.url");
-        if (user == null || user.isEmpty()) user = props.getProperty("db.user", "");
-        if (password == null || password.isEmpty()) password = props.getProperty("db.password", "");
-        if (dumpFile == null && props.containsKey("dump.file")) {
-            dumpFile = new File(props.getProperty("dump.file"));
+        if (jdbcUrl == null) {
+            jdbcUrl = props.getProperty("db.url", props.getProperty("jdbcurl", props.getProperty("url", null)));
+            if (jdbcUrl != null && jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
+                String sub = jdbcUrl.substring("jdbc:sqlite:".length());
+                File dbf = new File(sub);
+                if (!dbf.isAbsolute() && file.getParentFile() != null) {
+                    jdbcUrl = "jdbc:sqlite:" + new File(file.getParentFile(), sub).getAbsolutePath();
+                }
+            }
         }
-        if (memoryBudget == null && props.containsKey("memory.budget")) {
-            memoryBudget = parseMemoryString(props.getProperty("memory.budget"));
+        if (user == null || user.isEmpty()) user = props.getProperty("db.user", props.getProperty("user", ""));
+        if (password == null || password.isEmpty()) password = props.getProperty("db.password", props.getProperty("password", ""));
+        if (dumpFile == null) {
+            String dumpPath = props.getProperty("dump.file", props.getProperty("dump", null));
+            if (dumpPath != null) {
+                File df = new File(dumpPath);
+                if (!df.isAbsolute() && file.getParentFile() != null) {
+                    df = new File(file.getParentFile(), dumpPath);
+                }
+                dumpFile = df;
+            }
+        }
+        if (memoryBudgetString == null) {
+            String mem = props.getProperty("memory.budget", props.getProperty("memory", null));
+            if (mem != null) {
+                memoryBudgetString = mem;
+            }
+        }
+        if (threads == null) {
+            String thr = props.getProperty("worker.threads", props.getProperty("threads", null));
+            if (thr != null) {
+                try {
+                    threads = Integer.parseInt(thr.trim());
+                } catch (NumberFormatException ignored) {}
+            }
         }
     }
 
-    private long parseMemoryString(String val) {
+    public static long parseMemoryString(String val) {
+        if (val == null || val.isBlank()) return 0L;
         val = val.trim().toUpperCase();
-        if (val.endsWith("G") || val.endsWith("GB")) {
-            return Long.parseLong(val.replaceAll("[^0-9]", "")) * 1024L * 1024L * 1024L;
-        } else if (val.endsWith("M") || val.endsWith("MB")) {
-            return Long.parseLong(val.replaceAll("[^0-9]", "")) * 1024L * 1024L;
+        long multiplier = 1L;
+        String numStr = val;
+        if (val.endsWith("GB") || val.endsWith("G")) {
+            multiplier = 1024L * 1024L * 1024L;
+            numStr = val.replaceAll("[^0-9.]", "");
+        } else if (val.endsWith("MB") || val.endsWith("M")) {
+            multiplier = 1024L * 1024L;
+            numStr = val.replaceAll("[^0-9.]", "");
+        } else if (val.endsWith("KB") || val.endsWith("K")) {
+            multiplier = 1024L;
+            numStr = val.replaceAll("[^0-9.]", "");
+        } else if (val.endsWith("B")) {
+            numStr = val.replaceAll("[^0-9.]", "");
         }
-        return Long.parseLong(val);
+        if (numStr.contains(".")) {
+            return (long) (Double.parseDouble(numStr) * multiplier);
+        }
+        return Long.parseLong(numStr) * multiplier;
     }
 
     public static void main(String[] args) {

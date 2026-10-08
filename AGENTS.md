@@ -102,15 +102,24 @@ To achieve constant memory usage and avoid intermediate lock contention during i
 ## 5. Eclipse MAT Plugin Integration
 
 ### File Extensions & Descriptors
-The plugin binds to `.dhp` and `.properties` extensions:
-- `.properties` or `.dhp` files serve as database descriptors pointing to the SQLite DB or PostgreSQL instance and the underlying `.hprof` file.
+The plugin binds **strictly to `.dhp` files**:
+- `.dhp` files serve as database descriptors pointing to the SQLite DB or PostgreSQL instance and the underlying `.hprof` file.
 - Example descriptor:
   ```properties
   db.url=jdbc:sqlite:/path/to/heapdump.dhp.db
   dump.file=/path/to/heapdump.hprof
   memory.budget=4G
   ```
-- If the database is not yet ingested, `DhpIndexBuilder` will ingest the `.hprof` into the database on the fly. If already ingested, it reuses the precomputed tables and dominator tree immediately.
+- If the database is not yet ingested, `DhpIndexBuilder` will ingest the `.hprof` into the database on the fly. If already ingested (via `dhp-cli`), it reuses the precomputed tables and dominator tree immediately without generating legacy MAT index files.
+
+### Automation & Tooling Scripts (`scripts/`)
+Cross-platform scripts (Linux, macOS, Windows) streamline installation and headless execution:
+- **`scripts/setup-all.sh` / `setup-all.bat`**: Master setup: installs local MAT dependencies to Maven, compiles the reactor, sets up Eclipse MAT, and installs the DHP bundle.
+- **`scripts/setup-deps.sh` / `setup-deps.bat`**: Installs `lib/*.jar` into the local Maven cache (`~/.m2`).
+- **`scripts/setup-mat.sh` / `setup-mat.bat` / `setup-mat.ps1`**: Sets up Eclipse MAT into `tools/mat/mat` (reusing local cache or downloading the official RCP release).
+- **`scripts/install-mat-plugin.sh` / `install-mat-plugin.bat`**: Deploys the built DHP shaded OSGi bundle to `MAT_HOME/plugins/`, registers it in `bundles.info`, and purges the OSGi cache.
+- **`scripts/install-p2-dependency.sh` / `install-p2-dependency.bat`**: Wrapper around `MemoryAnalyzer -application org.eclipse.equinox.p2.director` to install p2 update site features.
+- **`scripts/run-mat-headless.sh` / `run-mat-headless.bat`**: Headless report generation using `ParseHeapDump` against `.dhp` descriptor files.
 
 ### Object & Array Payload Reading
 `DhpHeapObjectReader` utilizes `RandomAccessFile` and indexed `file_position` from the database:
