@@ -199,12 +199,21 @@ public class Pass1ScanParser {
                     for (int i = 0; i < staticCount; i++) {
                         long fieldNameId = reader.readId();
                         int fieldType = reader.readByte();
-                        Object val = null;
-                        if (fieldType == HprofConstants.Type.OBJECT) {
-                            val = reader.readId();
-                        } else {
-                            reader.skipBytes(HprofConstants.Type.sizeOf(fieldType, idSize));
-                        }
+                        Object val = switch (fieldType) {
+                            case HprofConstants.Type.OBJECT -> reader.readId();
+                            case HprofConstants.Type.BOOLEAN -> reader.readBoolean();
+                            case HprofConstants.Type.CHAR -> reader.readChar();
+                            case HprofConstants.Type.FLOAT -> reader.readFloat();
+                            case HprofConstants.Type.DOUBLE -> reader.readDouble();
+                            case HprofConstants.Type.BYTE -> (byte) reader.readByte();
+                            case HprofConstants.Type.SHORT -> reader.readShort();
+                            case HprofConstants.Type.INT -> reader.readInt();
+                            case HprofConstants.Type.LONG -> reader.readLong();
+                            default -> {
+                                reader.skipBytes(HprofConstants.Type.sizeOf(fieldType, idSize));
+                                yield null;
+                            }
+                        };
                         String fieldName = strings.getOrDefault(fieldNameId, "field_" + fieldNameId);
                         staticFields.add(new HeapRecords.StaticFieldRecord(fieldName, fieldType, val));
                     }

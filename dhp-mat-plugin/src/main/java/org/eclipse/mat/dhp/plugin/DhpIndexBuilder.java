@@ -162,12 +162,21 @@ public class DhpIndexBuilder implements IIndexBuilder {
                 long superClassAddr = superClassObjId >= 0 ? cls.superClassId() : 0L;
                 long classLoaderAddr = cls.classLoaderId() != 0 ? cls.classLoaderId() : 0L;
 
+                List<Field> staticFields = new ArrayList<>();
+                for (var sf : cls.staticFields()) {
+                    Object val = sf.value();
+                    if (sf.type() == 2 && val instanceof Number n) {
+                        val = new org.eclipse.mat.snapshot.model.ObjectReference(null, n.longValue());
+                    }
+                    staticFields.add(new Field(sf.name(), sf.type(), val));
+                }
+
                 ClassImpl classImpl = new ClassImpl(
                         cls.classId(),
                         cls.name(),
                         superClassAddr,
                         classLoaderAddr,
-                        new Field[0],
+                        staticFields.toArray(new Field[0]),
                         fields
                 );
                 classImpl.setObjectId(classObjId);

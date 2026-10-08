@@ -8,8 +8,12 @@ on:
 
 jobs:
   build:
-    name: Build & Test (Java 21)
-    runs-on: ubuntu-latest
+    name: Build & Test (Java 21, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
 
     steps:
       - name: Checkout repository
@@ -22,5 +26,24 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      - name: Build with Maven
+      - name: Install Local Eclipse MAT Dependencies (Linux)
+        if: runner.os != 'Windows'
+        run: bash scripts/setup-deps.sh
+
+      - name: Install Local Eclipse MAT Dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: .\scripts\setup-deps.bat
+        shell: cmd
+
+      - name: Build & Test with Maven
         run: mvn -B clean verify --file pom.xml
+
+      - name: Upload Built Artifacts
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhp-binaries
+          path: |
+            dhp-cli/target/dhp-cli-*.jar
+            dhp-mat-plugin/target/dhp-mat-plugin-*.jar
+          if-no-files-found: error

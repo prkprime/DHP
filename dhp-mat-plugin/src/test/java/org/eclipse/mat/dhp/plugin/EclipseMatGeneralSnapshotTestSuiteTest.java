@@ -243,13 +243,31 @@ class EclipseMatGeneralSnapshotTestSuiteTest {
             int[] gcRoots = snapshot.getGCRoots();
             assertThat(gcRoots.length).isGreaterThan(100);
 
-            // 7. Verify String payload reading and field resolution
+            // 7. Verify String payload reading, field resolution, hierarchy, and static fields
             Collection<IClass> stringClasses = snapshot.getClassesByName("java.lang.String", false);
             assertNotNull(stringClasses);
             assertFalse(stringClasses.isEmpty());
             IClass strClass = stringClasses.iterator().next();
             int[] strIds = strClass.getObjectIds();
             assertThat(strIds.length).isGreaterThan(0);
+
+            // Verify Class Hierarchy on inspector/engine model
+            assertNotNull(strClass.getSuperClass(), "java.lang.String must have superclass");
+            assertEquals("java.lang.Object", strClass.getSuperClass().getName());
+            assertTrue(strClass.doesExtend("java.lang.Object"));
+
+            Collection<IClass> objClasses = snapshot.getClassesByName("java.lang.Object", false);
+            assertNotNull(objClasses);
+            assertFalse(objClasses.isEmpty());
+            IClass objClass = objClasses.iterator().next();
+            assertThat(objClass.getSubclasses()).isNotEmpty();
+            assertThat(objClass.getAllSubclasses().size()).isGreaterThan(500);
+
+            // Verify Static Fields population
+            assertThat(strClass.getStaticFields()).isNotEmpty();
+            boolean hasCaseInsensitive = strClass.getStaticFields().stream()
+                    .anyMatch(f -> "CASE_INSENSITIVE_ORDER".equals(f.getName()) || "serialPersistentFields".equals(f.getName()) || "serialVersionUID".equals(f.getName()));
+            assertTrue(hasCaseInsensitive, "java.lang.String must contain standard static fields");
 
             IObject strObj = snapshot.getObject(strIds[0]);
             assertThat(strObj).isInstanceOf(IInstance.class);
@@ -273,11 +291,17 @@ class EclipseMatGeneralSnapshotTestSuiteTest {
                 assertThat(chars).isInstanceOf(char[].class);
             }
 
-            // 9. Verify Class Histogram computation
+            // 9. Verify Class Histogram computation and retained size calculation
             org.eclipse.mat.snapshot.Histogram histogram = snapshot.getHistogram(new org.eclipse.mat.util.VoidProgressListener());
             assertThat(histogram).isNotNull();
             assertThat(histogram.getClassHistogramRecords()).isNotEmpty();
             assertThat(histogram.getClassLoaderHistogramRecords()).isNotEmpty();
+
+            var firstRecord = histogram.getClassHistogramRecords().iterator().next();
+            if (firstRecord.getNumberOfObjects() > 0) {
+                long minRetained = firstRecord.calculateRetainedSize(snapshot, true, true, new org.eclipse.mat.util.VoidProgressListener());
+                assertThat(minRetained).isNotZero();
+            }
         }
     }
 

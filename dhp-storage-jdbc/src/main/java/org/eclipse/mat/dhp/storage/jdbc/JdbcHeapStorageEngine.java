@@ -137,7 +137,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     "class_obj_id INT DEFAULT -1, " +
                     "super_class_obj_id INT DEFAULT -1, " +
                     "class_loader_obj_id INT DEFAULT -1, " +
-                    "used_size BIGINT DEFAULT 0" +
+                    "used_size BIGINT DEFAULT 0, " +
+                    "static_fields_data TEXT" +
                     ");");
 
             stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_class_stats (" +
@@ -215,8 +216,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public void saveClasses(Collection<HeapRecords.ClassRecord> classes) throws SQLException {
         String sql = isPostgres
-                ? "INSERT INTO dhp_classes(class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT (class_id) DO NOTHING"
-                : "INSERT OR REPLACE INTO dhp_classes(class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data) VALUES(?, ?, ?, ?, ?, ?)";
+                ? "INSERT INTO dhp_classes(class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, static_fields_data) VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT (class_id) DO NOTHING"
+                : "INSERT OR REPLACE INTO dhp_classes(class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, static_fields_data) VALUES(?, ?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             for (HeapRecords.ClassRecord cls : classes) {
                 ps.setLong(1, cls.classId());
@@ -230,6 +231,16 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     sb.append(f.name()).append(':').append(f.type());
                 }
                 ps.setString(6, sb.toString());
+
+                StringBuilder sfSb = new StringBuilder();
+                for (var sf : cls.staticFields()) {
+                    if (!sfSb.isEmpty()) sfSb.append(';');
+                    String valStr = sf.value() != null ? String.valueOf(sf.value()) : "";
+                    sfSb.append(encodeField(sf.name())).append(':')
+                        .append(sf.type()).append(':')
+                        .append(encodeField(valStr));
+                }
+                ps.setString(7, sfSb.toString());
                 ps.addBatch();
             }
             ps.executeBatch();
@@ -241,9 +252,9 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     public List<HeapRecords.ClassRecord> getAllClasses() throws SQLException {
         List<HeapRecords.ClassRecord> list = new ArrayList<>();
         try (Statement stmt = connection.createStatement()) {
-            boolean hasExtendedCols = false;
-            try (ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, class_obj_id, super_class_obj_id, class_loader_obj_id, used_size FROM dhp_classes")) {
-                hasExtendedCols = true;
+            boolean loaded = false;
+            try (ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, class_obj_id, super_class_obj_id, class_loader_obj_id, used_size, static_fields_data FROM dhp_classes")) {
+                loaded = true;
                 while (rs.next()) {
                     list.add(new HeapRecords.ClassRecord(
                             rs.getLong(1),
@@ -252,7 +263,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                             rs.getString(4),
                             rs.getInt(5),
                             parseFieldsData(rs.getString(6)),
-                            List.of(),
+                            parseStaticFieldsData(rs.getString(11)),
                             rs.getInt(7),
                             rs.getInt(8),
                             rs.getInt(9),
@@ -261,7 +272,28 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                 }
             } catch (SQLException ignored) {}
 
-            if (!hasExtendedCols) {
+            if (!loaded) {
+                try (ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, class_obj_id, super_class_obj_id, class_loader_obj_id, used_size FROM dhp_classes")) {
+                    loaded = true;
+                    while (rs.next()) {
+                        list.add(new HeapRecords.ClassRecord(
+                                rs.getLong(1),
+                                rs.getLong(2),
+                                rs.getLong(3),
+                                rs.getString(4),
+                                rs.getInt(5),
+                                parseFieldsData(rs.getString(6)),
+                                List.of(),
+                                rs.getInt(7),
+                                rs.getInt(8),
+                                rs.getInt(9),
+                                rs.getLong(10)
+                        ));
+                    }
+                } catch (SQLException ignored) {}
+            }
+
+            if (!loaded) {
                 try (ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data FROM dhp_classes")) {
                     while (rs.next()) {
                         list.add(new HeapRecords.ClassRecord(
@@ -283,7 +315,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public HeapRecords.ClassRecord getClassById(long classId) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data FROM dhp_classes WHERE class_id = ?")) {
+                "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, static_fields_data FROM dhp_classes WHERE class_id = ?")) {
             ps.setLong(1, classId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
@@ -294,8 +326,26 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                             rs.getString(4),
                             rs.getInt(5),
                             parseFieldsData(rs.getString(6)),
-                            List.of()
+                            parseStaticFieldsData(rs.getString(7))
                     );
+                }
+            }
+        } catch (SQLException e) {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data FROM dhp_classes WHERE class_id = ?")) {
+                ps.setLong(1, classId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return new HeapRecords.ClassRecord(
+                                rs.getLong(1),
+                                rs.getLong(2),
+                                rs.getLong(3),
+                                rs.getString(4),
+                                rs.getInt(5),
+                                parseFieldsData(rs.getString(6)),
+                                List.of()
+                        );
+                    }
                 }
             }
         }
@@ -318,6 +368,59 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             }
         }
         return list;
+    }
+
+    private static List<HeapRecords.StaticFieldRecord> parseStaticFieldsData(String data) {
+        if (data == null || data.isBlank()) return List.of();
+        List<HeapRecords.StaticFieldRecord> list = new ArrayList<>();
+        String[] entries = data.split(";");
+        for (String entry : entries) {
+            if (entry.isBlank()) continue;
+            int idx1 = entry.indexOf(':');
+            int idx2 = entry.indexOf(':', idx1 + 1);
+            if (idx1 != -1 && idx2 != -1) {
+                String name = decodeField(entry.substring(0, idx1));
+                try {
+                    int type = Integer.parseInt(entry.substring(idx1 + 1, idx2));
+                    String rawVal = decodeField(entry.substring(idx2 + 1));
+                    Object val = parseStaticFieldValue(type, rawVal);
+                    list.add(new HeapRecords.StaticFieldRecord(name, type, val));
+                } catch (NumberFormatException ignored) {}
+            }
+        }
+        return list;
+    }
+
+    private static Object parseStaticFieldValue(int type, String rawVal) {
+        if (rawVal == null || rawVal.isEmpty() || "null".equals(rawVal)) {
+            return null;
+        }
+        try {
+            return switch (type) {
+                case 2 -> Long.parseLong(rawVal); // OBJECT: object address
+                case 4 -> Boolean.parseBoolean(rawVal); // BOOLEAN
+                case 5 -> (char) Integer.parseInt(rawVal); // CHAR
+                case 6 -> Float.parseFloat(rawVal); // FLOAT
+                case 7 -> Double.parseDouble(rawVal); // DOUBLE
+                case 8 -> Byte.parseByte(rawVal); // BYTE
+                case 9 -> Short.parseShort(rawVal); // SHORT
+                case 10 -> Integer.parseInt(rawVal); // INT
+                case 11 -> Long.parseLong(rawVal); // LONG
+                default -> null;
+            };
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String encodeField(String s) {
+        if (s == null) return "";
+        return s.replace("%", "%25").replace(":", "%3A").replace(";", "%3B");
+    }
+
+    private static String decodeField(String s) {
+        if (s == null) return "";
+        return s.replace("%3B", ";").replace("%3A", ":").replace("%25", "%");
     }
 
     @Override

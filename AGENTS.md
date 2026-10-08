@@ -79,13 +79,16 @@ To achieve constant memory usage and avoid intermediate lock contention during i
 ### Tables
 
 - **`dhp_snapshot_info`**: Key-value pairs for snapshot metadata (`idSize`, `creationDate`, `totalHeapSize`, `numberOfObjects`). Precomputes aggregates in `finishIngestion()` to achieve sub-millisecond retrieval.
-- **`dhp_classes`**: Stores `class_id`, `super_class_id`, `class_loader_id`, `class_name`, `instance_size`, `fields_data`, and pre-resolved `class_obj_id`, `super_class_obj_id`, `class_loader_obj_id`, and `used_size`.
+- **`dhp_classes`**: Stores `class_id`, `super_class_id`, `class_loader_id`, `class_name`, `instance_size`, `fields_data`, `static_fields_data`, and pre-resolved `class_obj_id`, `super_class_obj_id`, `class_loader_obj_id`, and `used_size`. Supports full Class Hierarchy navigation and Static Fields in MAT's Inspector view.
 - **`dhp_class_stats`**: Stores pre-aggregated `class_id`, `instance_count`, and `total_size` populated in `finishIngestion()`, eliminating costly full-table `GROUP BY` aggregations during snapshot open.
 - **`dhp_objects`**: Primary entity table storing `object_id` (0-indexed integer), `object_address` (JVM 64-bit pointer), `class_id`, `used_size` (shallow size), `file_position` (byte offset in `.hprof`), and `is_array`. Indexed by `idx_dhp_objects_arrays` partial index (`WHERE is_array = 1`).
 - **`dhp_outbound_references`**: Directed edges `(from_object_id, seq, to_object_id)` representing object references.
 - **`dhp_inbound_references`**: Reverse edges `(to_object_id, from_object_id)` for incoming references.
 - **`dhp_gc_roots`**: Root pointers `(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id)` with pre-resolved `object_id` and `thread_object_id`.
 - **`dhp_dominator_tree`**: Dominator computation results: `object_id`, `dominator_id`, and `retained_size`.
+
+### Storage Model & File Size Disparity (Why 58MB SQLite for a 2.2GB Dump)
+In HPROF format, 85-95% of file size comprises primitive array payload buffers (`byte[]`, `char[]`, `int[]`). DHP stores the object graph topology, relationships, metadata, and dominator trees in SQLite (~58 MB), while recording the exact byte offset (`file_position`) in `dhp_objects`. `DhpHeapObjectReader` performs zero-memory-overhead random seeks into `.hprof` only when array contents or instance field values are inspected, matching Eclipse MAT's native architecture where index files are similarly 15-30 MB.
 
 ---
 

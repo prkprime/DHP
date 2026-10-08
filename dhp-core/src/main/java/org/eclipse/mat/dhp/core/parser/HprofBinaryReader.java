@@ -66,6 +66,30 @@ public class HprofBinaryReader implements AutoCloseable {
         return b & 0xFF;
     }
 
+    public boolean readBoolean() throws IOException {
+        int b = readByte();
+        if (b < 0) {
+            throw new IOException("Unexpected EOF while reading boolean");
+        }
+        return b != 0;
+    }
+
+    public char readChar() throws IOException {
+        return (char) readUnsignedShort();
+    }
+
+    public short readShort() throws IOException {
+        return (short) readUnsignedShort();
+    }
+
+    public float readFloat() throws IOException {
+        return Float.intBitsToFloat(readInt());
+    }
+
+    public double readDouble() throws IOException {
+        return Double.longBitsToDouble(readLong());
+    }
+
     public int readUnsignedShort() throws IOException {
         int ch1 = readByte();
         int ch2 = readByte();

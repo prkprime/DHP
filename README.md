@@ -61,7 +61,9 @@ DHP parses massive Java heap dumps (100GB+) without requiring hundreds of gigaby
 
 - **Constant-Memory Architecture**: Configurable RAM budget (e.g. 1GB–4GB) regardless of whether the heap dump is 2GB or 150GB.
 - **Dynamic Memory Governor**: Self-tunes batch sizes, thread pools, and SQLite page cache sizes based on available system memory.
-- **Complete Class Hierarchy Traversal**: Handles multi-level inheritance, all 8 Java primitive types (`boolean`, `byte`, `char`, `short`, `int`, `long`, `float`, `double`), and object references with subclass-first layout matching JVM specifications.
+- **Compact Topological Storage**: Stores graph edges, class metadata, and dominators in SQLite (~58 MB for a 2.2 GB dump), seeking directly into `.hprof` byte offsets (`file_position`) for raw array and instance payloads.
+- **Full Object Inspector & Static Fields**: Populates static fields (both primitive and object reference values), superclasses, and subclasses across the entire JVM hierarchy.
+- **Dominator Tree & Histogram Retained Sizing**: Full Lengauer-Tarjan semi-dominator tree computation with instant bottom-up retained sizes and full compatibility with MAT's on-demand "Calculate Minimum Retained Size" calculator.
 - **Resilient Stream Handling**: Resilient to duplicate `INSTANCE_DUMP` / `CLASS_DUMP` records, zero-length `HEAP_DUMP_SEGMENT`s, and unknown record tags.
 - **Full Eclipse MAT Parity**: Generates index structures compliant with Eclipse MAT, enabling immediate analysis in Eclipse MAT GUI or headless reports.
 
