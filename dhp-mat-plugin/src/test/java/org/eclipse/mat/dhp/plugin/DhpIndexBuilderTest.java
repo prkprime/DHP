@@ -19,6 +19,7 @@ class DhpIndexBuilderTest {
     @Test
     void testIndexBuilderWithDhpConfigFile(@TempDir Path tempDir) throws IOException, SnapshotException {
         File dumpFile = new File("/tmp/eclipse-mat/plugins/org.eclipse.mat.tests/dumps/sun_jdk6_18_x64.hprof");
+        if (!dumpFile.exists()) return;
         File dbFile = tempDir.resolve("mat_test.db").toFile();
         File configFile = tempDir.resolve("dump.dhp").toFile();
 

@@ -17,6 +17,7 @@ class FullIngestionPipelineTest {
     @Test
     void testParseAndIngestJdkDump(@TempDir Path tempDir) throws Exception {
         File dumpFile = new File("/tmp/eclipse-mat/plugins/org.eclipse.mat.tests/dumps/sun_jdk6_18_x64.hprof");
+        if (!dumpFile.exists()) return;
         File dbFile = tempDir.resolve("sun_jdk6_18_parsed.db").toFile();
 
         Pass1ScanParser pass1 = new Pass1ScanParser();

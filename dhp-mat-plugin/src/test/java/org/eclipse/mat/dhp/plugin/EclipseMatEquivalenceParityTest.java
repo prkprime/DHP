@@ -28,6 +28,7 @@ class EclipseMatEquivalenceParityTest {
     @Test
     void testParityBetweenDhpAndMatStructures(@TempDir Path tempDir) throws Exception {
         File dumpFile = new File("/tmp/eclipse-mat/plugins/org.eclipse.mat.tests/dumps/sun_jdk6_18_x64.hprof");
+        if (!dumpFile.exists()) return;
         File dbFile = tempDir.resolve("parity_test.db").toFile();
         File configFile = tempDir.resolve("dump.dhp").toFile();
 

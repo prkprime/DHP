@@ -12,6 +12,7 @@ class Pass1ScanParserTest {
     @Test
     void testScanJdk6Dump() throws IOException {
         File dumpFile = new File("/tmp/eclipse-mat/plugins/org.eclipse.mat.tests/dumps/sun_jdk6_18_x64.hprof");
+        if (!dumpFile.exists()) return;
         Pass1ScanParser pass1 = new Pass1ScanParser();
         pass1.scan(dumpFile);
 

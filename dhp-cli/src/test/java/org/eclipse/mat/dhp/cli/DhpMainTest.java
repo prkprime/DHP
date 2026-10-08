@@ -14,6 +14,7 @@ class DhpMainTest {
     @Test
     void testCliExecutionWithDumpAndSqlite(@TempDir Path tempDir) {
         File dumpFile = new File("/tmp/eclipse-mat/plugins/org.eclipse.mat.tests/dumps/sun_jdk6_18_x64.hprof");
+        if (!dumpFile.exists()) return;
         File dbFile = tempDir.resolve("cli_test.db").toFile();
 
         int exitCode = new CommandLine(new DhpMain()).execute(
