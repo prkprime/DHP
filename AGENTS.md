@@ -78,13 +78,14 @@ To achieve constant memory usage and avoid intermediate lock contention during i
 
 ### Tables
 
-- **`dhp_snapshot_info`**: Key-value pairs for snapshot metadata (`idSize`, `creationDate`, `totalHeapSize`).
-- **`dhp_classes`**: Stores `class_id`, `super_class_id`, `class_loader_id`, `class_name`, `instance_size`, `fields_data`.
-- **`dhp_objects`**: Primary entity table storing `object_id` (0-indexed integer), `object_address` (JVM 64-bit pointer), `class_id`, `used_size` (shallow size), `file_position` (byte offset in `.hprof`), and `is_array`.
+- **`dhp_snapshot_info`**: Key-value pairs for snapshot metadata (`idSize`, `creationDate`, `totalHeapSize`, `numberOfObjects`). Precomputes aggregates in `finishIngestion()` to achieve sub-millisecond retrieval.
+- **`dhp_classes`**: Stores `class_id`, `super_class_id`, `class_loader_id`, `class_name`, `instance_size`, `fields_data`, and pre-resolved `class_obj_id`, `super_class_obj_id`, `class_loader_obj_id`, and `used_size`.
+- **`dhp_class_stats`**: Stores pre-aggregated `class_id`, `instance_count`, and `total_size` populated in `finishIngestion()`, eliminating costly full-table `GROUP BY` aggregations during snapshot open.
+- **`dhp_objects`**: Primary entity table storing `object_id` (0-indexed integer), `object_address` (JVM 64-bit pointer), `class_id`, `used_size` (shallow size), `file_position` (byte offset in `.hprof`), and `is_array`. Indexed by `idx_dhp_objects_arrays` partial index (`WHERE is_array = 1`).
 - **`dhp_outbound_references`**: Directed edges `(from_object_id, seq, to_object_id)` representing object references.
 - **`dhp_inbound_references`**: Reverse edges `(to_object_id, from_object_id)` for incoming references.
-- **`dhp_gc_roots`**: Root pointers `(object_address, referrer_address, root_type)`.
-- **`dhp_dominator_tree`**: Dominator computation results: `object_id`, `immediate_dominator_id`, and `retained_size`.
+- **`dhp_gc_roots`**: Root pointers `(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id)` with pre-resolved `object_id` and `thread_object_id`.
+- **`dhp_dominator_tree`**: Dominator computation results: `object_id`, `dominator_id`, and `retained_size`.
 
 ---
 

@@ -56,6 +56,12 @@ public interface HeapStorageEngine extends Closeable {
     // Bulk graph & class instance queries
     default boolean isArray(int objectId) throws SQLException { return false; }
     default boolean[] getAllArrayFlags(int objectCount) throws SQLException { return new boolean[objectCount]; }
+    default void populateArrayBitField(java.util.function.IntConsumer setBit) throws SQLException {
+        boolean[] flags = getAllArrayFlags(getObjectCount());
+        for (int i = 0; i < flags.length; i++) {
+            if (flags[i]) setBit.accept(i);
+        }
+    }
     default int[][] loadAllOutboundReferences(int objectCount) throws SQLException { return new int[objectCount][0]; }
     default long[] loadAllObjectUsedSizes(int objectCount) throws SQLException { return new long[objectCount]; }
     default int[] getObjectsByClassId(int classObjId) throws SQLException { return new int[0]; }

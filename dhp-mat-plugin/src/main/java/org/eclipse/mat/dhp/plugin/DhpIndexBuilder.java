@@ -1,6 +1,7 @@
 package org.eclipse.mat.dhp.plugin;
 
 import org.eclipse.mat.SnapshotException;
+import org.eclipse.mat.collect.BitField;
 import org.eclipse.mat.collect.HashMapIntObject;
 import org.eclipse.mat.dhp.core.graph.DominatorTreeEngine;
 import org.eclipse.mat.dhp.core.memory.MemoryGovernor;
@@ -100,7 +101,9 @@ public class DhpIndexBuilder implements IIndexBuilder {
 
             MemoryGovernor governor = new MemoryGovernor(memoryBudget, 4);
             this.storage = new JdbcHeapStorageEngine(jdbcUrl, user, password, governor.getTotalAllocatedBytes());
-            this.storage.initializeSchema();
+            if (!this.storage.hasExistingTables()) {
+                this.storage.initializeSchema();
+            }
 
             // If starting from fresh hprof file, run ingestion pipeline
             if (hprofFile != null && hprofFile.exists() && storage.getObjectCount() == 0) {
@@ -132,18 +135,31 @@ public class DhpIndexBuilder implements IIndexBuilder {
                 totalSizeField.setAccessible(true);
             } catch (Exception ignored) {}
 
+            int sysLoaderObjId = storage.getObjectIdByAddress(0L);
+            it.unimi.dsi.fastutil.ints.IntArrayList bootstrapClassIds = new it.unimi.dsi.fastutil.ints.IntArrayList();
+            int finalJavaLangClassObjId = -1;
+
             for (HeapRecords.ClassRecord cls : allClasses) {
-                int classObjId = storage.getObjectIdByAddress(cls.classId());
+                int classObjId = cls.classObjId() >= 0 ? cls.classObjId() : storage.getObjectIdByAddress(cls.classId());
+                if (classObjId < 0) continue;
+                int superClassObjId = cls.superClassObjId() >= 0 ? cls.superClassObjId() : (cls.superClassId() != 0 ? storage.getObjectIdByAddress(cls.superClassId()) : -1);
+                int classLoaderObjId = cls.classLoaderObjId() >= 0 ? cls.classLoaderObjId() : (cls.classLoaderId() != 0 ? storage.getObjectIdByAddress(cls.classLoaderId()) : sysLoaderObjId);
+                if (classLoaderObjId < 0) classLoaderObjId = sysLoaderObjId >= 0 ? sysLoaderObjId : 0;
+
+                if (cls.classLoaderId() == 0L) {
+                    bootstrapClassIds.add(classObjId);
+                }
+                if (finalJavaLangClassObjId < 0 && "java.lang.Class".equals(cls.name())) {
+                    finalJavaLangClassObjId = classObjId;
+                }
+
                 FieldDescriptor[] fields = new FieldDescriptor[cls.fields().size()];
                 for (int i = 0; i < fields.length; i++) {
                     var f = cls.fields().get(i);
                     fields[i] = new FieldDescriptor(f.name(), f.type());
                 }
-                int sysLoaderObjId = storage.getObjectIdByAddress(0L);
-                int superClassObjId = cls.superClassId() != 0 ? storage.getObjectIdByAddress(cls.superClassId()) : -1;
+
                 long superClassAddr = superClassObjId >= 0 ? cls.superClassId() : 0L;
-                int classLoaderObjId = cls.classLoaderId() != 0 ? storage.getObjectIdByAddress(cls.classLoaderId()) : sysLoaderObjId;
-                if (classLoaderObjId < 0) classLoaderObjId = sysLoaderObjId >= 0 ? sysLoaderObjId : 0;
                 long classLoaderAddr = cls.classLoaderId() != 0 ? cls.classLoaderId() : 0L;
 
                 ClassImpl classImpl = new ClassImpl(
@@ -154,30 +170,26 @@ public class DhpIndexBuilder implements IIndexBuilder {
                         new Field[0],
                         fields
                 );
-                if (classObjId >= 0) {
-                    classImpl.setObjectId(classObjId);
-                    classImpl.setCacheEntry(classObjId);
-                    classImpl.setHeapSizePerInstance(cls.instanceSize());
-                    classImpl.setUsedHeapSize(storage.getObjectUsedSize(classObjId));
-                    if (superClassObjId >= 0) {
-                        classImpl.setSuperClassIndex(superClassObjId);
-                    } else {
-                        classImpl.setSuperClassIndex(-1);
-                    }
-                    classImpl.setClassLoaderIndex(classLoaderObjId);
-
-                    var stat = classStats.get(classObjId);
-                    if (stat != null && countField != null && totalSizeField != null) {
-                        try {
-                            countField.setInt(classImpl, stat.instanceCount());
-                            totalSizeField.setLong(classImpl, stat.totalSize());
-                        } catch (Exception ignored) {}
-                    }
-                    classesById.put(classObjId, classImpl);
+                classImpl.setObjectId(classObjId);
+                classImpl.setCacheEntry(classObjId);
+                classImpl.setHeapSizePerInstance(cls.instanceSize());
+                long usedSize = cls.usedSize() > 0 ? cls.usedSize() : storage.getObjectUsedSize(classObjId);
+                classImpl.setUsedHeapSize(usedSize);
+                if (superClassObjId >= 0) {
+                    classImpl.setSuperClassIndex(superClassObjId);
                 } else {
-                    log.warn("Class not found in storage: classId={}, name={}, classObjId={}", 
-                            Long.toHexString(cls.classId()), cls.name(), classObjId);
+                    classImpl.setSuperClassIndex(-1);
                 }
+                classImpl.setClassLoaderIndex(classLoaderObjId);
+
+                var stat = classStats.get(classObjId);
+                if (stat != null && countField != null && totalSizeField != null) {
+                    try {
+                        countField.setInt(classImpl, stat.instanceCount());
+                        totalSizeField.setLong(classImpl, stat.totalSize());
+                    } catch (Exception ignored) {}
+                }
+                classesById.put(classObjId, classImpl);
             }
 
             // Find java.lang.Class ClassImpl
@@ -211,10 +223,10 @@ public class DhpIndexBuilder implements IIndexBuilder {
             HashMapIntObject<HashMapIntObject<List<XGCRootInfo>>> thread2objects2roots = new HashMapIntObject<>();
 
             for (var root : storage.getGcRoots()) {
-                int objId = storage.getObjectIdByAddress(root.objectAddress());
+                int objId = root.objectId() >= 0 ? root.objectId() : storage.getObjectIdByAddress(root.objectAddress());
                 if (objId >= 0) {
                     if (root.referrerAddress() != 0) {
-                        int threadObjId = storage.getObjectIdByAddress(root.referrerAddress());
+                        int threadObjId = root.threadObjectId() >= 0 ? root.threadObjectId() : storage.getObjectIdByAddress(root.referrerAddress());
                         if (threadObjId >= 0) {
                             var localsMap = thread2objects2roots.get(threadObjId);
                             if (localsMap == null) {
@@ -245,7 +257,6 @@ public class DhpIndexBuilder implements IIndexBuilder {
             }
 
             // Ensure system classloader (address 0L) is in gcRootsMap
-            int sysLoaderObjId = storage.getObjectIdByAddress(0L);
             if (sysLoaderObjId >= 0 && !gcRootsMap.containsKey(sysLoaderObjId)) {
                 List<XGCRootInfo> list = new ArrayList<>();
                 var xgc = new XGCRootInfo(0L, 0L, 1);
@@ -257,7 +268,7 @@ public class DhpIndexBuilder implements IIndexBuilder {
             // Ensure all classes with classLoaderId == 0 are included in gcRootsMap (MAT parity)
             for (HeapRecords.ClassRecord cls : allClasses) {
                 if (cls.classLoaderId() == 0L) {
-                    int classObjId = storage.getObjectIdByAddress(cls.classId());
+                    int classObjId = cls.classObjId() >= 0 ? cls.classObjId() : storage.getObjectIdByAddress(cls.classId());
                     if (classObjId >= 0 && !gcRootsMap.containsKey(classObjId)) {
                         List<XGCRootInfo> list = new ArrayList<>();
                         var xgc = new XGCRootInfo(cls.classId(), 0L, 2);
@@ -278,13 +289,6 @@ public class DhpIndexBuilder implements IIndexBuilder {
                     storage::getObjectIdByAddress
             ));
 
-            int finalJavaLangClassObjId = -1;
-            for (HeapRecords.ClassRecord cls : allClasses) {
-                if ("java.lang.Class".equals(cls.name())) {
-                    finalJavaLangClassObjId = storage.getObjectIdByAddress(cls.classId());
-                    break;
-                }
-            }
             int defaultClassId = finalJavaLangClassObjId >= 0 ? finalJavaLangClassObjId : (classesById.size() > 0 ? classesById.keys().next() : 0);
 
             // 4. Object-to-Class index (IOne2OneIndex)
@@ -299,14 +303,6 @@ public class DhpIndexBuilder implements IIndexBuilder {
                     }
             ));
 
-            // Collect bootstrap class IDs for system class loader outbound edges
-            it.unimi.dsi.fastutil.ints.IntArrayList bootstrapClassIds = new it.unimi.dsi.fastutil.ints.IntArrayList();
-            for (HeapRecords.ClassRecord cls : allClasses) {
-                if (cls.classLoaderId() == 0L) {
-                    int cid = storage.getObjectIdByAddress(cls.classId());
-                    if (cid >= 0) bootstrapClassIds.add(cid);
-                }
-            }
             int[] bootstrapClassIdsArray = bootstrapClassIds.toIntArray();
 
             // 5. Outbound references index (IOne2ManyIndex)
@@ -336,10 +332,11 @@ public class DhpIndexBuilder implements IIndexBuilder {
             ));
 
             // 6. Array sizes index (IOne2SizeIndex) - only populated for array objects!
-            boolean[] arrayFlags = storage.getAllArrayFlags(objectCount);
+            BitField arrayObjects = new BitField(objectCount);
+            storage.populateArrayBitField(arrayObjects::set);
             preliminaryIndex.setArray2size(new DbOne2SizeIndex(
                     objectCount,
-                    id -> (id >= 0 && id < arrayFlags.length && arrayFlags[id]) ? storage.getObjectUsedSize(id) : 0L
+                    id -> (id >= 0 && id < objectCount && arrayObjects.get(id)) ? storage.getObjectUsedSize(id) : 0L
             ));
 
             // 7. Update SnapshotInfo metadata

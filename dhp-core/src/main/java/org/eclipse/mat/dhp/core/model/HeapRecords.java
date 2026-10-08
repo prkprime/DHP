@@ -26,8 +26,16 @@ public final class HeapRecords {
             String name,
             int instanceSize,
             List<FieldDescriptor> fields,
-            List<StaticFieldRecord> staticFields
-    ) {}
+            List<StaticFieldRecord> staticFields,
+            int classObjId,
+            int superClassObjId,
+            int classLoaderObjId,
+            long usedSize
+    ) {
+        public ClassRecord(long classId, long superClassId, long classLoaderId, String name, int instanceSize, List<FieldDescriptor> fields, List<StaticFieldRecord> staticFields) {
+            this(classId, superClassId, classLoaderId, name, instanceSize, fields, staticFields, -1, -1, -1, 0L);
+        }
+    }
 
     public record StaticFieldRecord(
             String name,
@@ -59,11 +67,17 @@ public final class HeapRecords {
     ) {}
 
     public record GcRootRecord(
+            int objectId,
             long objectAddress,
             long referrerAddress,
             int rootType,
-            long threadAddress
-    ) {}
+            long threadAddress,
+            int threadObjectId
+    ) {
+        public GcRootRecord(long objectAddress, long referrerAddress, int rootType, long threadAddress) {
+            this(-1, objectAddress, referrerAddress, rootType, threadAddress, -1);
+        }
+    }
 
     public record StackFrameRecord(
             long frameId,

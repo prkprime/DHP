@@ -42,7 +42,7 @@ public class DominatorTreeEngine {
         // 2. Collect unique GC root object IDs
         Set<Integer> gcRootsSet = new LinkedHashSet<>();
         for (var root : storage.getGcRoots()) {
-            int rootId = storage.getObjectIdByAddress(root.objectAddress());
+            int rootId = root.objectId() >= 0 ? root.objectId() : storage.getObjectIdByAddress(root.objectAddress());
             if (rootId >= 0 && rootId < n) {
                 gcRootsSet.add(rootId);
             }

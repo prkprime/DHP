@@ -69,7 +69,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             long cacheKiB = Math.max(64 * 1024, memoryBudgetBytes / 1024 / 2);
             stmt.execute("PRAGMA cache_size = -" + cacheKiB + ";");
             stmt.execute("PRAGMA temp_store = MEMORY;");
-            stmt.execute("PRAGMA mmap_size = 2147483648;"); // 2GB mmap
+            stmt.execute("PRAGMA mmap_size = 4294967296;"); // 4GB mmap
+            stmt.execute("PRAGMA threads = 4;");
         }
         log.info("Configured SQLite for high performance WAL ingestion with memory cache budget");
     }
@@ -103,6 +104,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             "dhp_outbound_references",
             "dhp_inbound_references",
             "dhp_gc_roots",
+            "dhp_class_stats",
             "dhp_objects",
             "dhp_classes",
             "dhp_snapshot_info"
@@ -131,7 +133,17 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     "class_loader_id BIGINT, " +
                     "class_name VARCHAR(1024) NOT NULL, " +
                     "instance_size INT NOT NULL, " +
-                    "fields_data TEXT" +
+                    "fields_data TEXT, " +
+                    "class_obj_id INT DEFAULT -1, " +
+                    "super_class_obj_id INT DEFAULT -1, " +
+                    "class_loader_obj_id INT DEFAULT -1, " +
+                    "used_size BIGINT DEFAULT 0" +
+                    ");");
+
+            stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_class_stats (" +
+                    "class_id INT PRIMARY KEY, " +
+                    "instance_count INT NOT NULL, " +
+                    "total_size BIGINT NOT NULL" +
                     ");");
 
             // Bulk ingestion tables: NO PRIMARY KEYS or secondary indexes upfront
@@ -160,7 +172,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     "object_address BIGINT NOT NULL, " +
                     "referrer_address BIGINT, " +
                     "root_type INT NOT NULL, " +
-                    "thread_address BIGINT" +
+                    "thread_address BIGINT, " +
+                    "thread_object_id INT DEFAULT -1" +
                     ");");
 
             stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_dominator_tree (" +
@@ -227,18 +240,41 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public List<HeapRecords.ClassRecord> getAllClasses() throws SQLException {
         List<HeapRecords.ClassRecord> list = new ArrayList<>();
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data FROM dhp_classes")) {
-            while (rs.next()) {
-                list.add(new HeapRecords.ClassRecord(
-                        rs.getLong(1),
-                        rs.getLong(2),
-                        rs.getLong(3),
-                        rs.getString(4),
-                        rs.getInt(5),
-                        parseFieldsData(rs.getString(6)),
-                        List.of()
-                ));
+        try (Statement stmt = connection.createStatement()) {
+            boolean hasExtendedCols = false;
+            try (ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, class_obj_id, super_class_obj_id, class_loader_obj_id, used_size FROM dhp_classes")) {
+                hasExtendedCols = true;
+                while (rs.next()) {
+                    list.add(new HeapRecords.ClassRecord(
+                            rs.getLong(1),
+                            rs.getLong(2),
+                            rs.getLong(3),
+                            rs.getString(4),
+                            rs.getInt(5),
+                            parseFieldsData(rs.getString(6)),
+                            List.of(),
+                            rs.getInt(7),
+                            rs.getInt(8),
+                            rs.getInt(9),
+                            rs.getLong(10)
+                    ));
+                }
+            } catch (SQLException ignored) {}
+
+            if (!hasExtendedCols) {
+                try (ResultSet rs = stmt.executeQuery("SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data FROM dhp_classes")) {
+                    while (rs.next()) {
+                        list.add(new HeapRecords.ClassRecord(
+                                rs.getLong(1),
+                                rs.getLong(2),
+                                rs.getLong(3),
+                                rs.getString(4),
+                                rs.getInt(5),
+                                parseFieldsData(rs.getString(6)),
+                                List.of()
+                        ));
+                    }
+                }
             }
         }
         return list;
@@ -486,7 +522,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             // Rebuild dhp_gc_roots
             stmt.execute("DROP TABLE IF EXISTS dhp_gc_roots_clean");
             stmt.execute("CREATE " + unlogged + "TABLE dhp_gc_roots_clean AS " +
-                    "SELECT o.object_id, r.object_address, r.referrer_address, r.root_type, r.thread_address " +
+                    "SELECT o.object_id, r.object_address, r.referrer_address, r.root_type, r.thread_address, " +
+                    "coalesce((SELECT t.object_id FROM dhp_objects t WHERE t.object_address = r.thread_address), -1) AS thread_object_id " +
                     "FROM dhp_gc_roots r " +
                     "JOIN dhp_objects o ON r.object_address = o.object_address");
             stmt.execute("DROP TABLE dhp_gc_roots" + (isPostgres ? " CASCADE" : ""));
@@ -511,13 +548,44 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             // 2. Secondary lookup indexes
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_address ON dhp_objects(object_address);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_class ON dhp_objects(class_id);");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_arrays ON dhp_objects(object_id) WHERE is_array = 1;");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_outbound_to ON dhp_outbound_references(to_object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_from ON dhp_inbound_references(from_object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_to ON dhp_inbound_references(to_object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_gc_roots_obj ON dhp_gc_roots(object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_dominator ON dhp_dominator_tree(dominator_id, retained_size DESC);");
 
-            // 3. Database optimizer statistics
+            // 3. Precompute class stats table for instant snapshot opening
+            stmt.execute("DELETE FROM dhp_class_stats;");
+            stmt.execute("INSERT INTO dhp_class_stats(class_id, instance_count, total_size) " +
+                    "SELECT class_id, count(*), coalesce(sum(used_size), 0) FROM dhp_objects GROUP BY class_id;");
+
+            // 4. Pre-resolve and backfill metadata in dhp_classes
+            stmt.execute("UPDATE dhp_classes SET " +
+                    "class_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.class_id), -1), " +
+                    "super_class_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.super_class_id), -1), " +
+                    "class_loader_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.class_loader_id), -1), " +
+                    "used_size = coalesce((SELECT o.used_size FROM dhp_objects o WHERE o.object_address = dhp_classes.class_id), 0);");
+
+            // 5. Pre-resolve object_id and thread_object_id in dhp_gc_roots
+            stmt.execute("UPDATE dhp_gc_roots SET " +
+                    "object_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_gc_roots.object_address), -1), " +
+                    "thread_object_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_gc_roots.thread_address), -1);");
+
+            // 6. Pre-calculate total heap size and object count into dhp_snapshot_info
+            long totalHeap = 0L;
+            try (ResultSet rs = stmt.executeQuery("SELECT coalesce(sum(total_size), 0) FROM dhp_class_stats")) {
+                if (rs.next()) totalHeap = rs.getLong(1);
+            }
+            saveSnapshotInfo("totalHeapSize", String.valueOf(totalHeap));
+
+            int count = 0;
+            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_objects")) {
+                if (rs.next()) count = rs.getInt(1);
+            }
+            saveSnapshotInfo("numberOfObjects", String.valueOf(count));
+
+            // 7. Database optimizer statistics
             if (isSqlite) {
                 stmt.execute("PRAGMA optimize;");
             } else if (isPostgres) {
@@ -530,10 +598,18 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     @Override
     public int getObjectCount() throws SQLException {
+        String cached = getSnapshotInfo("numberOfObjects");
+        if (cached != null && !cached.isBlank()) {
+            try {
+                return Integer.parseInt(cached.trim());
+            } catch (NumberFormatException ignored) {}
+        }
         try (Statement stmt = connection.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_objects")) {
             if (rs.next()) {
-                return rs.getInt(1);
+                int count = rs.getInt(1);
+                saveSnapshotInfo("numberOfObjects", String.valueOf(count));
+                return count;
             }
         }
         return 0;
@@ -585,10 +661,18 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     @Override
     public long getTotalHeapSize() throws SQLException {
+        String val = getSnapshotInfo("totalHeapSize");
+        if (val != null && !val.isBlank()) {
+            try {
+                return Long.parseLong(val.trim());
+            } catch (NumberFormatException ignored) {}
+        }
         try (Statement stmt = connection.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT coalesce(sum(used_size), 0) FROM dhp_objects")) {
             if (rs.next()) {
-                return rs.getLong(1);
+                long total = rs.getLong(1);
+                saveSnapshotInfo("totalHeapSize", String.valueOf(total));
+                return total;
             }
         }
         return 0L;
@@ -638,15 +722,32 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public List<HeapRecords.GcRootRecord> getGcRoots() throws SQLException {
         List<HeapRecords.GcRootRecord> list = new ArrayList<>();
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT object_address, referrer_address, root_type, thread_address FROM dhp_gc_roots")) {
-            while (rs.next()) {
-                list.add(new HeapRecords.GcRootRecord(
-                        rs.getLong(1),
-                        rs.getLong(2),
-                        rs.getInt(3),
-                        rs.getLong(4)
-                ));
+        try (Statement stmt = connection.createStatement()) {
+            boolean hasExtendedCols = false;
+            try (ResultSet rs = stmt.executeQuery("SELECT object_id, object_address, referrer_address, root_type, thread_address, thread_object_id FROM dhp_gc_roots")) {
+                hasExtendedCols = true;
+                while (rs.next()) {
+                    list.add(new HeapRecords.GcRootRecord(
+                            rs.getInt(1),
+                            rs.getLong(2),
+                            rs.getLong(3),
+                            rs.getInt(4),
+                            rs.getLong(5),
+                            rs.getInt(6)
+                    ));
+                }
+            } catch (SQLException ignored) {}
+            if (!hasExtendedCols) {
+                try (ResultSet rs = stmt.executeQuery("SELECT object_address, referrer_address, root_type, thread_address FROM dhp_gc_roots")) {
+                    while (rs.next()) {
+                        list.add(new HeapRecords.GcRootRecord(
+                                rs.getLong(1),
+                                rs.getLong(2),
+                                rs.getInt(3),
+                                rs.getLong(4)
+                        ));
+                    }
+                }
             }
         }
         return list;
@@ -730,6 +831,16 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     @Override
+    public void populateArrayBitField(java.util.function.IntConsumer setBit) throws SQLException {
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT object_id FROM dhp_objects WHERE is_array = 1")) {
+            while (rs.next()) {
+                setBit.accept(rs.getInt(1));
+            }
+        }
+    }
+
+    @Override
     public int[][] loadAllOutboundReferences(int objectCount) throws SQLException {
         int[][] outAdj = new int[objectCount][];
         int[] counts = new int[objectCount];
@@ -791,13 +902,26 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public Map<Integer, ClassStats> getClassStats() throws SQLException {
         Map<Integer, ClassStats> map = new HashMap<>();
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT class_id, count(*), coalesce(sum(used_size), 0) FROM dhp_objects GROUP BY class_id")) {
-            while (rs.next()) {
-                int classId = rs.getInt(1);
-                int count = rs.getInt(2);
-                long total = rs.getLong(3);
-                map.put(classId, new ClassStats(classId, count, total));
+        try (Statement stmt = connection.createStatement()) {
+            boolean hasStatsTable = false;
+            try (ResultSet rs = stmt.executeQuery("SELECT class_id, instance_count, total_size FROM dhp_class_stats")) {
+                hasStatsTable = true;
+                while (rs.next()) {
+                    int classId = rs.getInt(1);
+                    int count = rs.getInt(2);
+                    long total = rs.getLong(3);
+                    map.put(classId, new ClassStats(classId, count, total));
+                }
+            } catch (SQLException ignored) {}
+            if (!hasStatsTable || map.isEmpty()) {
+                try (ResultSet rs = stmt.executeQuery("SELECT class_id, count(*), coalesce(sum(used_size), 0) FROM dhp_objects GROUP BY class_id")) {
+                    while (rs.next()) {
+                        int classId = rs.getInt(1);
+                        int count = rs.getInt(2);
+                        long total = rs.getLong(3);
+                        map.put(classId, new ClassStats(classId, count, total));
+                    }
+                }
             }
         }
         return map;
