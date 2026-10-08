@@ -26,6 +26,15 @@ import java.util.Map;
 public class JdbcHeapStorageEngine implements HeapStorageEngine {
     private static final Logger log = LoggerFactory.getLogger(JdbcHeapStorageEngine.class);
 
+    static {
+        try {
+            Class.forName("org.sqlite.JDBC");
+        } catch (Throwable ignored) {}
+        try {
+            Class.forName("org.postgresql.Driver");
+        } catch (Throwable ignored) {}
+    }
+
     private final String jdbcUrl;
     private final String user;
     private final String password;
@@ -333,6 +342,163 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     @Override
+    public int runGarbageCollection() throws SQLException {
+        int n = getObjectCount();
+        if (n == 0) return 0;
+
+        log.info("Starting Database-side Garbage Collection for {} objects...", n);
+
+        // 1. Collect GC root object IDs
+        it.unimi.dsi.fastutil.ints.IntOpenHashSet rootSet = new it.unimi.dsi.fastutil.ints.IntOpenHashSet();
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT DISTINCT o.object_id FROM dhp_objects o JOIN dhp_gc_roots r ON o.object_address = r.object_address")) {
+            while (rs.next()) {
+                rootSet.add(rs.getInt(1));
+            }
+        }
+        int sysId = getObjectIdByAddress(0L);
+        if (sysId >= 0) rootSet.add(sysId);
+
+        // 2. Load outbound adjacency for reachability traversal
+        int[][] outAdj = loadAllOutboundReferences(n);
+
+        // 3. Fast BFS reachability traversal
+        java.util.BitSet reachable = new java.util.BitSet(n);
+        it.unimi.dsi.fastutil.ints.IntArrayFIFOQueue queue = new it.unimi.dsi.fastutil.ints.IntArrayFIFOQueue();
+
+        for (int r : rootSet) {
+            if (r >= 0 && r < n && !reachable.get(r)) {
+                reachable.set(r);
+                queue.enqueue(r);
+            }
+        }
+
+        while (!queue.isEmpty()) {
+            int u = queue.dequeueInt();
+            if (u >= 0 && u < outAdj.length) {
+                for (int v : outAdj[u]) {
+                    if (v >= 0 && v < n && !reachable.get(v)) {
+                        reachable.set(v);
+                        queue.enqueue(v);
+                    }
+                }
+            }
+        }
+
+        int reachableCount = reachable.cardinality();
+        int unreachableCount = n - reachableCount;
+        log.info("Database Garbage Collection analysis: {} reachable, {} unreachable (out of {} objects)",
+                reachableCount, unreachableCount, n);
+
+        if (unreachableCount == 0) {
+            saveSnapshotInfo("removedUnreachableObjects", "0");
+            saveSnapshotInfo("removedUnreachableBytes", "0");
+            return 0;
+        }
+
+        // 4. Calculate total unreachable bytes
+        long unreachableBytes = 0;
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT object_id, used_size FROM dhp_objects")) {
+            while (rs.next()) {
+                int oid = rs.getInt(1);
+                if (oid < n && !reachable.get(oid)) {
+                    unreachableBytes += rs.getLong(2);
+                }
+            }
+        }
+
+        // 5. Purge unreachable records and re-index contiguous IDs directly in the database
+        purgeUnreachableObjectsInDatabase(reachable, n, reachableCount);
+
+        saveSnapshotInfo("numberOfObjects", String.valueOf(reachableCount));
+        saveSnapshotInfo("removedUnreachableObjects", String.valueOf(unreachableCount));
+        saveSnapshotInfo("removedUnreachableBytes", String.valueOf(unreachableBytes));
+
+        log.info("Database Garbage Collection complete: removed {} unreachable objects ({} bytes). Live objects: {}",
+                unreachableCount, unreachableBytes, reachableCount);
+        return unreachableCount;
+    }
+
+    private void purgeUnreachableObjectsInDatabase(java.util.BitSet reachable, int n, int reachableCount) throws SQLException {
+        log.info("Purging {} unreachable records directly inside database tables...", n - reachableCount);
+        long t0 = System.currentTimeMillis();
+
+        String unlogged = isPostgres ? "UNLOGGED " : "";
+        try (Statement stmt = connection.createStatement()) {
+            stmt.execute("DROP TABLE IF EXISTS dhp_gc_map");
+            stmt.execute("CREATE " + unlogged + "TABLE dhp_gc_map (old_id INT PRIMARY KEY, new_id INT NOT NULL)");
+        }
+
+        String insertMapSql = "INSERT INTO dhp_gc_map(old_id, new_id) VALUES(?, ?)";
+        try (PreparedStatement ps = connection.prepareStatement(insertMapSql)) {
+            int newId = 0;
+            int batch = 0;
+            for (int oldId = 0; oldId < n; oldId++) {
+                if (reachable.get(oldId)) {
+                    ps.setInt(1, oldId);
+                    ps.setInt(2, newId++);
+                    ps.addBatch();
+                    if (++batch >= 10000) {
+                        ps.executeBatch();
+                        batch = 0;
+                    }
+                }
+            }
+            if (batch > 0) {
+                ps.executeBatch();
+            }
+        }
+        connection.commit();
+
+        try (Statement stmt = connection.createStatement()) {
+            // Rebuild dhp_objects
+            stmt.execute("DROP TABLE IF EXISTS dhp_objects_clean");
+            stmt.execute("CREATE " + unlogged + "TABLE dhp_objects_clean AS " +
+                    "SELECT m.new_id AS object_id, o.object_address, COALESCE(mc.new_id, o.class_id) AS class_id, o.used_size, o.file_position, o.is_array " +
+                    "FROM dhp_objects o " +
+                    "JOIN dhp_gc_map m ON o.object_id = m.old_id " +
+                    "LEFT JOIN dhp_gc_map mc ON o.class_id = mc.old_id");
+            stmt.execute("DROP TABLE dhp_objects" + (isPostgres ? " CASCADE" : ""));
+            stmt.execute("ALTER TABLE dhp_objects_clean RENAME TO dhp_objects");
+
+            // Rebuild dhp_outbound_references
+            stmt.execute("DROP TABLE IF EXISTS dhp_outbound_clean");
+            stmt.execute("CREATE " + unlogged + "TABLE dhp_outbound_clean AS " +
+                    "SELECT mf.new_id AS from_object_id, r.seq, mt.new_id AS to_object_id " +
+                    "FROM dhp_outbound_references r " +
+                    "JOIN dhp_gc_map mf ON r.from_object_id = mf.old_id " +
+                    "JOIN dhp_gc_map mt ON r.to_object_id = mt.old_id");
+            stmt.execute("DROP TABLE dhp_outbound_references" + (isPostgres ? " CASCADE" : ""));
+            stmt.execute("ALTER TABLE dhp_outbound_clean RENAME TO dhp_outbound_references");
+
+            // Rebuild dhp_inbound_references
+            stmt.execute("DROP TABLE IF EXISTS dhp_inbound_clean");
+            stmt.execute("CREATE " + unlogged + "TABLE dhp_inbound_clean AS " +
+                    "SELECT mt.new_id AS to_object_id, mf.new_id AS from_object_id " +
+                    "FROM dhp_inbound_references r " +
+                    "JOIN dhp_gc_map mt ON r.to_object_id = mt.old_id " +
+                    "JOIN dhp_gc_map mf ON r.from_object_id = mf.old_id");
+            stmt.execute("DROP TABLE dhp_inbound_references" + (isPostgres ? " CASCADE" : ""));
+            stmt.execute("ALTER TABLE dhp_inbound_clean RENAME TO dhp_inbound_references");
+
+            // Rebuild dhp_gc_roots
+            stmt.execute("DROP TABLE IF EXISTS dhp_gc_roots_clean");
+            stmt.execute("CREATE " + unlogged + "TABLE dhp_gc_roots_clean AS " +
+                    "SELECT o.object_id, r.object_address, r.referrer_address, r.root_type, r.thread_address " +
+                    "FROM dhp_gc_roots r " +
+                    "JOIN dhp_objects o ON r.object_address = o.object_address");
+            stmt.execute("DROP TABLE dhp_gc_roots" + (isPostgres ? " CASCADE" : ""));
+            stmt.execute("ALTER TABLE dhp_gc_roots_clean RENAME TO dhp_gc_roots");
+
+            stmt.execute("DROP TABLE dhp_gc_map");
+        }
+        connection.commit();
+        log.info("Database table purge and re-indexing finished in {} ms.", System.currentTimeMillis() - t0);
+    }
+
+    @Override
     public void finishIngestion() throws SQLException {
         log.info("Ingestion completed. Creating primary unique indexes and secondary B-trees in bulk...");
         long start = System.currentTimeMillis();
@@ -349,7 +515,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_from ON dhp_inbound_references(from_object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_to ON dhp_inbound_references(to_object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_gc_roots_obj ON dhp_gc_roots(object_id);");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_dominator ON dhp_dominator_tree(dominator_id);");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_dominator ON dhp_dominator_tree(dominator_id, retained_size DESC);");
 
             // 3. Database optimizer statistics
             if (isSqlite) {
@@ -526,7 +692,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public int[] getImmediateDominatedIds(int objectId) throws SQLException {
         List<Integer> list = new ArrayList<>();
-        try (PreparedStatement ps = connection.prepareStatement("SELECT object_id FROM dhp_dominator_tree WHERE dominator_id = ?")) {
+        try (PreparedStatement ps = connection.prepareStatement("SELECT object_id FROM dhp_dominator_tree WHERE dominator_id = ? ORDER BY retained_size DESC")) {
             ps.setInt(1, objectId);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {

@@ -6,10 +6,30 @@
          name="Dynamic Heap Parser"
          point="org.eclipse.mat.parser.parser">
       <parser
-            name="Dynamic Heap Parser Database Format"
+            name="Dynamic Heap Parser (.dhp)"
             fileExtension="dhp,properties"
             indexBuilder="org.eclipse.mat.dhp.plugin.DhpIndexBuilder"
             objectReader="org.eclipse.mat.dhp.plugin.DhpHeapObjectReader">
+         <contentTypeBinding contentTypeId="org.eclipse.mat.dhp.contentType"/>
       </parser>
+   </extension>
+
+   <extension point="org.eclipse.core.contenttype.contentTypes">
+       <content-type
+           id="org.eclipse.mat.dhp.contentType"
+           base-type="org.eclipse.mat.JavaHeapDump"
+           file-extensions="dhp,properties"
+           file-patterns="*.dhp,*.properties"
+           name="Dynamic Heap Parser (.dhp)"
+           priority="high"/>
+   </extension>
+
+   <extension
+         id="dhpFactory"
+         name="DHP Snapshot Factory"
+         point="org.eclipse.mat.api.factory">
+      <factory
+            impl="org.eclipse.mat.dhp.plugin.DhpSnapshotFactory">
+      </factory>
    </extension>
 </plugin>

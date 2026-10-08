@@ -37,8 +37,11 @@ public class DhpMain implements Callable<Integer> {
     @Option(names = {"-d", "--dump"}, description = "Path to the input .hprof heap dump file")
     private File dumpFile;
 
-    @Option(names = {"-c", "--config"}, description = "Path to database configuration properties file")
+    @Option(names = {"-c", "--config"}, description = "Path to database configuration descriptor file (.dhp or .properties)")
     private File configFile;
+
+    @Option(names = {"--export-dhp"}, description = "Path to export .dhp MAT descriptor file (defaults to <dumpPrefix>.dhp)")
+    private File exportDhpFile;
 
     @Option(names = {"--jdbcurl"}, description = "JDBC Connection URL (e.g., jdbc:sqlite:heap.db or jdbc:postgresql://localhost:5432/heapdb)")
     private String jdbcUrl;
@@ -126,7 +129,7 @@ public class DhpMain implements Callable<Integer> {
             System.out.println("[Phase 2/3] Streaming object instances & references into database...");
             Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor);
             ingester.ingest(dumpFile);
-            System.out.println(String.format("   Ingested %d total heap objects.", storage.getObjectCount()));
+            System.out.println(String.format("   Ingested & garbage-collected %d reachable heap objects.", storage.getObjectCount()));
 
             System.out.println("[Phase 3/3] Calculating Dominator Tree & Retained Sizes...");
             DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
@@ -135,6 +138,29 @@ public class DhpMain implements Callable<Integer> {
             long duration = System.currentTimeMillis() - start;
             System.out.println("================================================================================");
             System.out.println(String.format("DHP Parsing successfully finished in %.2f seconds!", duration / 1000.0));
+
+            File targetDhp = exportDhpFile;
+            if (targetDhp == null && dumpFile != null) {
+                String base = dumpFile.getAbsolutePath();
+                int dot = base.lastIndexOf('.');
+                String pfx = dot > 0 ? base.substring(0, dot) : base;
+                targetDhp = new File(pfx + ".dhp");
+            }
+            if (targetDhp != null) {
+                Properties p = new Properties();
+                p.setProperty("db.url", jdbcUrl);
+                if (user != null && !user.isEmpty()) p.setProperty("db.user", user);
+                if (password != null && !password.isEmpty()) p.setProperty("db.password", password);
+                p.setProperty("dump.file", dumpFile.getAbsolutePath());
+                if (memoryBudget != null) p.setProperty("memory.budget", String.valueOf(memoryBudget));
+                try (java.io.FileOutputStream fos = new java.io.FileOutputStream(targetDhp)) {
+                    p.store(fos, "Dynamic Heap Parser (DHP) Descriptor");
+                    System.out.println("Exported MAT DHP descriptor: " + targetDhp.getAbsolutePath());
+                } catch (IOException e) {
+                    log.warn("Failed to export DHP descriptor: {}", e.getMessage());
+                }
+            }
+
             System.out.println("Ready to open with Eclipse MAT using DHP plugin!");
             System.out.println("================================================================================");
         }

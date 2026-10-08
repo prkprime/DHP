@@ -30,6 +30,9 @@ public interface HeapStorageEngine extends Closeable {
 
     void finishIngestion() throws SQLException;
 
+    // Database Garbage Collection
+    default int runGarbageCollection() throws SQLException { return 0; }
+
     // Index queries needed for MAT snapshot operations
     int getObjectCount() throws SQLException;
     long getObjectAddress(int objectId) throws SQLException;

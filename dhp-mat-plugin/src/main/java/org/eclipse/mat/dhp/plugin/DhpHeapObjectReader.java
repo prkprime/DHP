@@ -17,12 +17,14 @@ import org.eclipse.mat.snapshot.model.IPrimitiveArray;
 import org.eclipse.mat.snapshot.model.ObjectReference;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Properties;
 
 /**
  * Eclipse MAT IObjectReader implementation backed by underlying HPROF dump file via RandomAccessFile
@@ -32,16 +34,56 @@ public class DhpHeapObjectReader implements IObjectReader {
 
     private RandomAccessFile raf;
     private int idSize = 8;
+    private java.sql.Connection dbConn;
+    private java.sql.PreparedStatement psPos;
 
     @Override
     public void open(ISnapshot snapshot) throws SnapshotException, IOException {
-        String path = snapshot.getSnapshotInfo().getPath();
-        File file = new File(path);
+        String hprofPath = (String) snapshot.getSnapshotInfo().getProperty("dhp.hprofPath");
+        if (hprofPath == null || hprofPath.isEmpty()) {
+            hprofPath = snapshot.getSnapshotInfo().getPath();
+        }
+        File file = new File(hprofPath);
+        if (file.exists() && (file.getName().endsWith(".properties") || file.getName().endsWith(".dhp"))) {
+            try (FileInputStream fis = new FileInputStream(file)) {
+                Properties props = new Properties();
+                props.load(fis);
+                String dumpPath = props.getProperty("dump.file");
+                if (dumpPath != null) {
+                    file = new File(dumpPath);
+                }
+            } catch (Exception ignored) {}
+        }
         if (file.exists() && !file.isDirectory()) {
             this.raf = new RandomAccessFile(file, "r");
             this.idSize = snapshot.getSnapshotInfo().getIdentifierSize();
             if (this.idSize <= 0) {
                 this.idSize = 8;
+            }
+        }
+
+        String jdbcUrl = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.url");
+        String user = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.user");
+        String pass = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.password");
+        if (jdbcUrl == null && (snapshot.getSnapshotInfo().getPath().endsWith(".properties") || snapshot.getSnapshotInfo().getPath().endsWith(".dhp"))) {
+            File propFile = new File(snapshot.getSnapshotInfo().getPath());
+            if (propFile.exists()) {
+                try (FileInputStream fis = new FileInputStream(propFile)) {
+                    Properties props = new Properties();
+                    props.load(fis);
+                    jdbcUrl = props.getProperty("db.url");
+                    user = props.getProperty("db.user", "");
+                    pass = props.getProperty("db.password", "");
+                } catch (Exception ignored) {}
+            }
+        }
+        if (jdbcUrl != null && !jdbcUrl.isEmpty()) {
+            try {
+                this.dbConn = java.sql.DriverManager.getConnection(jdbcUrl, user != null ? user : "", pass != null ? pass : "");
+                this.psPos = dbConn.prepareStatement("SELECT file_position FROM dhp_objects WHERE object_address = ?");
+                System.out.println("[DHP-Reader] Successfully connected to database: " + jdbcUrl);
+            } catch (Exception e) {
+                System.err.println("[DHP-Reader] Could not connect to database " + jdbcUrl + ": " + e.getMessage());
             }
         }
     }
@@ -60,6 +102,15 @@ public class DhpHeapObjectReader implements IObjectReader {
         if (posLookup != null) {
             try {
                 filePos = posLookup.get(objectId);
+            } catch (Exception ignored) {}
+        } else if (psPos != null && address != 0) {
+            try {
+                psPos.setLong(1, address);
+                try (java.sql.ResultSet rs = psPos.executeQuery()) {
+                    if (rs.next()) {
+                        filePos = rs.getLong(1);
+                    }
+                }
             } catch (Exception ignored) {}
         }
 
@@ -110,9 +161,8 @@ public class DhpHeapObjectReader implements IObjectReader {
                     : new InstanceImpl(objectId, address, cImpl, Collections.emptyList());
         }
 
-        // Class hierarchy in top-down order (Object -> SuperClass -> Class)
+        // Class hierarchy in standard MAT order (target class first, followed by superclasses)
         List<IClass> hierarchy = resolveClassHierarchy(snapshot, targetClass);
-        Collections.reverse(hierarchy); // Now base classes first, target class last
 
         List<Field> instanceFields = new ArrayList<>();
         if (raf != null && filePos > 0) {
@@ -257,6 +307,18 @@ public class DhpHeapObjectReader implements IObjectReader {
         if (raf != null) {
             raf.close();
             raf = null;
+        }
+        if (psPos != null) {
+            try {
+                psPos.close();
+            } catch (Exception ignored) {}
+            psPos = null;
+        }
+        if (dbConn != null) {
+            try {
+                dbConn.close();
+            } catch (Exception ignored) {}
+            dbConn = null;
         }
     }
 }

@@ -49,7 +49,18 @@ public class Pass2ObjectIngester {
         storage.saveSnapshotInfo("idSize", String.valueOf(pass1.getHeader().idSize()));
         storage.saveSnapshotInfo("creationTime", String.valueOf(pass1.getHeader().creationTime()));
         storage.saveClasses(pass1.getClasses().values());
-        storage.insertGcRootsBatch(pass1.getGcRoots());
+        List<HeapRecords.GcRootRecord> allRoots = new ArrayList<>(pass1.getGcRoots());
+        boolean hasZero = false;
+        for (var r : allRoots) {
+            if (r.objectAddress() == 0L) {
+                hasZero = true;
+                break;
+            }
+        }
+        if (!hasZero) {
+            allRoots.add(new HeapRecords.GcRootRecord(0L, 0L, 1, 0L));
+        }
+        storage.insertGcRootsBatch(allRoots);
 
         int idSize = pass1.getHeader().idSize();
         int batchSize = governor.getBatchSize();
@@ -108,6 +119,18 @@ public class Pass2ObjectIngester {
         objectBatch.add(new HeapStorageEngine.RawObjectRecord(
                 systemClassLoaderObjId, 0L, classLoaderClassObjId, classLoaderInstanceSize, 0L, false
         ));
+        int sysSeq = 0;
+        if (classLoaderClassObjId >= 0) {
+            edgeBatch.add(new HeapStorageEngine.ReferenceEdge(systemClassLoaderObjId, sysSeq++, classLoaderClassObjId));
+        }
+        for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
+            if (cls.classLoaderId() == 0L) {
+                int cid = addressToId.get(cls.classId());
+                if (cid >= 0) {
+                    edgeBatch.add(new HeapStorageEngine.ReferenceEdge(systemClassLoaderObjId, sysSeq++, cid));
+                }
+            }
+        }
 
         for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
             int classObjId = addressToId.get(cls.classId());
@@ -188,6 +211,20 @@ public class Pass2ObjectIngester {
                                 int classObjId = addressToId.get(classId);
                                 boolean isFirstClassDump = processedClassDumps.add(classId);
                                 int edgeSeq = 0;
+                                if (classObjId != -1 && isFirstClassDump) {
+                                    if (javaLangClassObjId != -1) {
+                                        edgeBatch.add(new HeapStorageEngine.ReferenceEdge(classObjId, edgeSeq++, javaLangClassObjId));
+                                    }
+                                    if (superClassId != 0 && addressToId.containsKey(superClassId)) {
+                                        edgeBatch.add(new HeapStorageEngine.ReferenceEdge(classObjId, edgeSeq++, addressToId.get(superClassId)));
+                                    }
+                                    int clId = (classLoaderId != 0 && addressToId.containsKey(classLoaderId))
+                                            ? addressToId.get(classLoaderId)
+                                            : systemClassLoaderObjId;
+                                    if (clId >= 0) {
+                                        edgeBatch.add(new HeapStorageEngine.ReferenceEdge(classObjId, edgeSeq++, clId));
+                                    }
+                                }
                                 for (int i = 0; i < sfCount; i++) {
                                     reader.skipBytes(idSize); // fieldNameId
                                     int t = reader.readByte();
@@ -236,7 +273,7 @@ public class Pass2ObjectIngester {
                                 ));
 
                                 int edgeSeq = 0;
-                                if (assignedClassId > 0) {
+                                if (assignedClassId >= 0) {
                                     edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, edgeSeq++, assignedClassId));
                                 }
 
@@ -296,7 +333,7 @@ public class Pass2ObjectIngester {
                                 ));
 
                                 int edgeSeq = 0;
-                                if (assignedClassId > 0) {
+                                if (assignedClassId >= 0) {
                                     edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, edgeSeq++, assignedClassId));
                                 }
 
@@ -345,7 +382,7 @@ public class Pass2ObjectIngester {
                                         objId, objAddr, assignedClassId, usedSize, objPos, true
                                 ));
 
-                                if (assignedClassId > 0) {
+                                if (assignedClassId >= 0) {
                                     edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, 0, assignedClassId));
                                 }
 
@@ -378,8 +415,13 @@ public class Pass2ObjectIngester {
             edgeBatch.clear();
         }
 
-        storage.finishIngestion();
-        log.info("Pass 2 Completed: Ingested {} objects into database (writtenObjects={}).", currentObjectId, writtenObjects.size());
+        try {
+            storage.runGarbageCollection();
+            storage.finishIngestion();
+        } catch (SQLException e) {
+            throw new IOException("Failed to run database garbage collection and indexing", e);
+        }
+        log.info("Pass 2 Completed: Ingested & garbage-collected objects in database (writtenObjects={}).", writtenObjects.size());
     }
 
     private List<HeapRecords.ClassRecord> resolveClassHierarchy(long classId) {

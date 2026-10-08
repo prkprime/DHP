@@ -33,7 +33,7 @@ public class DominatorTreeEngine {
 
         int n = objectCount;
         int superRoot = n; // Artificial super root index
-        int totalVertices = n + 1;
+        int totalVertices = n + 2; // Supports 1-indexed vertex array up to n + 1
 
         // 1. Load outbound adjacency and shallow sizes
         int[][] outAdj = storage.loadAllOutboundReferences(n);

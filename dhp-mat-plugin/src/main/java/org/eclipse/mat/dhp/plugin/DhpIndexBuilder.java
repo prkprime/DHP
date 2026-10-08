@@ -50,6 +50,7 @@ public class DhpIndexBuilder implements IIndexBuilder {
     public void init(File file, String prefix) throws SnapshotException, IOException {
         this.dumpOrConfigFile = file;
         this.prefix = prefix;
+        DhpSnapshotFactory.install();
     }
 
     @Override
@@ -122,23 +123,32 @@ public class DhpIndexBuilder implements IIndexBuilder {
                     var f = cls.fields().get(i);
                     fields[i] = new FieldDescriptor(f.name(), f.type());
                 }
+                int sysLoaderObjId = storage.getObjectIdByAddress(0L);
+                int superClassObjId = cls.superClassId() != 0 ? storage.getObjectIdByAddress(cls.superClassId()) : -1;
+                long superClassAddr = superClassObjId >= 0 ? cls.superClassId() : 0L;
+                int classLoaderObjId = cls.classLoaderId() != 0 ? storage.getObjectIdByAddress(cls.classLoaderId()) : sysLoaderObjId;
+                if (classLoaderObjId < 0) classLoaderObjId = sysLoaderObjId >= 0 ? sysLoaderObjId : 0;
+                long classLoaderAddr = cls.classLoaderId() != 0 ? cls.classLoaderId() : 0L;
+
                 ClassImpl classImpl = new ClassImpl(
                         cls.classId(),
                         cls.name(),
-                        cls.superClassId(),
-                        cls.classLoaderId(),
+                        superClassAddr,
+                        classLoaderAddr,
                         new Field[0],
                         fields
                 );
                 if (classObjId >= 0) {
                     classImpl.setObjectId(classObjId);
+                    classImpl.setCacheEntry(classObjId);
                     classImpl.setHeapSizePerInstance(cls.instanceSize());
                     classImpl.setUsedHeapSize(storage.getObjectUsedSize(classObjId));
-                    classImpl.setCacheEntry(classObjId);
-                    int superClassObjId = cls.superClassId() != 0 ? storage.getObjectIdByAddress(cls.superClassId()) : -1;
-                    int classLoaderObjId = storage.getObjectIdByAddress(cls.classLoaderId());
-                    if (superClassObjId >= 0) classImpl.setSuperClassIndex(superClassObjId);
-                    if (classLoaderObjId >= 0) classImpl.setClassLoaderIndex(classLoaderObjId);
+                    if (superClassObjId >= 0) {
+                        classImpl.setSuperClassIndex(superClassObjId);
+                    } else {
+                        classImpl.setSuperClassIndex(-1);
+                    }
+                    classImpl.setClassLoaderIndex(classLoaderObjId);
 
                     var stat = classStats.get(classObjId);
                     if (stat != null && countField != null && totalSizeField != null) {
@@ -153,6 +163,30 @@ public class DhpIndexBuilder implements IIndexBuilder {
                             Long.toHexString(cls.classId()), cls.name(), classObjId);
                 }
             }
+
+            // Find java.lang.Class ClassImpl
+            ClassImpl javaLangClass = null;
+            for (java.util.Iterator<ClassImpl> it = classesById.values(); it.hasNext(); ) {
+                ClassImpl c = it.next();
+                if ("java.lang.Class".equals(c.getName())) {
+                    javaLangClass = c;
+                    break;
+                }
+            }
+
+            for (java.util.Iterator<ClassImpl> it = classesById.values(); it.hasNext(); ) {
+                ClassImpl c = it.next();
+                if (javaLangClass != null && c.getClazz() == null) {
+                    c.setClassInstance(javaLangClass);
+                }
+                if (c.getSuperClassId() >= 0) {
+                    ClassImpl superC = classesById.get(c.getSuperClassId());
+                    if (superC != null) {
+                        superC.addSubClass(c);
+                    }
+                }
+            }
+
             log.info("Total classes in storage: {}, populated: {}", allClasses.size(), classesById.size());
             preliminaryIndex.setClassesById(classesById);
 
@@ -176,7 +210,10 @@ public class DhpIndexBuilder implements IIndexBuilder {
                                 list = new ArrayList<>();
                                 localsMap.put(objId, list);
                             }
-                            list.add(new XGCRootInfo(root.objectAddress(), root.referrerAddress(), root.rootType()));
+                            var xgc = new XGCRootInfo(root.objectAddress(), root.referrerAddress(), root.rootType());
+                            xgc.setObjectId(objId);
+                            xgc.setContextId(threadObjId);
+                            list.add(xgc);
                         }
                     } else {
                         List<XGCRootInfo> list = gcRootsMap.get(objId);
@@ -184,10 +221,37 @@ public class DhpIndexBuilder implements IIndexBuilder {
                             list = new ArrayList<>();
                             gcRootsMap.put(objId, list);
                         }
-                        list.add(new XGCRootInfo(root.objectAddress(), root.referrerAddress(), root.rootType()));
+                        var xgc = new XGCRootInfo(root.objectAddress(), root.referrerAddress(), root.rootType());
+                        xgc.setObjectId(objId);
+                        list.add(xgc);
                     }
                 }
             }
+
+            // Ensure system classloader (address 0L) is in gcRootsMap
+            int sysLoaderObjId = storage.getObjectIdByAddress(0L);
+            if (sysLoaderObjId >= 0 && !gcRootsMap.containsKey(sysLoaderObjId)) {
+                List<XGCRootInfo> list = new ArrayList<>();
+                var xgc = new XGCRootInfo(0L, 0L, 1);
+                xgc.setObjectId(sysLoaderObjId);
+                list.add(xgc);
+                gcRootsMap.put(sysLoaderObjId, list);
+            }
+
+            // Ensure all classes with classLoaderId == 0 are included in gcRootsMap (MAT parity)
+            for (HeapRecords.ClassRecord cls : allClasses) {
+                if (cls.classLoaderId() == 0L) {
+                    int classObjId = storage.getObjectIdByAddress(cls.classId());
+                    if (classObjId >= 0 && !gcRootsMap.containsKey(classObjId)) {
+                        List<XGCRootInfo> list = new ArrayList<>();
+                        var xgc = new XGCRootInfo(cls.classId(), 0L, 2);
+                        xgc.setObjectId(classObjId);
+                        list.add(xgc);
+                        gcRootsMap.put(classObjId, list);
+                    }
+                }
+            }
+
             preliminaryIndex.setGcRoots(gcRootsMap);
             preliminaryIndex.setThread2objects2roots(thread2objects2roots);
 
@@ -198,27 +262,80 @@ public class DhpIndexBuilder implements IIndexBuilder {
                     storage::getObjectIdByAddress
             ));
 
+            int finalJavaLangClassObjId = -1;
+            for (HeapRecords.ClassRecord cls : allClasses) {
+                if ("java.lang.Class".equals(cls.name())) {
+                    finalJavaLangClassObjId = storage.getObjectIdByAddress(cls.classId());
+                    break;
+                }
+            }
+            int defaultClassId = finalJavaLangClassObjId >= 0 ? finalJavaLangClassObjId : (classesById.size() > 0 ? classesById.keys().next() : 0);
+
             // 4. Object-to-Class index (IOne2OneIndex)
             preliminaryIndex.setObject2classId(new DbOne2OneIndex(
                     objectCount,
-                    id -> (int) storage.getObjectClassId(id)
+                    id -> {
+                        int cid = (int) storage.getObjectClassId(id);
+                        if (cid < 0 || !classesById.containsKey(cid)) {
+                            return defaultClassId;
+                        }
+                        return cid;
+                    }
             ));
+
+            // Collect bootstrap class IDs for system class loader outbound edges
+            it.unimi.dsi.fastutil.ints.IntArrayList bootstrapClassIds = new it.unimi.dsi.fastutil.ints.IntArrayList();
+            for (HeapRecords.ClassRecord cls : allClasses) {
+                if (cls.classLoaderId() == 0L) {
+                    int cid = storage.getObjectIdByAddress(cls.classId());
+                    if (cid >= 0) bootstrapClassIds.add(cid);
+                }
+            }
+            int[] bootstrapClassIdsArray = bootstrapClassIds.toIntArray();
 
             // 5. Outbound references index (IOne2ManyIndex)
             preliminaryIndex.setOutbound(new DbOne2ManyIndex(
                     objectCount,
-                    storage::getOutboundReferences
+                    id -> {
+                        int classId = (int) storage.getObjectClassId(id);
+                        if (id == sysLoaderObjId) {
+                            int[] orig = storage.getOutboundReferences(id);
+                            it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet set = new it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet();
+                            if (classId >= 0) set.add(classId);
+                            for (int x : orig) set.add(x);
+                            for (int x : bootstrapClassIdsArray) set.add(x);
+                            return set.toIntArray();
+                        }
+                        int[] refs = storage.getOutboundReferences(id);
+                        if (classId >= 0) {
+                            if (refs.length == 0 || refs[0] != classId) {
+                                int[] newRefs = new int[refs.length + 1];
+                                newRefs[0] = classId;
+                                System.arraycopy(refs, 0, newRefs, 1, refs.length);
+                                return newRefs;
+                            }
+                        }
+                        return refs;
+                    }
             ));
 
-            // 6. Array sizes index (IOne2SizeIndex)
+            // 6. Array sizes index (IOne2SizeIndex) - only populated for array objects!
+            boolean[] arrayFlags = storage.getAllArrayFlags(objectCount);
             preliminaryIndex.setArray2size(new DbOne2SizeIndex(
                     objectCount,
-                    storage::getObjectUsedSize
+                    id -> (id >= 0 && id < arrayFlags.length && arrayFlags[id]) ? storage.getObjectUsedSize(id) : 0L
             ));
 
             // 7. Update SnapshotInfo metadata
             XSnapshotInfo info = preliminaryIndex.getSnapshotInfo();
             if (info != null) {
+                if (hprofFile != null) {
+                    info.setPath(hprofFile.getAbsolutePath());
+                    info.setProperty("dhp.hprofPath", hprofFile.getAbsolutePath());
+                }
+                info.setProperty("dhp.db.url", jdbcUrl);
+                info.setProperty("dhp.db.user", user);
+                info.setProperty("dhp.db.password", password);
                 info.setNumberOfObjects(objectCount);
                 info.setNumberOfClasses(classesById.size());
                 info.setNumberOfGCRoots(gcRootsMap.size());
@@ -229,7 +346,6 @@ public class DhpIndexBuilder implements IIndexBuilder {
                     }
                     info.setUsedHeapSize(storage.getTotalHeapSize());
                 } catch (Exception ignored) {}
-                info.setProperty("dhp.o2pos", (DhpHeapObjectReader.LongLookup & java.io.Serializable) storage::getObjectFilePosition);
             }
 
             log.info("DHP Preliminary Indexes successfully populated for Eclipse MAT.");

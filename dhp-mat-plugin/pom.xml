@@ -73,4 +73,68 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <resources>
+            <resource>
+                <directory>${project.basedir}</directory>
+                <includes>
+                    <include>plugin.xml</include>
+                </includes>
+            </resource>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+        </resources>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.2</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <artifactSet>
+                                <excludes>
+                                    <exclude>org.eclipse.mat:*</exclude>
+                                    <exclude>org.eclipse.platform:*</exclude>
+                                </excludes>
+                            </artifactSet>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <manifestEntries>
+                                        <Bundle-ManifestVersion>2</Bundle-ManifestVersion>
+                                        <Bundle-Name>Dynamic Heap Parser (DHP)</Bundle-Name>
+                                        <Bundle-SymbolicName>org.eclipse.mat.dhp;singleton:=true</Bundle-SymbolicName>
+                                        <Bundle-Version>1.0.0.SNAPSHOT</Bundle-Version>
+                                        <Bundle-Vendor>Eclipse MAT DHP</Bundle-Vendor>
+                                        <Bundle-RequiredExecutionEnvironment>JavaSE-21</Bundle-RequiredExecutionEnvironment>
+                                        <Bundle-Activator>org.eclipse.mat.dhp.plugin.DhpPlugin</Bundle-Activator>
+                                        <Require-Bundle>org.eclipse.core.runtime,org.eclipse.equinox.app,org.eclipse.mat.api,org.eclipse.mat.parser,org.eclipse.mat.report</Require-Bundle>
+                                        <Export-Package>org.eclipse.mat.dhp.plugin,org.eclipse.mat.dhp.plugin.index</Export-Package>
+                                        <DynamicImport-Package>*</DynamicImport-Package>
+                                    </manifestEntries>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 </project>

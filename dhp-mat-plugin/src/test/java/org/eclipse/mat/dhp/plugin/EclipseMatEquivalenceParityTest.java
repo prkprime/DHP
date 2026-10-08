@@ -47,9 +47,9 @@ class EclipseMatEquivalenceParityTest {
 
         builder.fill(preliminary, new VoidProgressListener());
 
-        // 1. Verify object count
+        // 1. Verify object count (reachable objects after DB garbage collection)
         int objectCount = preliminary.identifiers.size();
-        assertThat(objectCount).isGreaterThan(20000);
+        assertThat(objectCount).isGreaterThan(15000);
 
         // 2. Verify class resolution parity
         var classesMap = preliminary.classesById;

@@ -55,6 +55,9 @@ public class DbOne2ManyIndex implements IIndexReader.IOne2ManyObjectsIndex {
             if (key instanceof Number num) {
                 return lookup.get(num.intValue());
             }
+            if (key instanceof org.eclipse.mat.snapshot.model.IClass c) {
+                return lookup.get(c.getObjectId());
+            }
             return new int[0];
         } catch (SQLException e) {
             throw new SnapshotException("Error retrieving objects for key " + key, e);

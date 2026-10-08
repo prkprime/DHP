@@ -106,7 +106,7 @@ class EclipseMatGeneralSnapshotTestSuiteTest {
 
         indexManager.setReader(IndexManager.Index.DOMINATED, new DbOne2ManyIndex(
                 objectCount + 1,
-                id -> (id == 0 ? new int[0] : storage.getImmediateDominatedIds(id - 1))
+                id -> storage.getImmediateDominatedIds(id - 1)
         ));
 
         indexManager.setReader(IndexManager.Index.O2RETAINED, new DbOne2LongIndex(
@@ -272,6 +272,12 @@ class EclipseMatGeneralSnapshotTestSuiteTest {
                 assertThat(chars).isNotNull();
                 assertThat(chars).isInstanceOf(char[].class);
             }
+
+            // 9. Verify Class Histogram computation
+            org.eclipse.mat.snapshot.Histogram histogram = snapshot.getHistogram(new org.eclipse.mat.util.VoidProgressListener());
+            assertThat(histogram).isNotNull();
+            assertThat(histogram.getClassHistogramRecords()).isNotEmpty();
+            assertThat(histogram.getClassLoaderHistogramRecords()).isNotEmpty();
         }
     }
 
@@ -348,6 +354,10 @@ class EclipseMatGeneralSnapshotTestSuiteTest {
 
             int[] dominated = snapshot.getImmediateDominatedIds(rId);
             int[] retainedSetR = getRetainedSet(snapshot, ctx.storage(), rId);
+
+            // Assert root dominators are present and non-empty
+            int[] rootDominated = snapshot.getImmediateDominatedIds(-1);
+            assertThat(rootDominated.length).isGreaterThan(0);
 
             // Assertions from Eclipse MAT DominatorTreeTest.java
             assertEquals(8, dominated.length, "R should be immediate dominator of 8 objects");

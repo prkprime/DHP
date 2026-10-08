@@ -1,0 +1,206 @@
+# AGENTS.md — Dynamic Heap Parser (DHP) Developer & Agent Guide
+
+Welcome to the **Dynamic Heap Parser (DHP)** repository. This document serves as the primary technical specification, architectural reference, and operational playbook for AI agents and human developers maintaining, debugging, or extending this project.
+
+---
+
+## 1. Project Mission & Core Architecture
+
+DHP is a high-throughput, constant-memory HPROF heap dump ingestion and graph engine designed as a drop-in storage and index provider for **Eclipse Memory Analyzer (MAT)**.
+
+Standard Eclipse MAT relies on custom in-memory and disk-paged index files (`.idx`, `.o2c`, `.inbound`, `.outbound`, `.dom`) that consume significant RAM during generation. DHP solves this bottleneck by streaming HPROF records into an optimized relational database engine (SQLite WAL with memory budget governance or PostgreSQL) and computing dominator trees and retained sizes before exposing standard MAT preliminary indexes.
+
+### Ingestion & Analysis Pipeline
+
+```
+                     ┌────────────────────────────────────────┐
+                     │          Raw .hprof Heap Dump          │
+                     └───────────────────┬────────────────────┘
+                                         │
+                        [Pass 1: Fast Scan & Metadata]
+                        - Discovers string constants
+                        - Maps class definitions & fields
+                        - Identifies GC roots & thread locals
+                                         │
+                                         ▼
+                     ┌────────────────────────────────────────┐
+                     │        Dynamic Memory Governor         │
+                     │  - Sets batch sizes & thread pools     │
+                     │  - Tunes SQLite PRAGMAs & page cache   │
+                     └───────────────────┬────────────────────┘
+                                         │
+                        [Pass 2: Streaming Object Ingest]
+                        - High-speed batch inserts (no indexes)
+                        - Instances, object arrays, primitive arrays
+                        - Outbound and inbound references
+                                         │
+                                         ▼
+                     ┌────────────────────────────────────────┐
+                     │      Bulk B-Tree Index Generation      │
+                     │  - Unique PKs on object_id & address   │
+                     │  - Composite indexes on references     │
+                     └───────────────────┬────────────────────┘
+                                         │
+                        [Dominator Tree & Retained Engine]
+                        - Lengauer-Tarjan semi-dominator algorithm
+                        - Depth-First Search from artificial super root
+                        - Immediate dominators & bottom-up retained size
+                                         │
+                                         ▼
+                     ┌────────────────────────────────────────┐
+                     │     Eclipse MAT DHP Plugin Layer       │
+                     │  - DhpIndexBuilder (IIndexBuilder)     │
+                     │  - DhpHeapObjectReader (IObjectReader) │
+                     │  - Database-backed IIndexReader adapters│
+                     └────────────────────────────────────────┘
+```
+
+---
+
+## 2. Reactor Modules & Responsibilities
+
+The project is structured as a Maven multi-module reactor under Java 21:
+
+| Module | Artifact ID | Description |
+| :--- | :--- | :--- |
+| **`dhp-core`** | `org.eclipse.mat.dhp:dhp-core` | Core parsing and graph logic: `HprofBinaryReader`, `Pass1ScanParser`, `Pass2ObjectIngester`, `DominatorTreeEngine`, `MemoryGovernor`, `HeapRecords`, and `HprofConstants`. Contains zero JDBC code. |
+| **`dhp-storage-jdbc`** | `org.eclipse.mat.dhp:dhp-storage-jdbc` | JDBC storage abstraction and engine: `HeapStorageEngine` interface and `JdbcHeapStorageEngine` implementation supporting SQLite WAL and PostgreSQL with HikariCP connection pooling and bulk indexing. |
+| **`dhp-cli`** | `org.eclipse.mat.dhp:dhp-cli` | Command-line interface (`DhpMain`) using Picocli to parse dumps directly from the shell or execute headless database staging. Packaged as a fat JAR with `maven-shade-plugin`. |
+| **`dhp-mat-plugin`** | `org.eclipse.mat.dhp:dhp-mat-plugin` | Eclipse MAT plugin implementing `IIndexBuilder` (`DhpIndexBuilder`) and `IObjectReader` (`DhpHeapObjectReader`), database-backed index adapters (`DbOne2LongIndex`, `DbOne2OneIndex`, `DbOne2ManyIndex`, `DbOne2SizeIndex`), packaged as an OSGi bundle with `plugin.xml` and shaded runtime dependencies. |
+
+---
+
+## 3. Database Schema & Indexing Strategy
+
+To achieve constant memory usage and avoid intermediate lock contention during ingestion:
+1. **Raw Ingestion Phase**: Tables are created without secondary indexes or primary key constraints. Records are inserted in large batches (`INSERT INTO dhp_objects...`, `INSERT INTO dhp_outbound_references...`).
+2. **Bulk Index Phase**: Once Pass 2 finishes, indexes and constraints are created in parallel via `CREATE UNIQUE INDEX` and `CREATE INDEX`.
+
+### Tables
+
+- **`dhp_snapshot_info`**: Key-value pairs for snapshot metadata (`idSize`, `creationDate`, `totalHeapSize`).
+- **`dhp_classes`**: Stores `class_id`, `super_class_id`, `class_loader_id`, `class_name`, `instance_size`, `fields_data`.
+- **`dhp_objects`**: Primary entity table storing `object_id` (0-indexed integer), `object_address` (JVM 64-bit pointer), `class_id`, `used_size` (shallow size), `file_position` (byte offset in `.hprof`), and `is_array`.
+- **`dhp_outbound_references`**: Directed edges `(from_object_id, seq, to_object_id)` representing object references.
+- **`dhp_inbound_references`**: Reverse edges `(to_object_id, from_object_id)` for incoming references.
+- **`dhp_gc_roots`**: Root pointers `(object_address, referrer_address, root_type)`.
+- **`dhp_dominator_tree`**: Dominator computation results: `object_id`, `immediate_dominator_id`, and `retained_size`.
+
+---
+
+## 4. Dominator Tree Algorithm (Lengauer-Tarjan)
+
+`DominatorTreeEngine` implements the classic Lengauer-Tarjan algorithm for dominator tree computation:
+- **Artificial Super Root**: Connects to all GC root objects to provide a single entry point for Depth-First Search (DFS).
+- **Semi-dominators**: Computed using path compression with disjoint sets (`ancestor`, `label`, `semi`).
+- **Immediate Dominators**: Resolves immediate dominator (`idom`) for all reachable heap objects.
+- **Retained Sizes**: Computed bottom-up across the dominator tree by accumulating shallow sizes from leaves to roots.
+- **MAT Parity**: The resulting tree conforms to Eclipse MAT's dominator semantics where super-root children represent top-level GC dominators.
+
+---
+
+## 5. Eclipse MAT Plugin Integration
+
+### File Extensions & Descriptors
+The plugin binds to `.dhp` and `.properties` extensions:
+- `.properties` or `.dhp` files serve as database descriptors pointing to the SQLite DB or PostgreSQL instance and the underlying `.hprof` file.
+- Example descriptor:
+  ```properties
+  db.url=jdbc:sqlite:/path/to/heapdump.dhp.db
+  dump.file=/path/to/heapdump.hprof
+  memory.budget=4G
+  ```
+- If the database is not yet ingested, `DhpIndexBuilder` will ingest the `.hprof` into the database on the fly. If already ingested, it reuses the precomputed tables and dominator tree immediately.
+
+### Object & Array Payload Reading
+`DhpHeapObjectReader` utilizes `RandomAccessFile` and indexed `file_position` from the database:
+- Reads primitive arrays directly from binary offsets into typed Java arrays (`boolean[]`, `byte[]`, `char[]`, `int[]`, `long[]`, etc.).
+- Reads object arrays and resolves reference pointers.
+- Reconstructs instance field values according to JVM class hierarchy specification (base class fields first, subclass fields appended).
+
+---
+
+## 6. Build, Test, and Packaging Instructions
+
+### Prerequisites
+- JDK 21+ (`java -version` >= 21)
+- Maven 3.9+
+- Docker (optional, for PostgreSQL tests and PostgreSQL staging)
+
+### Commands
+- **Full Reactor Build**:
+  ```bash
+  mvn clean install
+  ```
+- **Run Unit & Parity Tests**:
+  ```bash
+  mvn test
+  ```
+- **Build Standalone CLI**:
+  ```bash
+  mvn clean package -pl dhp-cli -am -DskipTests
+  # Generates dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar (shaded fat JAR)
+  ```
+- **Build MAT Plugin Bundle**:
+  ```bash
+  mvn clean package -pl dhp-mat-plugin -am -DskipTests
+  # Generates dhp-mat-plugin/target/dhp-mat-plugin-1.0.0-SNAPSHOT.jar (OSGi shaded bundle)
+  ```
+
+---
+
+## 7. Installing into Eclipse Memory Analyzer (MAT)
+
+1. Build the shaded plugin jar:
+   ```bash
+   mvn package -pl dhp-mat-plugin -am -DskipTests
+   ```
+2. Copy the artifact into MAT's `plugins/` directory:
+   ```bash
+   cp dhp-mat-plugin/target/dhp-mat-plugin-1.0.0-SNAPSHOT.jar \
+      /path/to/mat/plugins/org.eclipse.mat.dhp_1.0.0.SNAPSHOT.jar
+   ```
+3. Register the bundle in MAT's `configuration/org.eclipse.equinox.simpleconfigurator/bundles.info`:
+   ```text
+   org.eclipse.mat.dhp,1.0.0.SNAPSHOT,plugins/org.eclipse.mat.dhp_1.0.0.SNAPSHOT.jar,4,true
+   ```
+4. Clear the OSGi cache to force extension re-indexing:
+   ```bash
+   rm -rf /path/to/mat/configuration/org.eclipse.osgi
+   ```
+5. Launch MAT:
+   ```bash
+   /path/to/mat/MemoryAnalyzer -clean
+   ```
+
+---
+
+## 8. CLI Usage Examples
+
+### Parse into SQLite
+```bash
+java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
+  --dump /path/to/heapdump.hprof \
+  --jdbcurl jdbc:sqlite:/path/to/heapdump.db \
+  --memory-budget 2147483648 \
+  --threads 4
+```
+
+### Parse into PostgreSQL
+```bash
+java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
+  --dump /path/to/heapdump.hprof \
+  --jdbcurl jdbc:postgresql://localhost:5432/heapdb \
+  --user dhp \
+  --password dhppass \
+  --memory-budget 4294967296 \
+  --threads 8
+```
+
+---
+
+## 9. Developer & Coding Guidelines
+
+1. **Memory Budget Discipline**: When implementing graph algorithms or data transformations, never load arbitrary unbounded collections into JVM memory. Use streamed queries, paginated queries, or memory-mapped primitives (`fastutil` primitive collections).
+2. **Deterministic Parity**: Any changes to object size calculation, dominator computation, or hierarchy traversal must pass `EclipseMatEquivalenceParityTest` and `EclipseMatGeneralSnapshotTestSuiteTest`.
+3. **OSGi & Serialization Safety**: In the MAT plugin, never store non-serializable objects (such as active connections or lambdas referencing JDBC components) in `XSnapshotInfo.properties`. MAT serializes snapshot metadata to disk when saving indexes.

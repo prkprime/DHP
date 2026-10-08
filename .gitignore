@@ -31,3 +31,9 @@ dependency-reduced-pom.xml
 # OS files
 .DS_Store
 Thumbs.db
+
+# Test cases, reports and workspaces
+test-cases/
+workspace/
+tools/dump-generator/bin/
+*.zip
