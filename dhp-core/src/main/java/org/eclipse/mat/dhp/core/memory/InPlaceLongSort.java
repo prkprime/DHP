@@ -100,14 +100,24 @@ public final class InPlaceLongSort {
     }
 
     /**
-     * In-place Dual-Pivot Quicksort (Yaroslavskiy algorithm) with zero auxiliary array allocation.
+     * In-place Dual-Pivot Quicksort (Yaroslavskiy algorithm) with zero auxiliary array allocation
+     * and strictly bounded O(log N) stack depth via tail-call loop elimination.
      */
     static void dualPivotQuicksort(long[] a, int low, int high) {
-        if (low < high) {
-            if (high - low < INSERTION_SORT_THRESHOLD) {
-                insertionSort(a, low, high);
-                return;
-            }
+        while (high - low >= INSERTION_SORT_THRESHOLD) {
+            // Sample equidistant elements for robust pivot selection
+            int mid = (low + high) >>> 1;
+            int sixth = (high - low) / 6;
+            int m1 = mid - sixth;
+            int m2 = mid;
+            int m3 = mid + sixth;
+
+            if (a[m1] > a[m2]) swap(a, m1, m2);
+            if (a[m2] > a[m3]) swap(a, m2, m3);
+            if (a[m1] > a[m2]) swap(a, m1, m2);
+
+            swap(a, m1, low);
+            swap(a, m3, high);
 
             if (a[low] > a[high]) {
                 swap(a, low, high);
@@ -141,11 +151,32 @@ public final class InPlaceLongSort {
             swap(a, low, l);
             swap(a, high, g);
 
-            dualPivotQuicksort(a, low, l - 1);
-            if (p < q) {
-                dualPivotQuicksort(a, l + 1, g - 1);
+            // Bounded stack depth: recurse on smaller partitions, loop on the largest
+            int len1 = (l - 1) - low;
+            int len2 = (g - 1) - (l + 1);
+            int len3 = high - (g + 1);
+
+            if (len1 >= len2 && len1 >= len3) {
+                if (p < q && len2 > 0) dualPivotQuicksort(a, l + 1, g - 1);
+                if (len3 > 0) dualPivotQuicksort(a, g + 1, high);
+                high = l - 1;
+            } else if (len2 >= len1 && len2 >= len3) {
+                if (len1 > 0) dualPivotQuicksort(a, low, l - 1);
+                if (len3 > 0) dualPivotQuicksort(a, g + 1, high);
+                if (p < q) {
+                    low = l + 1;
+                    high = g - 1;
+                } else {
+                    break;
+                }
+            } else {
+                if (len1 > 0) dualPivotQuicksort(a, low, l - 1);
+                if (p < q && len2 > 0) dualPivotQuicksort(a, l + 1, g - 1);
+                low = g + 1;
             }
-            dualPivotQuicksort(a, g + 1, high);
+        }
+        if (low < high) {
+            insertionSort(a, low, high);
         }
     }
 
