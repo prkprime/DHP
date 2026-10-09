@@ -16,8 +16,17 @@ if (-not (Test-Path $parentDir)) {
     New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
 }
 
-$version = "1.17.0.20260601"
 $baseVersion = "1.17.0"
+$pomPath = Join-Path $rootDir "pom.xml"
+if (Test-Path $pomPath) {
+    try {
+        [xml]$pom = Get-Content $pomPath
+        if ($pom.project.properties.'mat.version') {
+            $baseVersion = $pom.project.properties.'mat.version'
+        }
+    } catch {}
+}
+$version = "$baseVersion.20260601"
 $archive = "MemoryAnalyzer-$version-win32.win32.x86_64.zip"
 $destZip = Join-Path $parentDir $archive
 

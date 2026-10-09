@@ -117,19 +117,20 @@ The plugin binds **strictly to `.dhp` files**:
 - If the database is not yet ingested, `DhpIndexBuilder` will ingest the `.hprof` into the database on the fly. If already ingested (via `dhp-cli`), it reuses the precomputed tables and dominator tree immediately without generating legacy MAT index files.
 
 ### Automation & Tooling Scripts (`scripts/`)
-Cross-platform scripts (Linux, macOS, Windows) streamline installation and headless execution:
-- **`scripts/setup-all.sh` / `setup-all.bat`**: Master setup: installs local MAT dependencies to Maven, compiles the reactor, sets up Eclipse MAT, and installs the DHP bundle.
-- **`scripts/setup-deps.sh` / `setup-deps.bat`**: Installs `lib/*.jar` into the local Maven cache (`~/.m2`).
-- **`scripts/setup-mat.sh` / `setup-mat.bat` / `setup-mat.ps1`**: Sets up Eclipse MAT into `tools/mat/mat` (reusing local cache or downloading the official RCP release).
-- **`scripts/install-mat-plugin.sh` / `install-mat-plugin.bat`**: Deploys the built DHP shaded OSGi bundle to `MAT_HOME/plugins/`, registers it in `bundles.info`, and purges the OSGi cache.
-- **`scripts/install-p2-dependency.sh` / `install-p2-dependency.bat`**: Wrapper around `MemoryAnalyzer -application org.eclipse.equinox.p2.director` to install p2 update site features.
-- **`scripts/run-mat-headless.sh` / `run-mat-headless.bat`**: Headless report generation using `ParseHeapDump` against `.dhp` descriptor files.
+Cross-platform scripts (Linux, macOS, Windows) streamline installation, testing, and headless execution with full Bash (`.sh`), Batch (`.bat`), and PowerShell (`.ps1`) parity:
+- **`scripts/setup-all.sh` / `setup-all.bat` / `setup-all.ps1`**: Master setup: resolves MAT dependencies into Maven, compiles the reactor, sets up Eclipse MAT, and installs the DHP bundle.
+- **`scripts/setup-deps.sh` / `setup-deps.bat` / `setup-deps.ps1`**: Dynamically checks local Maven repository (`~/.m2`), extracts required p2 bundles (`api`, `parser`, `hprof`, `report`) from Eclipse MAT (downloading official MAT if missing), and installs them into Maven without committing binary JARs to Git.
+- **`scripts/setup-mat.sh` / `setup-mat.bat` / `setup-mat.ps1`**: Sets up Eclipse MAT into `tools/mat/mat` (reusing local cache or downloading the official RCP release dynamically matching `<mat.version>`).
+- **`scripts/install-mat-plugin.sh` / `install-mat-plugin.bat` / `install-mat-plugin.ps1`**: Deploys the built DHP shaded OSGi bundle to `MAT_HOME/plugins/`, registers it in `bundles.info`, and purges the OSGi cache.
+- **`scripts/install-p2-dependency.sh` / `install-p2-dependency.bat` / `install-p2-dependency.ps1`**: Wrapper around `MemoryAnalyzer -application org.eclipse.equinox.p2.director` to install p2 update site features.
+- **`scripts/run-mat-headless.sh` / `run-mat-headless.bat` / `run-mat-headless.ps1`**: Headless report generation using `ParseHeapDump` against `.dhp` descriptor files. Emits `Task: Writing HTML files` progress logs during Equinox report rendering.
 
 ### Object & Array Payload Reading
 `DhpHeapObjectReader` utilizes `RandomAccessFile` and indexed `file_position` from the database:
 - Reads primitive arrays directly from binary offsets into typed Java arrays (`boolean[]`, `byte[]`, `char[]`, `int[]`, `long[]`, etc.).
 - Reads object arrays and resolves reference pointers.
-- Reconstructs instance field values according to JVM class hierarchy specification (base class fields first, subclass fields appended).
+- Reconstructs instance field values with exact type and multi-level class hierarchy resolution.
+- Resolves strings, arrays, and complex instance graphs with 100% data parity.
 
 ---
 

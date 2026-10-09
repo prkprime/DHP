@@ -16,12 +16,10 @@
         <dependency>
             <groupId>org.eclipse.mat</groupId>
             <artifactId>org.eclipse.mat.api</artifactId>
-            <version>1.17.0</version>
         </dependency>
         <dependency>
             <groupId>org.eclipse.mat</groupId>
             <artifactId>org.eclipse.mat.parser</artifactId>
-            <version>1.17.0</version>
         </dependency>
         <dependency>
             <groupId>it.unimi.dsi</groupId>

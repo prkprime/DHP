@@ -51,6 +51,7 @@ public interface HeapStorageEngine extends Closeable {
     void saveDominatorTreeBatch(List<DominatorNode> dominators) throws SQLException;
     int getDominatorId(int objectId) throws SQLException;
     long getRetainedSize(int objectId) throws SQLException;
+    default int getObjectIdByRetainedSize(long retainedSize) throws SQLException { return -1; }
     int[] getImmediateDominatedIds(int objectId) throws SQLException;
 
     // Bulk graph & class instance queries

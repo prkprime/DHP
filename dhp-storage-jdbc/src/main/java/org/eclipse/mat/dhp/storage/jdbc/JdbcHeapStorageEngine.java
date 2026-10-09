@@ -235,7 +235,12 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                 StringBuilder sfSb = new StringBuilder();
                 for (var sf : cls.staticFields()) {
                     if (!sfSb.isEmpty()) sfSb.append(';');
-                    String valStr = sf.value() != null ? String.valueOf(sf.value()) : "";
+                    String valStr;
+                    if (sf.value() instanceof Character c) {
+                        valStr = String.valueOf((int) c);
+                    } else {
+                        valStr = sf.value() != null ? String.valueOf(sf.value()) : "";
+                    }
                     sfSb.append(encodeField(sf.name())).append(':')
                         .append(sf.type()).append(':')
                         .append(encodeField(valStr));
@@ -399,7 +404,13 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             return switch (type) {
                 case 2 -> Long.parseLong(rawVal); // OBJECT: object address
                 case 4 -> Boolean.parseBoolean(rawVal); // BOOLEAN
-                case 5 -> (char) Integer.parseInt(rawVal); // CHAR
+                case 5 -> {
+                    try {
+                        yield (char) Integer.parseInt(rawVal);
+                    } catch (NumberFormatException ignored) {
+                        yield rawVal.isEmpty() ? '\0' : rawVal.charAt(0);
+                    }
+                }
                 case 6 -> Float.parseFloat(rawVal); // FLOAT
                 case 7 -> Double.parseDouble(rawVal); // DOUBLE
                 case 8 -> Byte.parseByte(rawVal); // BYTE
@@ -415,12 +426,12 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     private static String encodeField(String s) {
         if (s == null) return "";
-        return s.replace("%", "%25").replace(":", "%3A").replace(";", "%3B");
+        return s.replace("%", "%25").replace(":", "%3A").replace(";", "%3B").replace("\0", "%00");
     }
 
     private static String decodeField(String s) {
         if (s == null) return "";
-        return s.replace("%3B", ";").replace("%3A", ":").replace("%25", "%");
+        return s.replace("%00", "\0").replace("%3B", ";").replace("%3A", ":").replace("%25", "%");
     }
 
     @Override
@@ -657,6 +668,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_to ON dhp_inbound_references(to_object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_gc_roots_obj ON dhp_gc_roots(object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_dominator ON dhp_dominator_tree(dominator_id, retained_size DESC);");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_retained ON dhp_dominator_tree(retained_size);");
 
             // 3. Precompute class stats table for instant snapshot opening
             stmt.execute("DELETE FROM dhp_class_stats;");
@@ -891,6 +903,17 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             }
         }
         return 0L;
+    }
+
+    @Override
+    public int getObjectIdByRetainedSize(long retainedSize) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement("SELECT object_id FROM dhp_dominator_tree WHERE retained_size = ? LIMIT 1")) {
+            ps.setLong(1, retainedSize);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getInt(1);
+            }
+        }
+        return -1;
     }
 
     @Override

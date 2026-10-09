@@ -461,7 +461,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             indexManager.setReader(IndexManager.Index.O2RETAINED, new DbOne2LongIndex(
                     objectCount,
                     storage::getRetainedSize,
-                    id -> -1
+                    storage::getObjectIdByRetainedSize
             ));
 
             // Prevent writing i2sv2.index by providing RetainedSizeCache with /dev/null or safe temp backed storage

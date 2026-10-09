@@ -90,30 +90,34 @@ cd DHP
 ./scripts/setup-all.sh
 ```
 
-**Windows:**
+**Windows (Command Prompt or PowerShell):**
 ```bat
 git clone https://github.com/prkprime/DHP.git
 cd DHP
 scripts\setup-all.bat
+# or in PowerShell:
+.\scripts\setup-all.ps1
 ```
 
-### 2. Modular Convenience Scripts
+### 2. Dynamic Eclipse MAT Dependency Resolution
 
-- **Install Local Dependencies to Maven**:
-  - Linux/macOS: `./scripts/setup-deps.sh`
-  - Windows: `scripts\setup-deps.bat`
-- **Setup Eclipse MAT Tooling**:
-  - Linux/macOS: `./scripts/setup-mat.sh [target_dir]`
-  - Windows: `scripts\setup-mat.bat` or `scripts\setup-mat.ps1`
-- **Install DHP Plugin into MAT**:
-  - Linux/macOS: `./scripts/install-mat-plugin.sh`
-  - Windows: `scripts\install-mat-plugin.bat`
-- **Install P2 Dependencies into MAT**:
-  - Linux/macOS: `./scripts/install-p2-dependency.sh <repository-url> <iu-id>`
-  - Windows: `scripts\install-p2-dependency.bat <repository-url> <iu-id>`
-- **Run Headless Analysis on `.dhp`**:
-  - Linux/macOS: `./scripts/run-mat-headless.sh <dump.dhp> [reports...]`
-  - Windows: `scripts\run-mat-headless.bat <dump.dhp> [reports...]`
+DHP decouples itself from pre-committed binary blobs in Git. Instead:
+- Root [`pom.xml`](pom.xml) defines a single source-of-truth property: `<mat.version>1.17.0</mat.version>`.
+- The setup scripts automatically detect existing local Eclipse MAT installations (or download the official distribution from Eclipse mirrors), extract the required p2 bundles (`api`, `parser`, `hprof`, `report`), and install them into your local Maven cache (`~/.m2`).
+- If already installed in `~/.m2`, the scripts verify them instantly without redundant downloads.
+
+### 3. Modular Convenience Scripts
+
+Full triple cross-platform parity (`.sh`, `.bat`, `.ps1`) across Linux, macOS, and Windows:
+
+| Task | Linux / macOS (Bash) | Windows (CMD) | Windows (PowerShell) |
+| :--- | :--- | :--- | :--- |
+| **Full Setup** | `./scripts/setup-all.sh` | `scripts\setup-all.bat` | `.\scripts\setup-all.ps1` |
+| **Install Dependencies** | `./scripts/setup-deps.sh` | `scripts\setup-deps.bat` | `.\scripts\setup-deps.ps1` |
+| **Download & Extract MAT** | `./scripts/setup-mat.sh` | `scripts\setup-mat.bat` | `.\scripts\setup-mat.ps1` |
+| **Deploy Plugin to MAT** | `./scripts/install-mat-plugin.sh` | `scripts\install-mat-plugin.bat` | `.\scripts\install-mat-plugin.ps1` |
+| **Install P2 Features** | `./scripts/install-p2-dependency.sh` | `scripts\install-p2-dependency.bat` | `.\scripts\install-p2-dependency.ps1` |
+| **Run Headless Report** | `./scripts/run-mat-headless.sh` | `scripts\run-mat-headless.bat` | `.\scripts\run-mat-headless.ps1` |
 
 ---
 
@@ -170,6 +174,10 @@ DHP registers **strictly the `.dhp` extension** in Eclipse MAT to bypass the leg
    ./scripts/run-mat-headless.sh /path/to/dump.dhp org.eclipse.mat.api:suspects
    ```
 3. Eclipse MAT opens the snapshot immediately without re-parsing, using direct SQL queries against SQLite/PostgreSQL and generating reports with zero disk index files!
+
+> [!NOTE]
+> **Understanding Headless Output (`Task: Writing HTML files`)**:
+> When executing headless reports via `run-mat-headless.sh /path/to/dump.dhp org.eclipse.mat.api:suspects`, Eclipse MAT's Equinox reporting engine evaluates chart templates and renders dozens of drill-down HTML pages for suspect components into an archive. While rendering, it outputs `Task: Writing HTML files` progress lines to stdout. This is standard Eclipse MAT report generation, confirming active progress rather than an infinite loop.
 
 ---
 

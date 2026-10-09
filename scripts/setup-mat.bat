@@ -14,8 +14,9 @@ if exist "%MAT_DIR%\MemoryAnalyzer.exe" (
 set "PARENT_DIR=%ROOT_DIR%\tools\mat"
 if not exist "%PARENT_DIR%" mkdir "%PARENT_DIR%"
 
-set "VERSION=1.17.0.20260601"
 set "BASE_VERSION=1.17.0"
+if not "%MAT_VERSION%"=="" set "BASE_VERSION=%MAT_VERSION%"
+set "VERSION=%BASE_VERSION%.20260601"
 set "ARCHIVE=MemoryAnalyzer-%VERSION%-win32.win32.x86_64.zip"
 set "DEST_ZIP=%PARENT_DIR%\%ARCHIVE%"
 

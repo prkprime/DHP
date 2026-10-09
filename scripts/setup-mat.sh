@@ -33,16 +33,6 @@ if [[ -x "${MAT_DIR}/MemoryAnalyzer" && -f "${MAT_DIR}/ParseHeapDump.sh" ]]; the
   exit 0
 fi
 
-# Check if pre-existing MAT exists in sibling directory
-LOCAL_MAT_CANDIDATE="/home/prk/easy-heap-dump-parser/tools/mat/mat"
-if [[ -d "${LOCAL_MAT_CANDIDATE}" && -x "${LOCAL_MAT_CANDIDATE}/MemoryAnalyzer" ]]; then
-  echo "Found local MAT installation at ${LOCAL_MAT_CANDIDATE}. Copying..."
-  cp -r "${LOCAL_MAT_CANDIDATE}" "${MAT_DIR}"
-  chmod +x "${MAT_DIR}/MemoryAnalyzer" "${MAT_DIR}/ParseHeapDump.sh"
-  echo "Successfully set up MAT at ${MAT_DIR}"
-  exit 0
-fi
-
 # Determine OS and Arch
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -79,14 +69,18 @@ elif [[ "${OS_NAME}" == "macosx" ]]; then
   CLASSIFIER="macosx.cocoa.${ARCH_NAME}"
 fi
 
-VERSION="1.17.0.20260601"
+# Resolve version
 BASE_VERSION="1.17.0"
+if [[ -f "${ROOT_DIR}/pom.xml" ]]; then
+  BASE_VERSION=$(grep -oPm1 '(?<=<mat.version>)[^<]+' "${ROOT_DIR}/pom.xml" 2>/dev/null || echo "1.17.0")
+fi
+VERSION="${BASE_VERSION}.20260601"
 ARCHIVE="MemoryAnalyzer-${VERSION}-${CLASSIFIER}.zip"
 DEST_ZIP="${PARENT_DIR}/${ARCHIVE}"
 
 URLS=(
-  "https://www.eclipse.org/downloads/download.php?file=/mat/${BASE_VERSION}/rcp/${ARCHIVE}&r=1"
   "https://download.eclipse.org/mat/${BASE_VERSION}/rcp/${ARCHIVE}"
+  "https://www.eclipse.org/downloads/download.php?file=/mat/${BASE_VERSION}/rcp/${ARCHIVE}&r=1"
   "https://mirror.umd.edu/eclipse/mat/${BASE_VERSION}/rcp/${ARCHIVE}"
 )
 
@@ -118,4 +112,4 @@ if [[ -f "${MAT_DIR}/ParseHeapDump.sh" ]]; then
   chmod +x "${MAT_DIR}/ParseHeapDump.sh"
 fi
 
-echo "Eclipse MAT successfully installed at ${MAT_DIR}"
+echo "Successfully installed Eclipse MAT at ${MAT_DIR}"
