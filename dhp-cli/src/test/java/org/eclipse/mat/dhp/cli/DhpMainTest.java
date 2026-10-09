@@ -43,4 +43,17 @@ class DhpMainTest {
         );
         assertThat(cleanExitCode).isEqualTo(0);
     }
+
+    @Test
+    void testEstimateMode(@TempDir Path tempDir) {
+        File dumpFile = new File("/tmp/eclipse-mat/plugins/org.eclipse.mat.tests/dumps/sun_jdk6_18_x64.hprof");
+        if (!dumpFile.exists()) return;
+
+        int exitCode = new CommandLine(new DhpMain()).execute(
+                "--dump", dumpFile.getAbsolutePath(),
+                "--estimate"
+        );
+
+        assertThat(exitCode).isEqualTo(0);
+    }
 }

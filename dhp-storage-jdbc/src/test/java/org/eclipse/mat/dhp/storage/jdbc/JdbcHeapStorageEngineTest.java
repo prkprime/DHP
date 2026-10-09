@@ -72,4 +72,34 @@ class JdbcHeapStorageEngineTest {
         storage.initializeSchema();
         assertThat(storage.hasExistingTables()).isTrue();
     }
+
+    @Test
+    void testClassStatsAndMetadataPersistence() throws SQLException {
+        // Save base class record
+        HeapRecords.ClassRecord cls = new HeapRecords.ClassRecord(100L, 0L, 0L, "java.lang.Object", 16, List.of(), List.of());
+        storage.saveClasses(List.of(cls));
+
+        // Save class stats in memory
+        List<HeapStorageEngine.ClassStats> stats = List.of(
+                new HeapStorageEngine.ClassStats(5, 42, 1024L)
+        );
+        storage.saveClassStats(stats);
+
+        var statsMap = storage.getClassStats();
+        assertThat(statsMap).containsKey(5);
+        assertThat(statsMap.get(5).instanceCount()).isEqualTo(42);
+        assertThat(statsMap.get(5).totalSize()).isEqualTo(1024L);
+
+        // Update class metadata in memory
+        storage.updateClassesMetadata(List.of(
+                new HeapStorageEngine.ResolvedClassMetadata(100L, 5, -1, 0, 16L)
+        ));
+
+        storage.finishIngestion();
+
+        HeapRecords.ClassRecord updated = storage.getClassById(100L);
+        assertThat(updated).isNotNull();
+        assertThat(updated.classObjId()).isEqualTo(5);
+        assertThat(updated.usedSize()).isEqualTo(16L);
+    }
 }

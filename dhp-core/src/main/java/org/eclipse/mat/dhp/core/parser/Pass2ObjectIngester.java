@@ -10,6 +10,8 @@ import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 
 import java.io.File;
@@ -134,7 +136,14 @@ public class Pass2ObjectIngester implements AutoCloseable {
         IObjectMembershipSet writtenObjects = governor.createMembershipSet(totalExpectedObjects);
         IObjectMembershipSet processedClassDumps = governor.createMembershipSet(baseInstanceId + 16);
 
+        Int2IntOpenHashMap classCounts = new Int2IntOpenHashMap();
+        Int2LongOpenHashMap classTotalSizes = new Int2LongOpenHashMap();
+
         writtenObjects.add(systemClassLoaderObjId);
+        if (classLoaderClassObjId >= 0) {
+            classCounts.addTo(classLoaderClassObjId, 1);
+            classTotalSizes.addTo(classLoaderClassObjId, classLoaderInstanceSize);
+        }
 
         objectBatch.add(new HeapStorageEngine.RawObjectRecord(
                 systemClassLoaderObjId, 0L, classLoaderClassObjId, classLoaderInstanceSize, 0L, false
@@ -161,6 +170,8 @@ public class Pass2ObjectIngester implements AutoCloseable {
             }
             long size = javaLangClassInstanceSize + alignUpToX(staticFieldsSize, 8);
             writtenObjects.add(classObjId);
+            classCounts.addTo(classTypeObjId, 1);
+            classTotalSizes.addTo(classTypeObjId, size);
             objectBatch.add(new HeapStorageEngine.RawObjectRecord(
                     classObjId, cls.classId(), classTypeObjId, size, 0L, false
             ));
@@ -282,6 +293,8 @@ public class Pass2ObjectIngester implements AutoCloseable {
                                 long usedSize = (clsRecord != null && clsRecord.instanceSize() > 0)
                                         ? clsRecord.instanceSize()
                                         : alignUpToX(bytesFollow + (2L * idSize), 8);
+                                classCounts.addTo(assignedClassId, 1);
+                                classTotalSizes.addTo(assignedClassId, usedSize);
                                 objectBatch.add(new HeapStorageEngine.RawObjectRecord(
                                         objId, objAddr, assignedClassId, usedSize, objPos, false
                                 ));
@@ -341,6 +354,8 @@ public class Pass2ObjectIngester implements AutoCloseable {
                                         : 0;
 
                                 long usedSize = alignUpToX(2L * idSize + 4 + (long) arrayLength * idSize, 8);
+                                classCounts.addTo(assignedClassId, 1);
+                                classTotalSizes.addTo(assignedClassId, usedSize);
                                 objectBatch.add(new HeapStorageEngine.RawObjectRecord(
                                         objId, objAddr, assignedClassId, usedSize, objPos, true
                                 ));
@@ -390,6 +405,8 @@ public class Pass2ObjectIngester implements AutoCloseable {
                                         : 0;
 
                                 long usedSize = alignUpToX(alignUpToX(2L * idSize + 4, idSize) + (long) arrayLength * elementSize, 8);
+                                classCounts.addTo(assignedClassId, 1);
+                                classTotalSizes.addTo(assignedClassId, usedSize);
                                 objectBatch.add(new HeapStorageEngine.RawObjectRecord(
                                         objId, objAddr, assignedClassId, usedSize, objPos, true
                                 ));
@@ -427,7 +444,29 @@ public class Pass2ObjectIngester implements AutoCloseable {
             edgeBatch.clear();
         }
 
+        // Save precomputed class stats and pre-resolved class hierarchy
         try {
+            List<HeapStorageEngine.ClassStats> statsList = new ArrayList<>(classCounts.size());
+            for (var entry : classCounts.int2IntEntrySet()) {
+                int cid = entry.getIntKey();
+                statsList.add(new HeapStorageEngine.ClassStats(cid, entry.getIntValue(), classTotalSizes.get(cid)));
+            }
+            storage.saveClassStats(statsList);
+
+            List<HeapStorageEngine.ResolvedClassMetadata> resolvedClasses = new ArrayList<>(pass1.getClasses().size());
+            for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
+                int classObjId = addressToId.get(cls.classId());
+                int superObjId = cls.superClassId() != 0 ? addressToId.get(cls.superClassId()) : -1;
+                int loaderObjId = cls.classLoaderId() != 0 ? addressToId.get(cls.classLoaderId()) : 0;
+                long staticFieldsSize = 0;
+                for (var sf : cls.staticFields()) {
+                    staticFieldsSize += (sf.type() == HprofConstants.Type.OBJECT) ? idSize : HprofConstants.Type.sizeOf(sf.type(), idSize);
+                }
+                long size = javaLangClassInstanceSize + alignUpToX(staticFieldsSize, 8);
+                resolvedClasses.add(new HeapStorageEngine.ResolvedClassMetadata(cls.classId(), classObjId, superObjId, loaderObjId, size));
+            }
+            storage.updateClassesMetadata(resolvedClasses);
+
             storage.finishIngestion();
         } catch (SQLException e) {
             throw new IOException("Failed to run database indexing", e);

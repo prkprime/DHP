@@ -2,6 +2,7 @@ package org.eclipse.mat.dhp.cli;
 
 import org.eclipse.mat.dhp.core.graph.DominatorTreeEngine;
 import org.eclipse.mat.dhp.core.memory.MemoryGovernor;
+import org.eclipse.mat.dhp.core.memory.ResourceEstimator;
 import org.eclipse.mat.dhp.core.parser.Pass1ScanParser;
 import org.eclipse.mat.dhp.core.parser.Pass2ObjectIngester;
 import org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine;
@@ -79,6 +80,9 @@ public class DhpMain implements Callable<Integer> {
     @Option(names = {"--membership-set"}, description = "Membership set strategy: bitset (default) or roaring")
     private String membershipSetStrategy;
 
+    @Option(names = {"--estimate", "-e"}, description = "Run fast structure scan to estimate required heap and disk space, then exit")
+    private boolean estimateOnly = false;
+
     @Override
     public Integer call() throws Exception {
         if (configFile != null && configFile.exists()) {
@@ -88,6 +92,25 @@ public class DhpMain implements Callable<Integer> {
         if (dumpFile == null || !dumpFile.exists()) {
             System.err.println("Error: Valid HPROF heap dump file must be specified with --dump or in config file.");
             return 1;
+        }
+
+        if (estimateOnly) {
+            System.out.println("Executing fast Pass 1 scan for resource estimation (--estimate)...");
+            long t0 = System.currentTimeMillis();
+            Pass1ScanParser pass1 = new Pass1ScanParser();
+            pass1.scan(dumpFile);
+            long p1Duration = System.currentTimeMillis() - t0;
+            System.out.println(String.format("Pass 1 scan completed in %.2f seconds.", p1Duration / 1000.0));
+            var estimate = ResourceEstimator.estimate(
+                    dumpFile.length(),
+                    pass1.getUniqueInstanceCount(),
+                    pass1.getClasses().size(),
+                    pass1.getGcRoots().size()
+            );
+            System.out.println();
+            System.out.println(estimate.banner());
+            System.out.println();
+            return 0;
         }
 
         if (jdbcUrl == null || jdbcUrl.isBlank()) {
@@ -182,29 +205,50 @@ public class DhpMain implements Callable<Integer> {
             storage.initializeSchema();
 
             System.out.println("[Phase 1/3] Scanning HPROF structure, classes, and GC roots...");
+            long t1 = System.currentTimeMillis();
             Pass1ScanParser pass1 = new Pass1ScanParser();
             pass1.scan(dumpFile);
-            System.out.println(String.format("   Parsed %d strings, %d classes, %d GC roots.",
-                    pass1.getStrings().size(), pass1.getClasses().size(), pass1.getGcRoots().size()));
+            long p1Time = System.currentTimeMillis() - t1;
+            System.out.println(String.format("   Parsed %,d strings, %,d classes, %,d unique objects, %,d GC roots (%.2f s).",
+                    pass1.getStrings().size(), pass1.getClasses().size(), pass1.getUniqueInstanceCount(), pass1.getGcRoots().size(), p1Time / 1000.0));
+
+            var estimate = ResourceEstimator.estimate(
+                    dumpFile.length(),
+                    pass1.getUniqueInstanceCount(),
+                    pass1.getClasses().size(),
+                    pass1.getGcRoots().size()
+            );
+            System.out.println();
+            System.out.println(estimate.banner());
+            System.out.println();
 
             System.out.println("[Phase 2/3] Streaming object instances & references into database...");
+            long t2 = System.currentTimeMillis();
             try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
                 ingester.ingest(dumpFile);
             }
-            System.out.println(String.format("   Ingested & garbage-collected %d reachable heap objects.", storage.getObjectCount()));
+            long p2Time = System.currentTimeMillis() - t2;
+            System.out.println(String.format("   Ingested & indexed %,d reachable heap objects (%.2f s).", storage.getObjectCount(), p2Time / 1000.0));
 
             System.out.println("[Phase 3/3] Calculating Dominator Tree & Retained Sizes...");
+            long t3 = System.currentTimeMillis();
             DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
             domEngine.computeAndStore();
+            long p3Time = System.currentTimeMillis() - t3;
+            System.out.println(String.format("   Dominator tree and retained sizes computed (%.2f s).", p3Time / 1000.0));
 
             long duration = System.currentTimeMillis() - start;
             System.out.println("================================================================================");
             System.out.println(String.format("DHP Parsing successfully finished in %.2f seconds!", duration / 1000.0));
+            System.out.println(String.format("   Phase 1 (Scan & Discovery):   %.2f s", p1Time / 1000.0));
+            System.out.println(String.format("   Phase 2 (Ingest & Indexes):   %.2f s", p2Time / 1000.0));
+            System.out.println(String.format("   Phase 3 (Dominator Analysis): %.2f s", p3Time / 1000.0));
             if (monitorThread != null) {
                 stopMonitor.set(true);
                 monitorThread.interrupt();
                 System.out.println(String.format("   [MEM MONITOR] Peak JVM Heap Used: %d MB", peakHeapUsed.get() / (1024 * 1024)));
             }
+            System.out.println("================================================================================");
 
             File targetDhp = exportDhpFile;
             if (targetDhp == null && dumpFile != null) {

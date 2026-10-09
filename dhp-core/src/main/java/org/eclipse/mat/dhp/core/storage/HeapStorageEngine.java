@@ -83,6 +83,16 @@ public interface HeapStorageEngine extends Closeable {
     default long[] loadAllObjectUsedSizes(int objectCount) throws SQLException { return new long[objectCount]; }
     default int[] getObjectsByClassId(int classObjId) throws SQLException { return new int[0]; }
     default java.util.Map<Integer, ClassStats> getClassStats() throws SQLException { return java.util.Collections.emptyMap(); }
+    default void saveClassStats(Collection<ClassStats> stats) throws SQLException {}
+    default void updateClassesMetadata(Collection<ResolvedClassMetadata> classes) throws SQLException {}
+
+    record ResolvedClassMetadata(
+            long classAddress,
+            int classObjId,
+            int superClassObjId,
+            int classLoaderObjId,
+            long usedSize
+    ) {}
 
     record RawObjectRecord(
             int objectId,

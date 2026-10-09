@@ -256,6 +256,44 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     @Override
+    public void saveClassStats(Collection<ClassStats> stats) throws SQLException {
+        if (stats == null || stats.isEmpty()) return;
+        String sql = isPostgres
+                ? "INSERT INTO dhp_class_stats(class_id, instance_count, total_size) VALUES(?, ?, ?) ON CONFLICT DO NOTHING"
+                : "INSERT INTO dhp_class_stats(class_id, instance_count, total_size) VALUES(?, ?, ?)";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            for (ClassStats s : stats) {
+                ps.setInt(1, s.classObjId());
+                ps.setInt(2, s.instanceCount());
+                ps.setLong(3, s.totalSize());
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+        connection.commit();
+        log.info("Persisted pre-calculated class stats in memory for {} classes.", stats.size());
+    }
+
+    @Override
+    public void updateClassesMetadata(Collection<ResolvedClassMetadata> classes) throws SQLException {
+        if (classes == null || classes.isEmpty()) return;
+        String sql = "UPDATE dhp_classes SET class_obj_id = ?, super_class_obj_id = ?, class_loader_obj_id = ?, used_size = ? WHERE class_id = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            for (ResolvedClassMetadata c : classes) {
+                ps.setInt(1, c.classObjId());
+                ps.setInt(2, c.superClassObjId());
+                ps.setInt(3, c.classLoaderObjId());
+                ps.setLong(4, c.usedSize());
+                ps.setLong(5, c.classAddress());
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+        connection.commit();
+        log.info("Persisted pre-resolved class hierarchy & metadata for {} classes.", classes.size());
+    }
+
+    @Override
     public List<HeapRecords.ClassRecord> getAllClasses() throws SQLException {
         List<HeapRecords.ClassRecord> list = new ArrayList<>();
         try (Statement stmt = connection.createStatement()) {
@@ -322,7 +360,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public HeapRecords.ClassRecord getClassById(long classId) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, static_fields_data FROM dhp_classes WHERE class_id = ?")) {
+                "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, class_obj_id, super_class_obj_id, class_loader_obj_id, used_size, static_fields_data FROM dhp_classes WHERE class_id = ?")) {
             ps.setLong(1, classId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
@@ -333,13 +371,17 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                             rs.getString(4),
                             rs.getInt(5),
                             parseFieldsData(rs.getString(6)),
-                            parseStaticFieldsData(rs.getString(7))
+                            parseStaticFieldsData(rs.getString(11)),
+                            rs.getInt(7),
+                            rs.getInt(8),
+                            rs.getInt(9),
+                            rs.getLong(10)
                     );
                 }
             }
         } catch (SQLException e) {
             try (PreparedStatement ps = connection.prepareStatement(
-                    "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data FROM dhp_classes WHERE class_id = ?")) {
+                    "SELECT class_id, super_class_id, class_loader_id, class_name, instance_size, fields_data, static_fields_data FROM dhp_classes WHERE class_id = ?")) {
                 ps.setLong(1, classId);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
@@ -350,7 +392,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                                 rs.getString(4),
                                 rs.getInt(5),
                                 parseFieldsData(rs.getString(6)),
-                                List.of()
+                                parseStaticFieldsData(rs.getString(7))
                         );
                     }
                 }
@@ -659,35 +701,78 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         log.info("Ingestion completed. Creating primary unique indexes and secondary B-trees in bulk...");
         long start = System.currentTimeMillis();
         try (Statement stmt = connection.createStatement()) {
+            long t;
+
             // 1. Primary/unique indexes built in bulk
+            t = System.currentTimeMillis();
             stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_objects_pk ON dhp_objects(object_id);");
+            log.info("Index idx_dhp_objects_pk built in {} ms.", (System.currentTimeMillis() - t));
+
+            t = System.currentTimeMillis();
             stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_outbound_pk ON dhp_outbound_references(from_object_id, seq);");
+            log.info("Index idx_dhp_outbound_pk built in {} ms.", (System.currentTimeMillis() - t));
 
             // 2. Secondary lookup indexes
+            t = System.currentTimeMillis();
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_address ON dhp_objects(object_address);");
+            log.info("Index idx_dhp_objects_address built in {} ms.", (System.currentTimeMillis() - t));
+
+            t = System.currentTimeMillis();
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_class ON dhp_objects(class_id);");
+            log.info("Index idx_dhp_objects_class built in {} ms.", (System.currentTimeMillis() - t));
+
+            t = System.currentTimeMillis();
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_arrays ON dhp_objects(object_id) WHERE is_array = 1;");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_outbound_to ON dhp_outbound_references(to_object_id);");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_from ON dhp_inbound_references(from_object_id);");
+            log.info("Index idx_dhp_objects_arrays built in {} ms.", (System.currentTimeMillis() - t));
+
+            t = System.currentTimeMillis();
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_to ON dhp_inbound_references(to_object_id);");
+            log.info("Index idx_dhp_inbound_to built in {} ms.", (System.currentTimeMillis() - t));
+
+            t = System.currentTimeMillis();
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_gc_roots_obj ON dhp_gc_roots(object_id);");
+            log.info("Index idx_dhp_gc_roots_obj built in {} ms.", (System.currentTimeMillis() - t));
 
-            // 3. Precompute class stats table for instant snapshot opening
-            stmt.execute("DELETE FROM dhp_class_stats;");
-            stmt.execute("INSERT INTO dhp_class_stats(class_id, instance_count, total_size) " +
-                    "SELECT class_id, count(*), coalesce(sum(used_size), 0) FROM dhp_objects GROUP BY class_id;");
+            // 3. Precompute class stats table (only if not pre-populated in memory)
+            boolean needClassStats = true;
+            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_class_stats")) {
+                if (rs.next() && rs.getInt(1) > 0) {
+                    needClassStats = false;
+                }
+            }
+            if (needClassStats) {
+                log.info("Populating class stats via fallback database aggregation...");
+                t = System.currentTimeMillis();
+                stmt.execute("DELETE FROM dhp_class_stats;");
+                stmt.execute("INSERT INTO dhp_class_stats(class_id, instance_count, total_size) " +
+                        "SELECT class_id, count(*), coalesce(sum(used_size), 0) FROM dhp_objects GROUP BY class_id;");
+                log.info("Class stats aggregated in {} ms.", (System.currentTimeMillis() - t));
+            }
 
-            // 4. Pre-resolve and backfill metadata in dhp_classes
-            stmt.execute("UPDATE dhp_classes SET " +
-                    "class_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.class_id), -1), " +
-                    "super_class_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.super_class_id), -1), " +
-                    "class_loader_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.class_loader_id), -1), " +
-                    "used_size = coalesce((SELECT o.used_size FROM dhp_objects o WHERE o.object_address = dhp_classes.class_id), 0);");
+            // 4. Pre-resolve and backfill metadata in dhp_classes (only if not pre-populated in memory)
+            boolean needClassMetadata = true;
+            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_classes WHERE class_obj_id IS NOT NULL AND class_obj_id >= 0")) {
+                if (rs.next() && rs.getInt(1) > 0) {
+                    needClassMetadata = false;
+                }
+            }
+            if (needClassMetadata) {
+                log.info("Backfilling class metadata via fallback database queries...");
+                t = System.currentTimeMillis();
+                stmt.execute("UPDATE dhp_classes SET " +
+                        "class_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.class_id), -1), " +
+                        "super_class_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.super_class_id), -1), " +
+                        "class_loader_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.class_loader_id), -1), " +
+                        "used_size = coalesce((SELECT o.used_size FROM dhp_objects o WHERE o.object_address = dhp_classes.class_id), 0);");
+                log.info("Class metadata backfilled in {} ms.", (System.currentTimeMillis() - t));
+            }
 
             // 5. Pre-resolve object_id and thread_object_id in dhp_gc_roots
+            t = System.currentTimeMillis();
             stmt.execute("UPDATE dhp_gc_roots SET " +
                     "object_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_gc_roots.object_address), -1), " +
                     "thread_object_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_gc_roots.thread_address), -1);");
+            log.info("GC roots pre-resolved in {} ms.", (System.currentTimeMillis() - t));
 
             // 6. Pre-calculate total heap size and object count into dhp_snapshot_info
             long totalHeap = 0L;
