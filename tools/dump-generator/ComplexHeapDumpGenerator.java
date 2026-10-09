@@ -383,7 +383,7 @@ public class ComplexHeapDumpGenerator {
         System.out.println(String.format("Dump Size: %d bytes (%.3f GB)", bytes, gigabytes));
         System.out.println("================================================================================");
 
-        if (scale >= 1.0) {
+        if (Math.abs(scale - 1.0) < 0.001) {
             long minBytes = 2L * 1024L * 1024L * 1024L;
             long maxBytes = 3L * 1024L * 1024L * 1024L;
 

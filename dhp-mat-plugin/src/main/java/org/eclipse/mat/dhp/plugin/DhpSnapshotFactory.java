@@ -118,16 +118,22 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 props.load(fis);
             }
 
-            String baseName = file.getAbsolutePath();
+            File absFile = file.getAbsoluteFile();
+            File parentDir = absFile.getParentFile();
+            String baseName = absFile.getName();
             int p = baseName.lastIndexOf('.');
-            String prefix = p >= 0 ? baseName.substring(0, p + 1) : baseName + ".";
+            String prefixName = p >= 0 ? baseName.substring(0, p) : baseName;
+            String prefix = new File(parentDir, prefixName + ".").getAbsolutePath().replace('\\', '/');
+            String defaultDb = new File(parentDir, prefixName + ".dhp.db").getAbsolutePath().replace('\\', '/');
 
-            String jdbcUrl = props.getProperty("db.url", "jdbc:sqlite:" + prefix + "dhp.db");
+            String jdbcUrl = props.getProperty("db.url", "jdbc:sqlite:" + defaultDb);
             if (jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
                 String sub = jdbcUrl.substring("jdbc:sqlite:".length());
                 File dbFile = new File(sub);
-                if (!dbFile.isAbsolute() && file.getParentFile() != null) {
-                    jdbcUrl = "jdbc:sqlite:" + new File(file.getParentFile(), sub).getAbsolutePath();
+                if (!dbFile.isAbsolute() && parentDir != null) {
+                    jdbcUrl = "jdbc:sqlite:" + new File(parentDir, sub).getAbsolutePath().replace('\\', '/');
+                } else if (dbFile.isAbsolute()) {
+                    jdbcUrl = "jdbc:sqlite:" + dbFile.getAbsolutePath().replace('\\', '/');
                 }
             }
             String user = props.getProperty("db.user", "");
@@ -136,8 +142,8 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             File hprofFile = null;
             if (hprofPath != null && !hprofPath.isBlank()) {
                 File candidate = new File(hprofPath);
-                if (!candidate.isAbsolute() && file.getParentFile() != null) {
-                    candidate = new File(file.getParentFile(), hprofPath);
+                if (!candidate.isAbsolute() && parentDir != null) {
+                    candidate = new File(parentDir, hprofPath);
                 }
                 hprofFile = candidate;
             }
@@ -161,8 +167,9 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 Pass1ScanParser pass1 = new Pass1ScanParser();
                 pass1.scan(hprofFile);
 
-                Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor);
-                ingester.ingest(hprofFile);
+                try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
+                    ingester.ingest(hprofFile);
+                }
 
                 DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
                 domEngine.computeAndStore();

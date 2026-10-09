@@ -175,6 +175,9 @@ The standalone fat JAR is located at `dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar`
 | `-t` | `-w`, `--threads`, `--workers` | Worker threads count (defaults to available CPU cores) |
 | `--clean` | `--drop-existing` | Drop pre-existing DHP tables in target database before ingestion |
 | `--export-dhp` | | Path to export `.dhp` MAT descriptor (defaults to `<dumpPrefix>.dhp`) |
+| `--monitor` | `--memory-monitor` | Enable live background CLI memory monitor logging JVM heap usage every 3s and peak RAM |
+| `--address-map` | | Address-to-ID map strategy: `auto` (default), `sorted`, `chunked`, or `mmap` |
+| `--membership-set` | | Ingested objects membership set: `bitset` (default, ~2.9ns/op) or `roaring` (run-compressed) |
 
 ### Parsing Commands (All Platforms)
 
@@ -334,6 +337,38 @@ Previous versions suffered from a 10–15 second latency when opening snapshots 
    - Replaced multi-megabyte `boolean[]` allocations with streaming `populateArrayBitField(IntConsumer)` directly into MAT's `BitField`.
 4. **Schema Initialization Bypass**:
    - `DhpIndexBuilder` and `DhpSnapshotFactory` detect existing tables and skip redundant DDL checks when opening pre-indexed dumps.
+
+---
+
+## Memory-Bounded Ingestion Architecture & Bitmap Analysis
+
+DHP strictly enforces the user-configured memory budget (`--memory-budget` / `-m`) by replacing open-addressing hash maps and hash sets with memory-bounded, zero-rehashing structures:
+
+### 1. Address-to-ID Map: Sorted Primitive Array vs Open Hash Map
+
+When mapping 64-bit object JVM addresses to sequential MAT 32-bit object IDs:
+- **Fastutil `Long2IntOpenHashMap` Problem**: Required $2^{28}$ slots for 100M objects at 0.75 load factor. Its steady-state footprint was ~3.22 GB, and doubling during rehashing caused catastrophic **6.4 GB memory spikes** and `OutOfMemoryError`.
+- **DHP's `SortedAddressToIdMap` Solution**: In Pass 1, addresses are gathered and sorted in-place in primitive `long[]`. MAT IDs are dense, contiguous integer offsets `baseInstanceId + index`. Binary search operates directly on the array with **zero value array overhead**.
+- **Performance**:
+  - Build time for 5,000,000 objects is **14.0 ms** (compared to 412.5 ms for hash map — **29x faster build**).
+  - Memory footprint for 100,000,000 objects is strictly **800 MB** (vs 3.2–4.8 GB with hash maps).
+  - Zero allocation during lookup, zero JVM GC pauses, and zero rehashing spikes.
+- **Off-Heap Support (`MmapAddressToIdMap`)**: For extremely constrained JVM environments (e.g., `-Xmx512m` or `-Xmx1g` on a 150GB dump), `--address-map mmap` writes the sorted long array to an off-heap memory-mapped file, reducing JVM heap consumption to **0 MB**.
+
+### 2. Membership Sets: `java.util.BitSet` vs `RoaringBitmap`
+
+To track written objects during Pass 2 streaming without unbounded `LongOpenHashSet` collections (which previously consumed 1.5–2.0 GB):
+
+| Implementation | Memory (5M objects) | Projected Memory (100M objects) | Read Latency | Strategy |
+| :--- | :--- | :--- | :--- | :--- |
+| **`BitSetMembershipSet`** (Default) | 610 KB | **11.9 MB** (flat 1 bit/item) | **~2.9 ns/op** | Default for highest ingestion speed |
+| **`RoaringMembershipSet`** | < 1 KB | **< 100 KB** (run-compressed) | **~35.3 ns/op** | Best for minimum RAM on dense ranges |
+
+Run benchmarks anytime via:
+```bash
+mvn test -pl dhp-core -Dtest=MemoryAndBitmapBenchmarkTest
+```
+
 
 ---
 

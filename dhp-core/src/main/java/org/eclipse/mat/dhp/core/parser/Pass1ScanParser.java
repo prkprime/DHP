@@ -30,6 +30,7 @@ public class Pass1ScanParser {
     private final Map<Long, Long> classIdToNameId = new HashMap<>();
     private final Map<Long, HeapRecords.ClassRecord> classes = new HashMap<>();
     private final LongArrayList objectAddresses = new LongArrayList();
+    private long[] sortedInstanceAddresses;
     private final List<HeapRecords.GcRootRecord> gcRoots = new ArrayList<>();
     private final Map<Long, Long> classToSuperClass = new HashMap<>();
 
@@ -120,8 +121,27 @@ public class Pass1ScanParser {
         // Recalculate runtime instance sizes with exact header + field alignment (MAT parity)
         calculateRuntimeInstanceSizes(header.idSize());
 
-        log.info("Pass 1 Completed: Parsed {} strings, {} classes, {} GC roots",
-                strings.size(), classes.size(), gcRoots.size());
+        // Sort and deduplicate instance object addresses in-place to compact memory and prepare binary search index
+        if (!objectAddresses.isEmpty()) {
+            long[] raw = objectAddresses.elements();
+            int rawSize = objectAddresses.size();
+            java.util.Arrays.parallelSort(raw, 0, rawSize);
+            int unique = 0;
+            for (int i = 0; i < rawSize; i++) {
+                long addr = raw[i];
+                if (addr != 0L && !classes.containsKey(addr) && (unique == 0 || addr != raw[unique - 1])) {
+                    raw[unique++] = addr;
+                }
+            }
+            this.sortedInstanceAddresses = java.util.Arrays.copyOf(raw, unique);
+            this.objectAddresses.clear();
+            this.objectAddresses.trim();
+        } else {
+            this.sortedInstanceAddresses = new long[0];
+        }
+
+        log.info("Pass 1 Completed: Parsed {} strings, {} classes, {} unique objects, {} GC roots",
+                strings.size(), classes.size(), sortedInstanceAddresses.length, gcRoots.size());
     }
 
     private void scanHeapDumpSegment(HprofBinaryReader reader, long segmentLength, int idSize) throws IOException {
@@ -274,7 +294,14 @@ public class Pass1ScanParser {
     }
 
     public LongArrayList getObjectAddresses() {
+        if (sortedInstanceAddresses != null && sortedInstanceAddresses.length > 0) {
+            return LongArrayList.wrap(sortedInstanceAddresses);
+        }
         return objectAddresses;
+    }
+
+    public long[] getSortedInstanceAddresses() {
+        return sortedInstanceAddresses != null ? sortedInstanceAddresses : new long[0];
     }
 
     public HeapRecords.Header getHeader() {

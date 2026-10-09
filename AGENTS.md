@@ -223,6 +223,8 @@ java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
 
 ## 9. Developer & Coding Guidelines
 
-1. **Memory Budget Discipline**: When implementing graph algorithms or data transformations, never load arbitrary unbounded collections into JVM memory. Use streamed queries, paginated queries, or memory-mapped primitives (`fastutil` primitive collections).
+1. **Memory Budget Discipline**: When implementing graph algorithms or data transformations, never load arbitrary unbounded collections into JVM memory. Use streamed queries, paginated queries, memory-bounded address maps (`SortedAddressToIdMap`, `ChunkedAddressToIdMap`, `MmapAddressToIdMap`), and compact membership bitsets (`BitSetMembershipSet`, `RoaringMembershipSet`). Never use unbounded hash maps (`Long2IntOpenHashMap`) for full-dump object indices as rehashing doubles allocation spikes and causes `OutOfMemoryError`.
 2. **Deterministic Parity**: Any changes to object size calculation, dominator computation, or hierarchy traversal must pass `EclipseMatEquivalenceParityTest` and `EclipseMatGeneralSnapshotTestSuiteTest`.
 3. **OSGi & Serialization Safety**: In the MAT plugin, never store non-serializable objects (such as active connections or lambdas referencing JDBC components) in `XSnapshotInfo.properties`. MAT serializes snapshot metadata to disk when saving indexes.
+4. **Cross-Platform Path Safety**: In SQLite JDBC URLs and file paths, always use normalized forward slashes (`/`) and canonical absolute paths (`file.getAbsoluteFile().getParentFile()`) to avoid Windows backslash escaping errors and relative-path root mismatches.
+

@@ -65,17 +65,27 @@ public class DhpIndexBuilder implements IIndexBuilder {
             File hprofFile = null;
             long memoryBudget = 1024 * 1024 * 1024L;
 
+            File absDumpOrConfig = dumpOrConfigFile.getAbsoluteFile();
+            File parentDir = absDumpOrConfig.getParentFile();
+
             if (isConfigFile) {
                 Properties props = new Properties();
                 try (FileInputStream fis = new FileInputStream(dumpOrConfigFile)) {
                     props.load(fis);
                 }
-                jdbcUrl = props.getProperty("db.url", "jdbc:sqlite:" + prefix + "dhp.db");
+                String baseName = absDumpOrConfig.getName();
+                int idx = baseName.lastIndexOf('.');
+                String pfx = idx > 0 ? baseName.substring(0, idx) : baseName;
+                String defaultDb = new File(parentDir, pfx + ".dhp.db").getAbsolutePath().replace('\\', '/');
+
+                jdbcUrl = props.getProperty("db.url", "jdbc:sqlite:" + defaultDb);
                 if (jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
                     String sub = jdbcUrl.substring("jdbc:sqlite:".length());
                     File dbFile = new File(sub);
-                    if (!dbFile.isAbsolute() && dumpOrConfigFile.getParentFile() != null) {
-                        jdbcUrl = "jdbc:sqlite:" + new File(dumpOrConfigFile.getParentFile(), sub).getAbsolutePath();
+                    if (!dbFile.isAbsolute() && parentDir != null) {
+                        jdbcUrl = "jdbc:sqlite:" + new File(parentDir, sub).getAbsolutePath().replace('\\', '/');
+                    } else if (dbFile.isAbsolute()) {
+                        jdbcUrl = "jdbc:sqlite:" + dbFile.getAbsolutePath().replace('\\', '/');
                     }
                 }
                 user = props.getProperty("db.user", "");
@@ -83,8 +93,8 @@ public class DhpIndexBuilder implements IIndexBuilder {
                 String hprofPath = props.getProperty("dump.file");
                 if (hprofPath != null && !hprofPath.isBlank()) {
                     File candidate = new File(hprofPath);
-                    if (!candidate.isAbsolute() && dumpOrConfigFile.getParentFile() != null) {
-                        candidate = new File(dumpOrConfigFile.getParentFile(), hprofPath);
+                    if (!candidate.isAbsolute() && parentDir != null) {
+                        candidate = new File(parentDir, hprofPath);
                     }
                     hprofFile = candidate;
                 }
@@ -96,7 +106,11 @@ public class DhpIndexBuilder implements IIndexBuilder {
                 }
             } else {
                 hprofFile = dumpOrConfigFile;
-                jdbcUrl = "jdbc:sqlite:" + prefix + "dhp.db";
+                String baseName = absDumpOrConfig.getName();
+                int idx = baseName.lastIndexOf('.');
+                String pfx = idx > 0 ? baseName.substring(0, idx) : baseName;
+                File dbFile = new File(parentDir, pfx + ".dhp.db");
+                jdbcUrl = "jdbc:sqlite:" + dbFile.getAbsolutePath().replace('\\', '/');
             }
 
             MemoryGovernor governor = new MemoryGovernor(memoryBudget, 4);
@@ -111,8 +125,9 @@ public class DhpIndexBuilder implements IIndexBuilder {
                 Pass1ScanParser pass1 = new Pass1ScanParser();
                 pass1.scan(hprofFile);
 
-                Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor);
-                ingester.ingest(hprofFile);
+                try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
+                    ingester.ingest(hprofFile);
+                }
 
                 DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
                 domEngine.computeAndStore();

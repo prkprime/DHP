@@ -1,6 +1,9 @@
 package org.eclipse.mat.dhp.core.parser;
 
+import org.eclipse.mat.dhp.core.memory.IAddressToIdMap;
+import org.eclipse.mat.dhp.core.memory.IObjectMembershipSet;
 import org.eclipse.mat.dhp.core.memory.MemoryGovernor;
+import org.eclipse.mat.dhp.core.memory.SortedAddressToIdMap;
 import org.eclipse.mat.dhp.core.model.HeapRecords;
 import org.eclipse.mat.dhp.core.model.HprofConstants;
 import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
@@ -8,7 +11,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 import java.io.File;
 import java.io.IOException;
@@ -23,22 +25,21 @@ import java.util.Map;
  * Streams object instances and arrays from HPROF directly into JDBC storage batches.
  * Dynamically adjusts batch sizing according to MemoryGovernor.
  */
-public class Pass2ObjectIngester {
+public class Pass2ObjectIngester implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(Pass2ObjectIngester.class);
 
     private final Pass1ScanParser pass1;
     private final HeapStorageEngine storage;
     private final MemoryGovernor governor;
 
-    // Primitive address-to-ID open addressing map: highly memory efficient (~10-12 bytes/entry)
-    private final Long2IntOpenHashMap addressToId = new Long2IntOpenHashMap();
+    private IAddressToIdMap addressToId;
     private final Map<Long, List<HeapRecords.ClassRecord>> classHierarchyCache = new HashMap<>();
 
     public Pass2ObjectIngester(Pass1ScanParser pass1, HeapStorageEngine storage, MemoryGovernor governor) {
         this.pass1 = pass1;
         this.storage = storage;
         this.governor = governor;
-        this.addressToId.defaultReturnValue(-1);
+        this.addressToId = new SortedAddressToIdMap(new Long2IntOpenHashMap(), new long[0], 0);
     }
 
     public void ingest(File file) throws IOException, SQLException {
@@ -69,13 +70,12 @@ public class Pass2ObjectIngester {
         List<HeapStorageEngine.ReferenceEdge> edgeBatch = new ArrayList<>(batchSize);
 
         int currentObjectId = 0;
-        LongOpenHashSet writtenObjects = new LongOpenHashSet();
-        LongOpenHashSet processedClassDumps = new LongOpenHashSet();
+        Long2IntOpenHashMap classAddressToId = new Long2IntOpenHashMap();
+        classAddressToId.defaultReturnValue(-1);
 
         // 1. Pre-register system classloader at address 0
         int systemClassLoaderObjId = currentObjectId++;
-        addressToId.put(0L, systemClassLoaderObjId);
-        writtenObjects.add(0L);
+        classAddressToId.put(0L, systemClassLoaderObjId);
 
         // 2. Pre-register all classes as heap objects and map address -> objectId
         long javaLangClassAddress = 0L;
@@ -90,9 +90,9 @@ public class Pass2ObjectIngester {
         }
 
         for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
-            if (!addressToId.containsKey(cls.classId())) {
+            if (!classAddressToId.containsKey(cls.classId())) {
                 int classObjId = currentObjectId++;
-                addressToId.put(cls.classId(), classObjId);
+                classAddressToId.put(cls.classId(), classObjId);
             }
         }
 
@@ -109,12 +109,29 @@ public class Pass2ObjectIngester {
         if (classLoaderInstanceSize == 0) classLoaderInstanceSize = 4L * idSize;
         if (javaLangClassInstanceSize == 0) javaLangClassInstanceSize = 4L * idSize;
 
-        int javaLangClassObjId = (javaLangClassAddress != 0 && addressToId.containsKey(javaLangClassAddress))
-                ? addressToId.get(javaLangClassAddress)
+        int javaLangClassObjId = (javaLangClassAddress != 0 && classAddressToId.containsKey(javaLangClassAddress))
+                ? classAddressToId.get(javaLangClassAddress)
                 : -1;
-        int classLoaderClassObjId = (classLoaderClassAddress != 0 && addressToId.containsKey(classLoaderClassAddress))
-                ? addressToId.get(classLoaderClassAddress)
+        int classLoaderClassObjId = (classLoaderClassAddress != 0 && classAddressToId.containsKey(classLoaderClassAddress))
+                ? classAddressToId.get(classLoaderClassAddress)
                 : (javaLangClassObjId != -1 ? javaLangClassObjId : 0);
+
+        int baseInstanceId = currentObjectId;
+        long[] sortedInstances = pass1.getSortedInstanceAddresses();
+        File tempDir = file.getAbsoluteFile().getParentFile();
+
+        this.addressToId = governor.createAddressMap(
+                classAddressToId,
+                sortedInstances,
+                baseInstanceId,
+                tempDir
+        );
+
+        int totalExpectedObjects = addressToId.size();
+        IObjectMembershipSet writtenObjects = governor.createMembershipSet(totalExpectedObjects);
+        IObjectMembershipSet processedClassDumps = governor.createMembershipSet(baseInstanceId + 16);
+
+        writtenObjects.add(systemClassLoaderObjId);
 
         objectBatch.add(new HeapStorageEngine.RawObjectRecord(
                 systemClassLoaderObjId, 0L, classLoaderClassObjId, classLoaderInstanceSize, 0L, false
@@ -140,7 +157,7 @@ public class Pass2ObjectIngester {
                 staticFieldsSize += (sf.type() == HprofConstants.Type.OBJECT) ? idSize : HprofConstants.Type.sizeOf(sf.type(), idSize);
             }
             long size = javaLangClassInstanceSize + alignUpToX(staticFieldsSize, 8);
-            writtenObjects.add(cls.classId());
+            writtenObjects.add(classObjId);
             objectBatch.add(new HeapStorageEngine.RawObjectRecord(
                     classObjId, cls.classId(), classTypeObjId, size, 0L, false
             ));
@@ -150,16 +167,8 @@ public class Pass2ObjectIngester {
             }
         }
 
-        // 3. Pre-register all instance and array objects from Pass 1
-        var objAddresses = pass1.getObjectAddresses();
-        for (int i = 0; i < objAddresses.size(); i++) {
-            long addr = objAddresses.getLong(i);
-            if (!addressToId.containsKey(addr)) {
-                addressToId.put(addr, currentObjectId++);
-            }
-        }
-        log.info("Pass 2 Pre-registration: classes={}, objAddresses={}, totalRegistered={}",
-                pass1.getClasses().size(), objAddresses.size(), currentObjectId);
+        log.info("Pass 2 Pre-registration complete: classes={}, instances={}, totalExpectedObjects={}",
+                pass1.getClasses().size(), sortedInstances.length, totalExpectedObjects);
 
         try (HprofBinaryReader reader = new HprofBinaryReader(file)) {
             reader.readHeader(); // skip header
@@ -209,7 +218,10 @@ public class Pass2ObjectIngester {
 
                                 int sfCount = reader.readUnsignedShort();
                                 int classObjId = addressToId.get(classId);
-                                boolean isFirstClassDump = processedClassDumps.add(classId);
+                                boolean isFirstClassDump = (classObjId >= 0 && !processedClassDumps.contains(classObjId));
+                                if (isFirstClassDump) {
+                                    processedClassDumps.add(classObjId);
+                                }
                                 int edgeSeq = 0;
                                 if (classObjId != -1 && isFirstClassDump) {
                                     if (javaLangClassObjId != -1) {
@@ -253,13 +265,12 @@ public class Pass2ObjectIngester {
                                 int bytesFollow = reader.readInt();
                                 byte[] instanceBytes = reader.readBytes(bytesFollow);
 
-                                boolean alreadyWritten = writtenObjects.contains(objAddr);
                                 int objId = addressToId.get(objAddr);
-                                if (objId == -1 || alreadyWritten) {
+                                if (objId == -1 || writtenObjects.contains(objId)) {
                                     continue;
                                 }
 
-                                writtenObjects.add(objAddr);
+                                writtenObjects.add(objId);
                                 int assignedClassId = addressToId.containsKey(classAddr)
                                         ? addressToId.get(classAddr)
                                         : (javaLangClassObjId != -1 ? javaLangClassObjId : 0);
@@ -315,14 +326,13 @@ public class Pass2ObjectIngester {
                                 int arrayLength = reader.readInt();
                                 long elementClassAddr = reader.readId();
 
-                                boolean alreadyWritten = writtenObjects.contains(objAddr);
                                 int objId = addressToId.get(objAddr);
-                                if (objId == -1 || alreadyWritten) {
+                                if (objId == -1 || writtenObjects.contains(objId)) {
                                     reader.skipBytes((long) arrayLength * idSize);
                                     continue;
                                 }
 
-                                writtenObjects.add(objAddr);
+                                writtenObjects.add(objId);
                                 int assignedClassId = addressToId.containsKey(elementClassAddr)
                                         ? addressToId.get(elementClassAddr)
                                         : 0;
@@ -365,13 +375,12 @@ public class Pass2ObjectIngester {
                                 int elementSize = HprofConstants.Type.sizeOf(elementType, idSize);
                                 reader.skipBytes((long) arrayLength * elementSize);
 
-                                boolean alreadyWritten = writtenObjects.contains(objAddr);
                                 int objId = addressToId.get(objAddr);
-                                if (objId == -1 || alreadyWritten) {
+                                if (objId == -1 || writtenObjects.contains(objId)) {
                                     continue;
                                 }
 
-                                writtenObjects.add(objAddr);
+                                writtenObjects.add(objId);
                                 long primClassAddr = pass1.getPrimitiveArrayClassId(elementType);
                                 int assignedClassId = addressToId.containsKey(primClassAddr)
                                         ? addressToId.get(primClassAddr)
@@ -452,7 +461,14 @@ public class Pass2ObjectIngester {
         return r == 0 ? n : n + x - r;
     }
 
-    public Long2IntOpenHashMap getAddressToId() {
+    public IAddressToIdMap getAddressToId() {
         return addressToId;
+    }
+
+    @Override
+    public void close() {
+        if (addressToId != null) {
+            addressToId.close();
+        }
     }
 }

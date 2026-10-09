@@ -70,6 +70,15 @@ public class DhpMain implements Callable<Integer> {
     @Option(names = {"--clean", "--drop-existing"}, description = "Clean/drop existing DHP tables in target database before ingestion")
     private boolean clean = false;
 
+    @Option(names = {"--monitor", "--memory-monitor"}, description = "Enable periodic background CLI memory monitor logging JVM heap usage")
+    private boolean monitorMemory = false;
+
+    @Option(names = {"--address-map"}, description = "Address-to-ID map strategy: auto (default), sorted, chunked, or mmap")
+    private String addressMapStrategy;
+
+    @Option(names = {"--membership-set"}, description = "Membership set strategy: bitset (default) or roaring")
+    private String membershipSetStrategy;
+
     @Override
     public Integer call() throws Exception {
         if (configFile != null && configFile.exists()) {
@@ -99,10 +108,13 @@ public class DhpMain implements Callable<Integer> {
                 jdbcUrl = "jdbc:postgresql://" + host + ":" + p + "/" + dbName;
             } else {
                 // Default to optimized SQLite database alongside the dump
-                String baseName = dumpFile.getAbsolutePath();
+                File absDump = dumpFile.getAbsoluteFile();
+                File parentDir = absDump.getParentFile();
+                String baseName = absDump.getName();
                 int idx = baseName.lastIndexOf('.');
                 String prefix = idx > 0 ? baseName.substring(0, idx) : baseName;
-                jdbcUrl = "jdbc:sqlite:" + prefix + ".dhp.db";
+                File targetDb = new File(parentDir, prefix + ".dhp.db");
+                jdbcUrl = "jdbc:sqlite:" + targetDb.getAbsolutePath().replace('\\', '/');
             }
         }
 
@@ -117,6 +129,38 @@ public class DhpMain implements Callable<Integer> {
         Long memoryBudget = null;
         if (memoryBudgetString != null && !memoryBudgetString.isBlank()) {
             memoryBudget = parseMemoryString(memoryBudgetString);
+        }
+
+        if (addressMapStrategy != null && !addressMapStrategy.isBlank()) {
+            System.setProperty("dhp.address.map", addressMapStrategy.trim().toLowerCase());
+        }
+        if (membershipSetStrategy != null && !membershipSetStrategy.isBlank()) {
+            System.setProperty("dhp.membership.set", membershipSetStrategy.trim().toLowerCase());
+        }
+
+        java.util.concurrent.atomic.AtomicBoolean stopMonitor = new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.atomic.AtomicLong peakHeapUsed = new java.util.concurrent.atomic.AtomicLong(0);
+        Thread monitorThread = null;
+        if (monitorMemory) {
+            monitorThread = new Thread(() -> {
+                Runtime rt = Runtime.getRuntime();
+                while (!stopMonitor.get()) {
+                    long total = rt.totalMemory();
+                    long free = rt.freeMemory();
+                    long used = total - free;
+                    long max = rt.maxMemory();
+                    peakHeapUsed.updateAndGet(cur -> Math.max(cur, used));
+                    System.out.println(String.format("   [MEM MONITOR] Heap Used: %d MB | Total: %d MB | Max: %d MB",
+                            used / (1024 * 1024), total / (1024 * 1024), max / (1024 * 1024)));
+                    try {
+                        Thread.sleep(3000);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+            }, "dhp-memory-monitor");
+            monitorThread.setDaemon(true);
+            monitorThread.start();
         }
 
         MemoryGovernor governor = new MemoryGovernor(memoryBudget, threads);
@@ -144,8 +188,9 @@ public class DhpMain implements Callable<Integer> {
                     pass1.getStrings().size(), pass1.getClasses().size(), pass1.getGcRoots().size()));
 
             System.out.println("[Phase 2/3] Streaming object instances & references into database...");
-            Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor);
-            ingester.ingest(dumpFile);
+            try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
+                ingester.ingest(dumpFile);
+            }
             System.out.println(String.format("   Ingested & garbage-collected %d reachable heap objects.", storage.getObjectCount()));
 
             System.out.println("[Phase 3/3] Calculating Dominator Tree & Retained Sizes...");
@@ -155,20 +200,27 @@ public class DhpMain implements Callable<Integer> {
             long duration = System.currentTimeMillis() - start;
             System.out.println("================================================================================");
             System.out.println(String.format("DHP Parsing successfully finished in %.2f seconds!", duration / 1000.0));
+            if (monitorThread != null) {
+                stopMonitor.set(true);
+                monitorThread.interrupt();
+                System.out.println(String.format("   [MEM MONITOR] Peak JVM Heap Used: %d MB", peakHeapUsed.get() / (1024 * 1024)));
+            }
 
             File targetDhp = exportDhpFile;
             if (targetDhp == null && dumpFile != null) {
-                String base = dumpFile.getAbsolutePath();
+                File absDump = dumpFile.getAbsoluteFile();
+                File parentDir = absDump.getParentFile();
+                String base = absDump.getName();
                 int dot = base.lastIndexOf('.');
                 String pfx = dot > 0 ? base.substring(0, dot) : base;
-                targetDhp = new File(pfx + ".dhp");
+                targetDhp = new File(parentDir, pfx + ".dhp");
             }
             if (targetDhp != null) {
                 Properties p = new Properties();
                 p.setProperty("db.url", jdbcUrl);
                 if (user != null && !user.isEmpty()) p.setProperty("db.user", user);
                 if (password != null && !password.isEmpty()) p.setProperty("db.password", password);
-                p.setProperty("dump.file", dumpFile.getAbsolutePath());
+                p.setProperty("dump.file", dumpFile.getAbsoluteFile().getAbsolutePath().replace('\\', '/'));
                 if (memoryBudget != null) p.setProperty("memory.budget", String.valueOf(memoryBudget));
                 if (threads != null) p.setProperty("worker.threads", String.valueOf(threads));
                 try (java.io.FileOutputStream fos = new java.io.FileOutputStream(targetDhp)) {
@@ -191,13 +243,18 @@ public class DhpMain implements Callable<Integer> {
         try (FileInputStream fis = new FileInputStream(file)) {
             props.load(fis);
         }
+        File absConfigFile = file.getAbsoluteFile();
+        File configParent = absConfigFile.getParentFile();
+
         if (jdbcUrl == null) {
             jdbcUrl = props.getProperty("db.url", props.getProperty("jdbcurl", props.getProperty("url", null)));
             if (jdbcUrl != null && jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
                 String sub = jdbcUrl.substring("jdbc:sqlite:".length());
                 File dbf = new File(sub);
-                if (!dbf.isAbsolute() && file.getParentFile() != null) {
-                    jdbcUrl = "jdbc:sqlite:" + new File(file.getParentFile(), sub).getAbsolutePath();
+                if (!dbf.isAbsolute() && configParent != null) {
+                    jdbcUrl = "jdbc:sqlite:" + new File(configParent, sub).getAbsolutePath().replace('\\', '/');
+                } else if (dbf.isAbsolute()) {
+                    jdbcUrl = "jdbc:sqlite:" + dbf.getAbsolutePath().replace('\\', '/');
                 }
             }
         }
@@ -207,8 +264,8 @@ public class DhpMain implements Callable<Integer> {
             String dumpPath = props.getProperty("dump.file", props.getProperty("dump", null));
             if (dumpPath != null) {
                 File df = new File(dumpPath);
-                if (!df.isAbsolute() && file.getParentFile() != null) {
-                    df = new File(file.getParentFile(), dumpPath);
+                if (!df.isAbsolute() && configParent != null) {
+                    df = new File(configParent, dumpPath);
                 }
                 dumpFile = df;
             }
