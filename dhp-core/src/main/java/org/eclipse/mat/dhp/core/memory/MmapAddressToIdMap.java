@@ -33,8 +33,12 @@ public class MmapAddressToIdMap implements IAddressToIdMap {
     private static final int LONGS_PER_CHUNK = (int) (CHUNK_BYTES / 8);
 
     public MmapAddressToIdMap(Long2IntOpenHashMap classAddressToId, long[] sortedAddresses, int baseInstanceId, File tempDir) throws IOException {
+        this(classAddressToId, sortedAddresses, sortedAddresses != null ? sortedAddresses.length : 0, baseInstanceId, tempDir);
+    }
+
+    public MmapAddressToIdMap(Long2IntOpenHashMap classAddressToId, long[] sortedAddresses, int instanceCount, int baseInstanceId, File tempDir) throws IOException {
         this.classAddressToId = classAddressToId != null ? classAddressToId : new Long2IntOpenHashMap();
-        this.instanceCount = sortedAddresses != null ? sortedAddresses.length : 0;
+        this.instanceCount = instanceCount;
         this.baseInstanceId = baseInstanceId;
         this.totalSize = this.classAddressToId.size() + instanceCount;
 

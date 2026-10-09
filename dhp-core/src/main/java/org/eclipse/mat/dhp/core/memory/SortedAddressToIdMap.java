@@ -12,14 +12,20 @@ import java.util.Arrays;
 public class SortedAddressToIdMap implements IAddressToIdMap {
     private final Long2IntOpenHashMap classAddressToId;
     private final long[] instanceAddresses;
+    private final int instanceCount;
     private final int baseInstanceId;
     private final int totalSize;
 
     public SortedAddressToIdMap(Long2IntOpenHashMap classAddressToId, long[] sortedInstanceAddresses, int baseInstanceId) {
+        this(classAddressToId, sortedInstanceAddresses, sortedInstanceAddresses != null ? sortedInstanceAddresses.length : 0, baseInstanceId);
+    }
+
+    public SortedAddressToIdMap(Long2IntOpenHashMap classAddressToId, long[] sortedInstanceAddresses, int instanceCount, int baseInstanceId) {
         this.classAddressToId = classAddressToId != null ? classAddressToId : new Long2IntOpenHashMap();
         this.instanceAddresses = sortedInstanceAddresses != null ? sortedInstanceAddresses : new long[0];
+        this.instanceCount = instanceCount;
         this.baseInstanceId = baseInstanceId;
-        this.totalSize = this.classAddressToId.size() + this.instanceAddresses.length;
+        this.totalSize = this.classAddressToId.size() + this.instanceCount;
     }
 
     @Override
@@ -27,8 +33,8 @@ public class SortedAddressToIdMap implements IAddressToIdMap {
         if (classAddressToId.containsKey(address)) {
             return classAddressToId.get(address);
         }
-        if (instanceAddresses.length > 0) {
-            int idx = Arrays.binarySearch(instanceAddresses, address);
+        if (instanceCount > 0) {
+            int idx = Arrays.binarySearch(instanceAddresses, 0, instanceCount, address);
             if (idx >= 0) {
                 return baseInstanceId + idx;
             }

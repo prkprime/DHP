@@ -118,14 +118,17 @@ public class Pass2ObjectIngester implements AutoCloseable {
 
         int baseInstanceId = currentObjectId;
         long[] sortedInstances = pass1.getSortedInstanceAddresses();
+        int instanceCount = pass1.getUniqueInstanceCount();
         File tempDir = file.getAbsoluteFile().getParentFile();
 
         this.addressToId = governor.createAddressMap(
                 classAddressToId,
                 sortedInstances,
+                instanceCount,
                 baseInstanceId,
                 tempDir
         );
+        pass1.releaseSortedInstanceAddresses();
 
         int totalExpectedObjects = addressToId.size();
         IObjectMembershipSet writtenObjects = governor.createMembershipSet(totalExpectedObjects);
@@ -168,7 +171,7 @@ public class Pass2ObjectIngester implements AutoCloseable {
         }
 
         log.info("Pass 2 Pre-registration complete: classes={}, instances={}, totalExpectedObjects={}",
-                pass1.getClasses().size(), sortedInstances.length, totalExpectedObjects);
+                pass1.getClasses().size(), instanceCount, totalExpectedObjects);
 
         try (HprofBinaryReader reader = new HprofBinaryReader(file)) {
             reader.readHeader(); // skip header

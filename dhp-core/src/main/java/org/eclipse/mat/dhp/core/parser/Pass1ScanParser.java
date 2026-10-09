@@ -1,6 +1,7 @@
 package org.eclipse.mat.dhp.core.parser;
 
 import it.unimi.dsi.fastutil.longs.LongArrayList;
+import org.eclipse.mat.dhp.core.memory.InPlaceLongSort;
 import org.eclipse.mat.dhp.core.model.HeapRecords;
 import org.eclipse.mat.dhp.core.model.HprofConstants;
 import org.slf4j.Logger;
@@ -11,8 +12,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -26,11 +29,13 @@ public class Pass1ScanParser {
     private static final Pattern PATTERN_PRIMITIVE_ARRAY = Pattern.compile("^(\\[+)(.)$");
 
     private final Map<Long, String> strings = new HashMap<>();
+    private final Set<Long> referencedStringIds = new HashSet<>();
     private final Map<Long, Long> classSerialNumberToId = new HashMap<>();
     private final Map<Long, Long> classIdToNameId = new HashMap<>();
     private final Map<Long, HeapRecords.ClassRecord> classes = new HashMap<>();
     private final LongArrayList objectAddresses = new LongArrayList();
     private long[] sortedInstanceAddresses;
+    private int uniqueInstanceCount;
     private final List<HeapRecords.GcRootRecord> gcRoots = new ArrayList<>();
     private final Map<Long, Long> classToSuperClass = new HashMap<>();
 
@@ -65,6 +70,7 @@ public class Pass1ScanParser {
                         long nameId = reader.readId();
                         classSerialNumberToId.put(classSerNum, classId);
                         classIdToNameId.put(classId, nameId);
+                        referencedStringIds.add(nameId);
                     }
                     case HprofConstants.Record.HEAP_DUMP, HprofConstants.Record.HEAP_DUMP_SEGMENT -> {
                         scanHeapDumpSegment(reader, length, idSize);
@@ -121,11 +127,25 @@ public class Pass1ScanParser {
         // Recalculate runtime instance sizes with exact header + field alignment (MAT parity)
         calculateRuntimeInstanceSizes(header.idSize());
 
-        // Sort and deduplicate instance object addresses in-place to compact memory and prepare binary search index
+        // Prune strings map to keep only referenced names, freeing potentially millions of strings
+        int totalStringsFound = strings.size();
+        Map<Long, String> retained = new HashMap<>(referencedStringIds.size());
+        for (Long sid : referencedStringIds) {
+            String val = strings.get(sid);
+            if (val != null) {
+                retained.put(sid, val);
+            }
+        }
+        strings.clear();
+        strings.putAll(retained);
+        referencedStringIds.clear();
+
+        // Sort and deduplicate instance object addresses in-place to compact memory and prepare binary search index.
+        // Uses InPlaceLongSort (0 auxiliary allocations) to completely avoid tryMergeRuns OOM.
         if (!objectAddresses.isEmpty()) {
             long[] raw = objectAddresses.elements();
             int rawSize = objectAddresses.size();
-            java.util.Arrays.parallelSort(raw, 0, rawSize);
+            InPlaceLongSort.sort(raw, 0, rawSize, Runtime.getRuntime().availableProcessors());
             int unique = 0;
             for (int i = 0; i < rawSize; i++) {
                 long addr = raw[i];
@@ -133,15 +153,15 @@ public class Pass1ScanParser {
                     raw[unique++] = addr;
                 }
             }
-            this.sortedInstanceAddresses = java.util.Arrays.copyOf(raw, unique);
-            this.objectAddresses.clear();
-            this.objectAddresses.trim();
+            this.uniqueInstanceCount = unique;
+            this.sortedInstanceAddresses = raw;
         } else {
+            this.uniqueInstanceCount = 0;
             this.sortedInstanceAddresses = new long[0];
         }
 
         log.info("Pass 1 Completed: Parsed {} strings, {} classes, {} unique objects, {} GC roots",
-                strings.size(), classes.size(), sortedInstanceAddresses.length, gcRoots.size());
+                totalStringsFound, classes.size(), uniqueInstanceCount, gcRoots.size());
     }
 
     private void scanHeapDumpSegment(HprofBinaryReader reader, long segmentLength, int idSize) throws IOException {
@@ -218,6 +238,7 @@ public class Pass1ScanParser {
                     List<HeapRecords.StaticFieldRecord> staticFields = new ArrayList<>(staticCount);
                     for (int i = 0; i < staticCount; i++) {
                         long fieldNameId = reader.readId();
+                        referencedStringIds.add(fieldNameId);
                         int fieldType = reader.readByte();
                         Object val = switch (fieldType) {
                             case HprofConstants.Type.OBJECT -> reader.readId();
@@ -243,6 +264,7 @@ public class Pass1ScanParser {
                     List<HeapRecords.FieldDescriptor> fields = new ArrayList<>(fieldCount);
                     for (int i = 0; i < fieldCount; i++) {
                         long fieldNameId = reader.readId();
+                        referencedStringIds.add(fieldNameId);
                         int fieldType = reader.readByte();
                         String fieldName = strings.getOrDefault(fieldNameId, "field_" + fieldNameId);
                         fields.add(new HeapRecords.FieldDescriptor(fieldName, fieldType));
@@ -302,6 +324,16 @@ public class Pass1ScanParser {
 
     public long[] getSortedInstanceAddresses() {
         return sortedInstanceAddresses != null ? sortedInstanceAddresses : new long[0];
+    }
+
+    public int getUniqueInstanceCount() {
+        return uniqueInstanceCount;
+    }
+
+    public void releaseSortedInstanceAddresses() {
+        this.sortedInstanceAddresses = null;
+        this.objectAddresses.clear();
+        this.objectAddresses.trim();
     }
 
     public HeapRecords.Header getHeader() {

@@ -54,15 +54,25 @@ public final class MemoryGovernor {
                                             long[] sortedInstanceAddresses,
                                             int baseInstanceId,
                                             java.io.File tempDir) {
+        return createAddressMap(classAddressToId, sortedInstanceAddresses,
+                sortedInstanceAddresses != null ? sortedInstanceAddresses.length : 0,
+                baseInstanceId, tempDir);
+    }
+
+    public IAddressToIdMap createAddressMap(it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap classAddressToId,
+                                            long[] sortedInstanceAddresses,
+                                            int instanceCount,
+                                            int baseInstanceId,
+                                            java.io.File tempDir) {
         String override = System.getProperty("dhp.address.map", "").toLowerCase();
-        int count = sortedInstanceAddresses != null ? sortedInstanceAddresses.length : 0;
+        int count = instanceCount;
         long estimatedArrayBytes = (long) count * 8L;
 
         if ("mmap".equals(override) || (totalAllocatedBytes < estimatedArrayBytes * 2 && count > 500_000)) {
             try {
                 log.info("MemoryGovernor: Selected off-heap MmapAddressToIdMap (Heap budget = {}MB, Addresses = {}MB)",
                         totalAllocatedBytes / (1024 * 1024), estimatedArrayBytes / (1024 * 1024));
-                return new MmapAddressToIdMap(classAddressToId, sortedInstanceAddresses, baseInstanceId, tempDir);
+                return new MmapAddressToIdMap(classAddressToId, sortedInstanceAddresses, count, baseInstanceId, tempDir);
             } catch (Exception e) {
                 log.warn("Failed creating MmapAddressToIdMap, falling back to ChunkedAddressToIdMap: {}", e.getMessage());
             }
@@ -71,12 +81,12 @@ public final class MemoryGovernor {
         if ("chunked".equals(override)) {
             log.info("MemoryGovernor: Selected ChunkedAddressToIdMap ({} objects, ~{}MB heap)",
                     count, estimatedArrayBytes / (1024 * 1024));
-            return new ChunkedAddressToIdMap(classAddressToId, sortedInstanceAddresses, baseInstanceId);
+            return new ChunkedAddressToIdMap(classAddressToId, sortedInstanceAddresses, count, baseInstanceId);
         }
 
         log.info("MemoryGovernor: Selected SortedAddressToIdMap ({} objects, ~{}MB heap)",
                 count, estimatedArrayBytes / (1024 * 1024));
-        return new SortedAddressToIdMap(classAddressToId, sortedInstanceAddresses, baseInstanceId);
+        return new SortedAddressToIdMap(classAddressToId, sortedInstanceAddresses, count, baseInstanceId);
     }
 
     /**

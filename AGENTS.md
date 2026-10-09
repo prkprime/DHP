@@ -113,6 +113,12 @@ To eliminate out-of-memory errors on massive dumps (e.g. 11GB–100GB dumps with
   - 100M objects consume strictly **800 MB** of RAM (vs 3.2–4.8 GB with hash maps).
   - Build time is **29x faster** (14.0 ms vs 412.5 ms for 5M objects).
   - Eliminates the Pass 2 pre-registration insertion loop completely.
+- **`InPlaceLongSort` (Zero-Auxiliary-Array Quicksort)**:
+  - Standard `java.util.Arrays.parallelSort(long[])` is a parallel merge sort that allocates an auxiliary array `new long[N]` (an instant 800 MB – 1.07 GB allocation for 100M objects) and invokes OpenJDK's `DualPivotQuicksort.tryMergeRuns`, causing fatal `OutOfMemoryError` on large dumps under 4GB heaps.
+  - `InPlaceLongSort` executes an in-place multi-threaded partition-first Quicksort using `ForkJoinPool` with **strictly 0 bytes** of auxiliary array allocation.
+  - **Zero-Copy Deduplication**: In-place unique compaction updates `uniqueInstanceCount` without calling `Arrays.copyOf(raw, unique)`, saving an additional 800 MB allocation spike. Binary search operates directly on `Arrays.binarySearch(a, 0, uniqueInstanceCount, address)`.
+- **String Memory Governance in Pass 1**:
+  - Millions of application string objects in `.hprof` dumps can consume >1.5 GB heap. Pass 1 dynamically tracks referenced string IDs (class and field descriptors) and prunes `strings` down to only required names immediately after class hierarchy resolution, freeing ~1.5 GB before the sorting phase starts.
 - **`ChunkedAddressToIdMap`**: Breaks sorted addresses into 8 MB chunks (1,048,576 longs each) using bit-shifting (`mid >>> 20` and `mid & 0xFFFFF`) to eliminate G1 GC humongous allocation warnings.
 - **`MmapAddressToIdMap`**: Streams the sorted primitive array into an off-heap memory-mapped file on disk, reducing JVM heap consumption to **0 MB** for extreme low-memory environments (e.g. `-Xmx512m` on a 150GB dump).
 

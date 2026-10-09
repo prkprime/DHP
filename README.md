@@ -61,6 +61,8 @@ DHP parses massive Java heap dumps (100GB+) without requiring hundreds of gigaby
 
 - **Constant-Memory Architecture**: Configurable RAM budget (e.g. 1GB–4GB) regardless of whether the heap dump is 2GB or 150GB.
 - **Dynamic Memory Governor**: Self-tunes batch sizes, thread pools, and SQLite page cache sizes based on available system memory.
+- **Zero-Auxiliary In-Place Address Sorting**: Multi-threaded in-place Quicksort (`InPlaceLongSort`) with strictly 0 bytes of auxiliary array allocation, eliminating the `DualPivotQuicksort.tryMergeRuns` OOM spikes on multi-gigabyte dumps with 100M+ objects.
+- **Dynamic String Pruning & Zero-Copy Dedup**: Automatically prunes non-class strings right after class hierarchy resolution and indexes sorted address subranges without duplicate array copies, saving up to 2.5 GB of heap headroom.
 - **Compact Topological Storage**: Stores graph edges, class metadata, and dominators in SQLite (~58 MB for a 2.2 GB dump), seeking directly into `.hprof` byte offsets (`file_position`) for raw array and instance payloads.
 - **Full Object Inspector & Static Fields**: Populates static fields (both primitive and object reference values), superclasses, and subclasses across the entire JVM hierarchy.
 - **Dominator Tree & Histogram Retained Sizing**: Full Lengauer-Tarjan semi-dominator tree computation with instant bottom-up retained sizes and full compatibility with MAT's on-demand "Calculate Minimum Retained Size" calculator.
