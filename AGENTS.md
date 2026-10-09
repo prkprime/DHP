@@ -191,11 +191,19 @@ Cross-platform scripts (Linux, macOS, Windows) streamline installation, testing,
 
 ## 8. CLI Usage Examples
 
-### Parse into SQLite
+### Generate Synthetic Test Dump
+```bash
+# Authentic complex dump (~2.38 GB):
+java -Xmx4g tools/dump-generator/ComplexHeapDumpGenerator.java dump.hprof
+
+# Fast scaled test dump (~140 MB):
+java -Xmx1g tools/dump-generator/ComplexHeapDumpGenerator.java dump.hprof 0.05
+```
+
+### Parse into SQLite (Co-locates .dhp and .dhp.db alongside dump)
 ```bash
 java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
   --dump /path/to/heapdump.hprof \
-  --jdbcurl jdbc:sqlite:/path/to/heapdump.db \
   --memory-budget 2147483648 \
   --threads 4
 ```

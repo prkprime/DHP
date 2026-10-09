@@ -121,7 +121,46 @@ Full triple cross-platform parity (`.sh`, `.bat`, `.ps1`) across Linux, macOS, a
 
 ---
 
-## CLI Usage
+## Generating Sample Dumps (`ComplexHeapDumpGenerator`)
+
+DHP includes an authentic, production-grade synthetic dump generator ([`tools/dump-generator/ComplexHeapDumpGenerator.java`](tools/dump-generator/ComplexHeapDumpGenerator.java)) that simulates complex enterprise workloads:
+- Deep multi-level inheritance hierarchies across all 8 Java primitive types.
+- Diamond DAG topologies testing dominator convergence (`idom(D) = A`).
+- Cyclic reference loops, binary search trees (16,383 nodes), and collections (`HashMap`, `TreeMap`).
+- Multi-thread local GC roots and distinct dominator retained buckets (650 MB, 550 MB, 450 MB, 350 MB, 250 MB).
+
+Thanks to Java 21 single-file source execution, no prior compilation is required:
+
+### Linux / macOS (Bash):
+```bash
+# Full authentic dump (strictly 2.0 GB - 3.0 GB, ~2.38 GB):
+java -Xmx4g tools/dump-generator/ComplexHeapDumpGenerator.java sample_dump.hprof
+
+# Fast scaled test dump (~140 MB, scale = 0.05):
+java -Xmx1g tools/dump-generator/ComplexHeapDumpGenerator.java sample_dump.hprof 0.05
+```
+
+### Windows Command Prompt (CMD):
+```cmd
+:: Full authentic dump (strictly 2.0 GB - 3.0 GB, ~2.38 GB):
+java -Xmx4g tools\dump-generator\ComplexHeapDumpGenerator.java sample_dump.hprof
+
+:: Fast scaled test dump (~140 MB, scale = 0.05):
+java -Xmx1g tools\dump-generator\ComplexHeapDumpGenerator.java sample_dump.hprof 0.05
+```
+
+### Windows PowerShell:
+```powershell
+# Full authentic dump (strictly 2.0 GB - 3.0 GB, ~2.38 GB):
+java -Xmx4g tools\dump-generator\ComplexHeapDumpGenerator.java sample_dump.hprof
+
+# Fast scaled test dump (~140 MB, scale = 0.05):
+java -Xmx1g tools\dump-generator\ComplexHeapDumpGenerator.java sample_dump.hprof 0.05
+```
+
+---
+
+## CLI Usage & Parsing from Repository Root
 
 The standalone fat JAR is located at `dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar`.
 
@@ -133,30 +172,96 @@ The standalone fat JAR is located at `dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar`
 | `-c` | `--config` | Path to DHP descriptor file (`.dhp`) |
 | `--db` | `--url`, `--db-url`, `--jdbcurl` | Database name or JDBC connection URL |
 | `-m` | `--memory`, `--memory-budget` | Memory budget (e.g. `512M`, `2G`, `4GB`, or raw bytes). Defaults to 75% of JVM `-Xmx` |
-| `-t` | `-w`, `--threads`, `--workers` | Worker threads count |
+| `-t` | `-w`, `--threads`, `--workers` | Worker threads count (defaults to available CPU cores) |
 | `--clean` | `--drop-existing` | Drop pre-existing DHP tables in target database before ingestion |
-| `--export-dhp` | | Path to export `.dhp` MAT descriptor (defaults to `<prefix>.dhp`) |
+| `--export-dhp` | | Path to export `.dhp` MAT descriptor (defaults to `<dumpPrefix>.dhp`) |
 
-### Examples
+### Parsing Commands (All Platforms)
 
-**Parse directly into SQLite WAL database:**
+When executing DHP CLI from the repository root (or any directory), invoke:
+
+**Linux / macOS (Bash):**
 ```bash
+# Auto-stages into SQLite alongside the dump:
+java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar -d sample_dump.hprof
+
+# Or with custom memory budget and threads:
 java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
-  --dump /path/to/heapdump.hprof \
-  --url jdbc:sqlite:/path/to/heapdump.dhp.db \
+  --dump sample_dump.hprof \
   --memory 2G \
   --threads 4
-```
 
-**Stream to PostgreSQL:**
-```bash
+# Or stream into PostgreSQL:
 java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
-  --dump /path/to/heapdump.hprof \
+  --dump sample_dump.hprof \
   --db jdbc:postgresql://localhost:5432/heapdumps \
   --user postgres \
   --password secret \
   --memory 4G
 ```
+
+**Windows Command Prompt (CMD):**
+```cmd
+:: Auto-stages into SQLite alongside the dump:
+java -jar dhp-cli\target\dhp-cli-1.0.0-SNAPSHOT.jar -d sample_dump.hprof
+
+:: Or with custom memory budget and threads:
+java -jar dhp-cli\target\dhp-cli-1.0.0-SNAPSHOT.jar ^
+  --dump sample_dump.hprof ^
+  --memory 2G ^
+  --threads 4
+
+:: Or stream into PostgreSQL:
+java -jar dhp-cli\target\dhp-cli-1.0.0-SNAPSHOT.jar ^
+  --dump sample_dump.hprof ^
+  --db jdbc:postgresql://localhost:5432/heapdumps ^
+  --user postgres ^
+  --password secret ^
+  --memory 4G
+```
+
+**Windows PowerShell:**
+```powershell
+# Auto-stages into SQLite alongside the dump:
+java -jar dhp-cli\target\dhp-cli-1.0.0-SNAPSHOT.jar -d sample_dump.hprof
+
+# Or with custom memory budget and threads:
+java -jar dhp-cli\target\dhp-cli-1.0.0-SNAPSHOT.jar `
+  --dump sample_dump.hprof `
+  --memory 2G `
+  --threads 4
+
+# Or stream into PostgreSQL:
+java -jar dhp-cli\target\dhp-cli-1.0.0-SNAPSHOT.jar `
+  --dump sample_dump.hprof `
+  --db jdbc:postgresql://localhost:5432/heapdumps `
+  --user postgres `
+  --password secret `
+  --memory 4G
+```
+
+---
+
+## Output Files & Resolution Architecture
+
+When parsing `sample_dump.hprof`, DHP automatically co-locates the database and descriptor directly alongside the dump:
+
+```
+/path/to/
+├── sample_dump.hprof     # Raw HPROF binary (never modified)
+├── sample_dump.dhp.db    # SQLite WAL database (stores topology, dominators, stats)
+└── sample_dump.dhp       # Eclipse MAT descriptor file
+```
+
+### Descriptor File (`.dhp`) Format:
+```properties
+# Dynamic Heap Parser (DHP) Descriptor
+db.url=jdbc:sqlite:/path/to/sample_dump.dhp.db
+dump.file=/path/to/sample_dump.hprof
+memory.budget=2147483648
+```
+- **Canonical Absolute Paths**: By default, `db.url` and `dump.file` are generated with canonical absolute paths. Eclipse MAT can therefore be launched from **any directory** or through the desktop GUI, and it will locate the database and `.hprof` binary without path mismatch errors.
+- **Relative Path Support**: Relative paths are also supported; if `dump.file` is relative, DHP resolves it relative to the directory containing the `.dhp` file.
 
 ---
 
@@ -164,20 +269,36 @@ java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
 
 DHP registers **strictly the `.dhp` extension** in Eclipse MAT to bypass the legacy memory-intensive `.idx` file generation entirely.
 
-1. Ingest your dump using CLI:
-   ```bash
-   java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar -d /path/to/dump.hprof
-   # Generates /path/to/dump.dhp and /path/to/dump.dhp.db
-   ```
-2. Open `/path/to/dump.dhp` directly in Eclipse MAT GUI or run headlessly:
-   ```bash
-   ./scripts/run-mat-headless.sh /path/to/dump.dhp org.eclipse.mat.api:suspects
-   ```
-3. Eclipse MAT opens the snapshot immediately without re-parsing, using direct SQL queries against SQLite/PostgreSQL and generating reports with zero disk index files!
+### 1. Headless Report Generation (All Platforms)
+
+Generate standard MAT HTML leak reports (e.g., `sample_dump_Leak_Suspects.zip`):
+
+**Linux / macOS (Bash):**
+```bash
+./scripts/run-mat-headless.sh sample_dump.dhp org.eclipse.mat.api:suspects
+```
+
+**Windows Command Prompt (CMD):**
+```cmd
+scripts\run-mat-headless.bat sample_dump.dhp org.eclipse.mat.api:suspects
+```
+
+**Windows PowerShell:**
+```powershell
+.\scripts\run-mat-headless.ps1 sample_dump.dhp org.eclipse.mat.api:suspects
+```
+
+### 2. Eclipse MAT GUI Navigation
+1. Launch Eclipse MAT:
+   - Linux: `./tools/mat/mat/MemoryAnalyzer`
+   - Windows: `tools\mat\mat\MemoryAnalyzer.exe`
+2. Click **File -> Open Heap Dump...**
+3. Select `sample_dump.dhp` (the file dialog filter defaults to `.dhp`).
+4. Eclipse MAT opens the snapshot immediately in **< 1 second** using direct SQL queries against SQLite/PostgreSQL, generating reports with **zero disk index files**!
 
 > [!NOTE]
 > **Understanding Headless Output (`Task: Writing HTML files`)**:
-> When executing headless reports via `run-mat-headless.sh /path/to/dump.dhp org.eclipse.mat.api:suspects`, Eclipse MAT's Equinox reporting engine evaluates chart templates and renders dozens of drill-down HTML pages for suspect components into an archive. While rendering, it outputs `Task: Writing HTML files` progress lines to stdout. This is standard Eclipse MAT report generation, confirming active progress rather than an infinite loop.
+> When executing headless reports via `run-mat-headless` for `org.eclipse.mat.api:suspects`, Eclipse MAT's Equinox reporting engine evaluates chart templates and renders dozens of drill-down HTML pages for suspect components into an archive. While rendering, it outputs `Task: Writing HTML files` progress lines to stdout. This is standard Eclipse MAT report generation, confirming active progress rather than an infinite loop.
 
 ---
 
