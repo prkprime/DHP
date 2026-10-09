@@ -112,6 +112,11 @@ public class MmapAddressToIdMap implements IAddressToIdMap {
 
     @Override
     public void close() {
+        if (buffers != null) {
+            for (MappedByteBuffer buf : buffers) {
+                unmap(buf);
+            }
+        }
         try {
             raf.close();
             if (tempFile.exists()) {
@@ -119,6 +124,27 @@ public class MmapAddressToIdMap implements IAddressToIdMap {
             }
         } catch (IOException e) {
             log.warn("Failed closing mmap address file: {}", e.getMessage());
+        }
+    }
+
+    private static void unmap(MappedByteBuffer buffer) {
+        if (buffer == null) return;
+        try {
+            java.lang.reflect.Field unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            unsafeField.setAccessible(true);
+            sun.misc.Unsafe unsafe = (sun.misc.Unsafe) unsafeField.get(null);
+            unsafe.invokeCleaner(buffer);
+        } catch (Throwable t) {
+            try {
+                java.lang.reflect.Method cleanerMethod = buffer.getClass().getMethod("cleaner");
+                cleanerMethod.setAccessible(true);
+                Object cleaner = cleanerMethod.invoke(buffer);
+                if (cleaner != null) {
+                    java.lang.reflect.Method cleanMethod = cleaner.getClass().getMethod("clean");
+                    cleanMethod.setAccessible(true);
+                    cleanMethod.invoke(cleaner);
+                }
+            } catch (Throwable ignored) {}
         }
     }
 }

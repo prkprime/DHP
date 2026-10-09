@@ -1,5 +1,6 @@
 package org.eclipse.mat.dhp.storage.jdbc;
 
+import org.eclipse.mat.dhp.core.graph.CsrGraph;
 import org.eclipse.mat.dhp.core.model.HeapRecords;
 import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
 import org.slf4j.Logger;
@@ -65,14 +66,15 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         try (Statement stmt = connection.createStatement()) {
             stmt.execute("PRAGMA journal_mode = WAL;");
             stmt.execute("PRAGMA synchronous = NORMAL;");
-            // Set cache size: negative number indicates KiB
-            long cacheKiB = Math.max(64 * 1024, memoryBudgetBytes / 1024 / 2);
+            // Set cache size: negative number indicates KiB (cap at 128 MB to preserve OS RAM)
+            long cacheKiB = Math.min(128 * 1024, Math.max(32 * 1024, memoryBudgetBytes / 1024 / 16));
             stmt.execute("PRAGMA cache_size = -" + cacheKiB + ";");
-            stmt.execute("PRAGMA temp_store = MEMORY;");
-            stmt.execute("PRAGMA mmap_size = 4294967296;"); // 4GB mmap
+            stmt.execute("PRAGMA temp_store = FILE;"); // Always use disk for temp sorting to protect system RAM
+            stmt.execute("PRAGMA mmap_size = 268435456;"); // 256 MB bounded mmap, not 4 GB
+            stmt.execute("PRAGMA wal_autocheckpoint = 10000;");
             stmt.execute("PRAGMA threads = 4;");
         }
-        log.info("Configured SQLite for high performance WAL ingestion with memory cache budget");
+        log.info("Configured SQLite for high performance bounded WAL ingestion with safe temp_store=FILE");
     }
 
     private void configurePostgres() throws SQLException {
@@ -511,7 +513,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         if (sysId >= 0) rootSet.add(sysId);
 
         // 2. Load outbound adjacency for reachability traversal
-        int[][] outAdj = loadAllOutboundReferences(n);
+        CsrGraph outAdj = loadOutboundCsr(n);
 
         // 3. Fast BFS reachability traversal
         java.util.BitSet reachable = new java.util.BitSet(n);
@@ -526,8 +528,11 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
         while (!queue.isEmpty()) {
             int u = queue.dequeueInt();
-            if (u >= 0 && u < outAdj.length) {
-                for (int v : outAdj[u]) {
+            if (u >= 0 && u < n) {
+                int start = outAdj.edgeStart(u);
+                int end = outAdj.edgeEnd(u);
+                for (int i = start; i < end; i++) {
+                    int v = outAdj.to()[i];
                     if (v >= 0 && v < n && !reachable.get(v)) {
                         reachable.set(v);
                         queue.enqueue(v);
@@ -656,7 +661,6 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         try (Statement stmt = connection.createStatement()) {
             // 1. Primary/unique indexes built in bulk
             stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_objects_pk ON dhp_objects(object_id);");
-            stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_dominator_pk ON dhp_dominator_tree(object_id);");
             stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_outbound_pk ON dhp_outbound_references(from_object_id, seq);");
 
             // 2. Secondary lookup indexes
@@ -667,8 +671,6 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_from ON dhp_inbound_references(from_object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_to ON dhp_inbound_references(to_object_id);");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_gc_roots_obj ON dhp_gc_roots(object_id);");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_dominator ON dhp_dominator_tree(dominator_id, retained_size DESC);");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_retained ON dhp_dominator_tree(retained_size);");
 
             // 3. Precompute class stats table for instant snapshot opening
             stmt.execute("DELETE FROM dhp_class_stats;");
@@ -700,6 +702,12 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             }
             saveSnapshotInfo("numberOfObjects", String.valueOf(count));
 
+            long edges = 0L;
+            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_outbound_references")) {
+                if (rs.next()) edges = rs.getLong(1);
+            }
+            saveSnapshotInfo("numberOfOutboundReferences", String.valueOf(edges));
+
             // 7. Database optimizer statistics
             if (isSqlite) {
                 stmt.execute("PRAGMA optimize;");
@@ -709,6 +717,24 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         }
         connection.commit();
         log.info("Bulk indexing successfully finished in {} ms.", System.currentTimeMillis() - start);
+    }
+
+    @Override
+    public void finishDominatorTree() throws SQLException {
+        long start = System.currentTimeMillis();
+        log.info("Building Dominator Tree indexes in bulk...");
+        try (Statement stmt = connection.createStatement()) {
+            stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_dominator_pk ON dhp_dominator_tree(object_id);");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_dominator ON dhp_dominator_tree(dominator_id, retained_size DESC);");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_retained ON dhp_dominator_tree(retained_size);");
+            if (isSqlite) {
+                stmt.execute("PRAGMA optimize;");
+            } else if (isPostgres) {
+                stmt.execute("ANALYZE dhp_dominator_tree;");
+            }
+        }
+        connection.commit();
+        log.info("Dominator Tree bulk indexes created in {} ms.", System.currentTimeMillis() - start);
     }
 
     @Override
@@ -967,44 +993,68 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     @Override
-    public int[][] loadAllOutboundReferences(int objectCount) throws SQLException {
-        int[][] outAdj = new int[objectCount][];
-        int[] counts = new int[objectCount];
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT from_object_id, count(*) FROM dhp_outbound_references GROUP BY from_object_id")) {
-            while (rs.next()) {
-                int from = rs.getInt(1);
-                if (from >= 0 && from < objectCount) {
-                    counts[from] = rs.getInt(2);
+    public CsrGraph loadOutboundCsr(int objectCount) throws SQLException {
+        log.info("Loading outbound CSR graph for {} objects from database...", objectCount);
+        long start = System.currentTimeMillis();
+        String cached = getSnapshotInfo("numberOfOutboundReferences");
+        long edgeCountLong = -1;
+        if (cached != null && !cached.isBlank()) {
+            try {
+                edgeCountLong = Long.parseLong(cached.trim());
+            } catch (NumberFormatException ignored) {}
+        }
+        if (edgeCountLong < 0) {
+            try (Statement stmt = connection.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_outbound_references")) {
+                if (rs.next()) edgeCountLong = rs.getLong(1);
+            }
+        }
+        if (edgeCountLong > Integer.MAX_VALUE) {
+            throw new IllegalStateException("Edge count exceeds Integer.MAX_VALUE: " + edgeCountLong);
+        }
+        int edgeCount = (int) edgeCountLong;
+        int[] head = new int[objectCount + 1];
+        int[] to = new int[edgeCount];
+
+        try (Statement stmt = connection.createStatement()) {
+            stmt.setFetchSize(50000);
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT from_object_id, to_object_id FROM dhp_outbound_references ORDER BY from_object_id, seq")) {
+                int edgeIdx = 0;
+                while (rs.next()) {
+                    int from = rs.getInt(1);
+                    int target = rs.getInt(2);
+                    if (from >= 0 && from < objectCount) {
+                        if (edgeIdx < edgeCount) {
+                            to[edgeIdx++] = target;
+                        }
+                        head[from + 1]++;
+                    }
+                }
+                if (edgeIdx < edgeCount) {
+                    to = java.util.Arrays.copyOf(to, edgeIdx);
                 }
             }
         }
         for (int i = 0; i < objectCount; i++) {
-            outAdj[i] = new int[counts[i]];
+            head[i + 1] += head[i];
         }
-        int[] pos = new int[objectCount];
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT from_object_id, to_object_id FROM dhp_outbound_references ORDER BY from_object_id, seq")) {
-            while (rs.next()) {
-                int from = rs.getInt(1);
-                int to = rs.getInt(2);
-                if (from >= 0 && from < objectCount && pos[from] < outAdj[from].length) {
-                    outAdj[from][pos[from]++] = to;
-                }
-            }
-        }
-        return outAdj;
+        log.info("Outbound CSR graph loaded: {} vertices, {} edges in {} ms.",
+                objectCount, to.length, System.currentTimeMillis() - start);
+        return new CsrGraph(head, to);
     }
 
     @Override
     public long[] loadAllObjectUsedSizes(int objectCount) throws SQLException {
         long[] sizes = new long[objectCount];
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT object_id, used_size FROM dhp_objects")) {
-            while (rs.next()) {
-                int id = rs.getInt(1);
-                if (id >= 0 && id < objectCount) {
-                    sizes[id] = rs.getLong(2);
+        try (Statement stmt = connection.createStatement()) {
+            stmt.setFetchSize(50000);
+            try (ResultSet rs = stmt.executeQuery("SELECT object_id, used_size FROM dhp_objects ORDER BY object_id")) {
+                while (rs.next()) {
+                    int id = rs.getInt(1);
+                    if (id >= 0 && id < objectCount) {
+                        sizes[id] = rs.getLong(2);
+                    }
                 }
             }
         }

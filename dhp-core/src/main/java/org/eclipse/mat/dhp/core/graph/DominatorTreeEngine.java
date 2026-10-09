@@ -35,9 +35,9 @@ public class DominatorTreeEngine {
         int superRoot = n; // Artificial super root index
         int totalVertices = n + 2; // Supports 1-indexed vertex array up to n + 1
 
-        // 1. Load outbound adjacency and shallow sizes
-        int[][] outAdj = storage.loadAllOutboundReferences(n);
-        long[] shallowSizes = storage.loadAllObjectUsedSizes(n);
+        // 1. Load outbound CSR and shallow sizes directly into retainedSizes buffer
+        CsrGraph outGraph = storage.loadOutboundCsr(n);
+        long[] retainedSizes = storage.loadAllObjectUsedSizes(n);
 
         // 2. Collect unique GC root object IDs
         Set<Integer> gcRootsSet = new LinkedHashSet<>();
@@ -50,34 +50,54 @@ public class DominatorTreeEngine {
         int[] gcRootIds = gcRootsSet.stream().mapToInt(Integer::intValue).toArray();
         log.info("Collected {} unique GC root objects for dominator analysis", gcRootIds.length);
 
-        // 3. Build inAdj graph (with superRoot as predecessor to all GC roots)
-        int[] inDegree = new int[n];
+        // 3. Build inHead and inTo CSR graph (with superRoot as predecessor to all GC roots)
+        int[] inHead = new int[n + 1];
         for (int u = 0; u < n; u++) {
-            for (int v : outAdj[u]) {
+            int start = outGraph.edgeStart(u);
+            int end = outGraph.edgeEnd(u);
+            for (int e = start; e < end; e++) {
+                int v = outGraph.to()[e];
                 if (v >= 0 && v < n) {
-                    inDegree[v]++;
+                    inHead[v + 1]++;
                 }
             }
         }
         for (int r : gcRootIds) {
-            inDegree[r]++; // Edge from superRoot -> r
+            if (r >= 0 && r < n) {
+                inHead[r + 1]++;
+            }
         }
-
-        int[][] inAdj = new int[n][];
         for (int i = 0; i < n; i++) {
-            inAdj[i] = new int[inDegree[i]];
+            inHead[i + 1] += inHead[i];
         }
-        int[] inPos = new int[n];
+        int totalInEdges = inHead[n];
+        int[] inTo = new int[totalInEdges];
+
+        // Allocate scratch arrays (reused across phases to bound memory footprint)
+        int[] dfsStack = new int[totalVertices];
+        int[] edgePos = new int[totalVertices];
+
+        // Temporarily reuse dfsStack as inPos
+        int[] inPos = dfsStack;
+        System.arraycopy(inHead, 0, inPos, 0, n);
+
         for (int r : gcRootIds) {
-            inAdj[r][inPos[r]++] = superRoot;
+            if (r >= 0 && r < n) {
+                inTo[inPos[r]++] = superRoot;
+            }
         }
         for (int u = 0; u < n; u++) {
-            for (int v : outAdj[u]) {
+            int start = outGraph.edgeStart(u);
+            int end = outGraph.edgeEnd(u);
+            for (int e = start; e < end; e++) {
+                int v = outGraph.to()[e];
                 if (v >= 0 && v < n) {
-                    inAdj[v][inPos[v]++] = u;
+                    inTo[inPos[v]++] = u;
                 }
             }
         }
+        // Reset dfsStack before DFS traversal
+        Arrays.fill(dfsStack, 0);
 
         // 4. Lengauer-Tarjan structures
         int[] semi = new int[totalVertices];
@@ -94,10 +114,7 @@ public class DominatorTreeEngine {
         }
 
         // 5. Iterative DFS from superRoot
-        int[] dfsStack = new int[totalVertices];
-        int[] edgePos = new int[totalVertices];
         int top = 0;
-
         dfsStack[0] = superRoot;
         edgePos[0] = 0;
         top = 1;
@@ -109,10 +126,21 @@ public class DominatorTreeEngine {
         while (top > 0) {
             int u = dfsStack[top - 1];
             int e = edgePos[top - 1]++;
-            int[] succ = (u == superRoot) ? gcRootIds : outAdj[u];
+            int w = -1;
 
-            if (e < succ.length) {
-                int w = succ[e];
+            if (u == superRoot) {
+                if (e < gcRootIds.length) {
+                    w = gcRootIds[e];
+                }
+            } else {
+                int start = outGraph.edgeStart(u);
+                int end = outGraph.edgeEnd(u);
+                if (start + e < end) {
+                    w = outGraph.to()[start + e];
+                }
+            }
+
+            if (w != -1) {
                 if (w >= 0 && w < n && semi[w] == 0) {
                     semi[w] = ++dfsCount;
                     vertex[dfsCount] = w;
@@ -127,15 +155,22 @@ public class DominatorTreeEngine {
         }
         log.info("DFS complete: reached {} of {} heap objects from GC roots", dfsCount - 1, n);
 
+        // Outbound graph is no longer needed: release memory immediately
+        outGraph = null;
+
         // 6. Lengauer-Tarjan algorithm: compute semi-dominators and dominators
-        int[] bucketHead = new int[totalVertices];
-        int[] bucketNext = new int[totalVertices];
+        // Reuse dfsStack and edgePos for bucketHead and bucketNext
+        int[] bucketHead = dfsStack;
+        int[] bucketNext = edgePos;
         Arrays.fill(bucketHead, -1);
 
         for (int i = dfsCount; i >= 2; i--) {
             int w = vertex[i];
 
-            for (int v : inAdj[w]) {
+            int inStart = inHead[w];
+            int inEnd = inHead[w + 1];
+            for (int idx = inStart; idx < inEnd; idx++) {
+                int v = inTo[idx];
                 if (semi[v] == 0) continue; // Unreachable predecessor
                 int u = eval(v, ancestor, label, semi);
                 if (semi[u] < semi[w]) {
@@ -171,27 +206,29 @@ public class DominatorTreeEngine {
         }
         dom[superRoot] = -1;
 
+        // Inbound graph is no longer needed: release memory immediately
+        inHead = null;
+        inTo = null;
+
         // 7. Retained size calculation: build dominator tree children and post-order traversal
-        int[] domHead = new int[totalVertices];
-        int[] domNext = new int[totalVertices];
+        // Reuse ancestor and label for domHead and domNext
+        int[] domHead = ancestor;
+        int[] domNext = label;
         Arrays.fill(domHead, -1);
 
         for (int i = 0; i < n; i++) {
             if (semi[i] > 0) {
                 int p = dom[i];
-                domNext[i] = domHead[p];
-                domHead[p] = i;
+                if (p >= 0 && p < totalVertices) {
+                    domNext[i] = domHead[p];
+                    domHead[p] = i;
+                }
             }
         }
 
-        long[] retainedSizes = new long[n];
-        for (int i = 0; i < n; i++) {
-            retainedSizes[i] = shallowSizes[i];
-        }
-
-        // Iterative post-order traversal starting at superRoot
-        int[] postStack = new int[totalVertices];
-        int[] childPointer = new int[totalVertices];
+        // Reuse bucketHead and bucketNext for postStack and childPointer
+        int[] postStack = bucketHead;
+        int[] childPointer = bucketNext;
         int postTop = 0;
 
         postStack[0] = superRoot;
@@ -209,7 +246,7 @@ public class DominatorTreeEngine {
                 int curr = postStack[--postTop];
                 if (postTop > 0) {
                     int p = postStack[postTop - 1];
-                    if (p != superRoot) {
+                    if (p != superRoot && p >= 0 && p < n) {
                         retainedSizes[p] += retainedSizes[curr];
                     }
                 }
@@ -217,7 +254,7 @@ public class DominatorTreeEngine {
         }
 
         // 8. Batch save dominator tree to database
-        int batchSize = 10000;
+        int batchSize = 50000;
         List<HeapStorageEngine.DominatorNode> nodes = new ArrayList<>(batchSize);
         for (int i = 0; i < n; i++) {
             int d = (semi[i] > 0 && dom[i] != superRoot) ? dom[i] : -1;
@@ -232,10 +269,15 @@ public class DominatorTreeEngine {
             nodes.clear();
         }
 
+        // Build Dominator Tree bulk indexes
+        storage.finishDominatorTree();
+
         log.info("Lengauer-Tarjan Dominator tree and retained sizes successfully persisted for {} objects.", n);
     }
 
-    private static int eval(int v, int[] ancestor, int[] label, int[] semi) {
+    private int[] compressStack = new int[128];
+
+    private int eval(int v, int[] ancestor, int[] label, int[] semi) {
         if (ancestor[v] == -1) {
             return v;
         }
@@ -243,13 +285,27 @@ public class DominatorTreeEngine {
         return label[v];
     }
 
-    private static void compress(int v, int[] ancestor, int[] label, int[] semi) {
-        if (ancestor[ancestor[v]] != -1) {
-            compress(ancestor[v], ancestor, label, semi);
-            if (semi[label[ancestor[v]]] < semi[label[v]]) {
-                label[v] = label[ancestor[v]];
+    private void compress(int v, int[] ancestor, int[] label, int[] semi) {
+        int a = ancestor[v];
+        if (a == -1 || ancestor[a] == -1) {
+            return;
+        }
+        int top = 0;
+        int curr = v;
+        while (ancestor[curr] != -1 && ancestor[ancestor[curr]] != -1) {
+            if (top == compressStack.length) {
+                compressStack = Arrays.copyOf(compressStack, compressStack.length * 2);
             }
-            ancestor[v] = ancestor[ancestor[v]];
+            compressStack[top++] = curr;
+            curr = ancestor[curr];
+        }
+        while (top > 0) {
+            int node = compressStack[--top];
+            int p = ancestor[node];
+            if (semi[label[p]] < semi[label[node]]) {
+                label[node] = label[p];
+            }
+            ancestor[node] = ancestor[p];
         }
     }
 }

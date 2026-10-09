@@ -428,12 +428,11 @@ public class Pass2ObjectIngester implements AutoCloseable {
         }
 
         try {
-            storage.runGarbageCollection();
             storage.finishIngestion();
         } catch (SQLException e) {
-            throw new IOException("Failed to run database garbage collection and indexing", e);
+            throw new IOException("Failed to run database indexing", e);
         }
-        log.info("Pass 2 Completed: Ingested & garbage-collected objects in database (writtenObjects={}).", writtenObjects.size());
+        log.info("Pass 2 Completed: Ingested objects in database (writtenObjects={}).", writtenObjects.size());
     }
 
     private List<HeapRecords.ClassRecord> resolveClassHierarchy(long classId) {
