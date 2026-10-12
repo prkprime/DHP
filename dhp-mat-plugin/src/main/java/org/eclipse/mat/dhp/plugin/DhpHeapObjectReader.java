@@ -19,7 +19,6 @@ import org.eclipse.mat.snapshot.model.ObjectReference;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -32,10 +31,11 @@ import java.util.Properties;
  */
 public class DhpHeapObjectReader implements IObjectReader {
 
-    private RandomAccessFile raf;
+    private volatile HprofMap raf;
     /** Why object payloads cannot be read (null when the dump file is open). */
     private String dumpProblem;
     private int idSize = 8;
+    private final java.util.concurrent.ConcurrentHashMap<Integer, FieldDescriptor[]> layouts = new java.util.concurrent.ConcurrentHashMap<>();
     private org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine posStorage;
 
     @Override
@@ -67,7 +67,7 @@ public class DhpHeapObjectReader implements IObjectReader {
             this.dumpProblem = "the HPROF dump " + file + " is not available";
         }
         if (dumpProblem == null) {
-            this.raf = new RandomAccessFile(file, "r");
+            this.raf = new HprofMap(file);
             this.idSize = snapshot.getSnapshotInfo().getIdentifierSize();
             if (this.idSize <= 0) {
                 this.idSize = 8;
@@ -117,7 +117,7 @@ public class DhpHeapObjectReader implements IObjectReader {
     }
 
     @Override
-    public synchronized IObject read(int objectId, ISnapshot snapshot) throws SnapshotException, IOException {
+    public IObject read(int objectId, ISnapshot snapshot) throws SnapshotException, IOException {
         long address = snapshot.mapIdToAddress(objectId);
         IClass targetClass = snapshot.getClassOf(objectId);
         if (targetClass == null) {
@@ -155,8 +155,7 @@ public class DhpHeapObjectReader implements IObjectReader {
                 long dataPos = 0;
                 requireDump(filePos);
                 if (raf != null && filePos > 0) {
-                    raf.seek(filePos + 1 + idSize + 4);
-                    arrayLen = raf.readInt();
+                    arrayLen = raf.getInt(filePos + 1 + idSize + 4);
                     dataPos = filePos + 1 + idSize + 4 + 4 + 1;
                 }
                 PrimitiveArrayImpl arr = new PrimitiveArrayImpl(objectId, address, cImpl, arrayLen, primType);
@@ -168,8 +167,7 @@ public class DhpHeapObjectReader implements IObjectReader {
                 long dataPos = 0;
                 requireDump(filePos);
                 if (raf != null && filePos > 0) {
-                    raf.seek(filePos + 1 + idSize + 4);
-                    arrayLen = raf.readInt();
+                    arrayLen = raf.getInt(filePos + 1 + idSize + 4);
                     dataPos = filePos + 1 + idSize + 4 + 4 + idSize;
                 }
                 ObjectArrayImpl arr = new ObjectArrayImpl(objectId, address, cImpl, arrayLen);
@@ -187,28 +185,30 @@ public class DhpHeapObjectReader implements IObjectReader {
                     : new InstanceImpl(objectId, address, cImpl, Collections.emptyList());
         }
 
-        // Class hierarchy in standard MAT order (target class first, followed by superclasses)
-        List<IClass> hierarchy = resolveClassHierarchy(snapshot, targetClass);
+        // Field layout in standard MAT order (target class first, followed by superclasses), cached per class
+        FieldDescriptor[] layout = layouts.get(targetClass.getObjectId());
+        if (layout == null) {
+            List<FieldDescriptor> flat = new ArrayList<>();
+            for (IClass cls : resolveClassHierarchy(snapshot, targetClass)) {
+                flat.addAll(cls.getFieldDescriptors());
+            }
+            layout = flat.toArray(new FieldDescriptor[0]);
+            layouts.put(targetClass.getObjectId(), layout);
+        }
 
-        List<Field> instanceFields = new ArrayList<>();
+        List<Field> instanceFields = new ArrayList<>(layout.length);
         if (raf != null && filePos > 0) {
-            // Seek past INSTANCE_DUMP header: [id: idSize][serial: 4][classId: idSize][bytesFollowing: 4]
-            // Note: filePos was recorded at segment start tag, so segment tag byte + header
-            raf.seek(filePos + 1 + idSize + 4 + idSize + 4);
-            for (IClass cls : hierarchy) {
-                for (FieldDescriptor fd : cls.getFieldDescriptors()) {
-                    int type = fd.getType();
-                    Object val = readBinaryValue(type, snapshot);
-                    instanceFields.add(new Field(fd.getName(), type, val));
-                }
+            // INSTANCE_DUMP: [tag: 1][id: idSize][serial: 4][classId: idSize][bytesFollowing: 4][field values]
+            long pos = filePos + 1 + idSize + 4 + idSize + 4;
+            for (FieldDescriptor fd : layout) {
+                int type = fd.getType();
+                instanceFields.add(new Field(fd.getName(), type, readBinaryValue(type, pos, snapshot)));
+                pos += type == IObject.Type.OBJECT ? idSize : IPrimitiveArray.ELEMENT_SIZE[type];
             }
         } else {
-            for (IClass cls : hierarchy) {
-                for (FieldDescriptor fd : cls.getFieldDescriptors()) {
-                    int type = fd.getType();
-                    Object val = readDefaultOrMockValue(type, snapshot);
-                    instanceFields.add(new Field(fd.getName(), type, val));
-                }
+            for (FieldDescriptor fd : layout) {
+                int type = fd.getType();
+                instanceFields.add(new Field(fd.getName(), type, readDefaultOrMockValue(type, snapshot)));
             }
         }
 
@@ -220,20 +220,20 @@ public class DhpHeapObjectReader implements IObjectReader {
         }
     }
 
-    private Object readBinaryValue(int type, ISnapshot snapshot) throws IOException {
+    private Object readBinaryValue(int type, long pos, ISnapshot snapshot) throws IOException {
         return switch (type) {
             case IObject.Type.OBJECT -> {
-                long id = (idSize == 4) ? (raf.readInt() & 0xFFFFFFFFL) : raf.readLong();
+                long id = (idSize == 4) ? (raf.getInt(pos) & 0xFFFFFFFFL) : raf.getLong(pos);
                 yield id == 0 ? null : new ObjectReference(snapshot, id);
             }
-            case IObject.Type.BOOLEAN -> raf.readByte() != 0;
-            case IObject.Type.BYTE -> raf.readByte();
-            case IObject.Type.CHAR -> raf.readChar();
-            case IObject.Type.SHORT -> raf.readShort();
-            case IObject.Type.INT -> raf.readInt();
-            case IObject.Type.LONG -> raf.readLong();
-            case IObject.Type.FLOAT -> raf.readFloat();
-            case IObject.Type.DOUBLE -> raf.readDouble();
+            case IObject.Type.BOOLEAN -> raf.getByte(pos) != 0;
+            case IObject.Type.BYTE -> raf.getByte(pos);
+            case IObject.Type.CHAR -> raf.getChar(pos);
+            case IObject.Type.SHORT -> raf.getShort(pos);
+            case IObject.Type.INT -> raf.getInt(pos);
+            case IObject.Type.LONG -> raf.getLong(pos);
+            case IObject.Type.FLOAT -> Float.intBitsToFloat(raf.getInt(pos));
+            case IObject.Type.DOUBLE -> Double.longBitsToDouble(raf.getLong(pos));
             default -> null;
         };
     }
@@ -270,60 +270,64 @@ public class DhpHeapObjectReader implements IObjectReader {
     }
 
     @Override
-    public synchronized Object readPrimitiveArrayContent(PrimitiveArrayImpl array, int offset, int length)
+    public Object readPrimitiveArrayContent(PrimitiveArrayImpl array, int offset, int length)
             throws IOException, SnapshotException {
         int type = array.getType();
         int elementSize = IPrimitiveArray.ELEMENT_SIZE[type];
         Object result = Array.newInstance(IPrimitiveArray.COMPONENT_TYPE[type], length);
+        HprofMap map = raf;
 
-        if (raf == null && length > 0 && array.getInfo() instanceof Long pos && pos > 0) {
+        if (map == null && length > 0 && array.getInfo() instanceof Long pos && pos > 0) {
             requireDump(pos);
         }
-        if (raf == null || length == 0) {
+        if (map == null || length == 0) {
             return result;
         }
 
-        Object info = array.getInfo();
-        if (info instanceof Long filePos && filePos > 0) {
-            long dataOffset = filePos + ((long) offset * elementSize);
-            raf.seek(dataOffset);
+        if (array.getInfo() instanceof Long filePos && filePos > 0) {
             byte[] buffer = new byte[length * elementSize];
-            raf.readFully(buffer);
-            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(buffer).order(java.nio.ByteOrder.BIG_ENDIAN);
-
-            for (int i = 0; i < length; i++) {
-                switch (type) {
-                    case IObject.Type.BOOLEAN -> Array.set(result, i, bb.get() != 0);
-                    case IObject.Type.BYTE -> Array.set(result, i, bb.get());
-                    case IObject.Type.CHAR -> Array.set(result, i, bb.getChar());
-                    case IObject.Type.SHORT -> Array.set(result, i, bb.getShort());
-                    case IObject.Type.INT -> Array.set(result, i, bb.getInt());
-                    case IObject.Type.LONG -> Array.set(result, i, bb.getLong());
-                    case IObject.Type.FLOAT -> Array.set(result, i, bb.getFloat());
-                    case IObject.Type.DOUBLE -> Array.set(result, i, bb.getDouble());
+            map.copy(filePos + (long) offset * elementSize, buffer, 0, buffer.length);
+            if (type == IObject.Type.BYTE) {
+                return buffer;
+            }
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(buffer); // big endian, like HPROF
+            switch (type) {
+                case IObject.Type.BOOLEAN -> {
+                    boolean[] a = (boolean[]) result;
+                    for (int i = 0; i < length; i++) a[i] = buffer[i] != 0;
                 }
+                case IObject.Type.CHAR -> bb.asCharBuffer().get((char[]) result);
+                case IObject.Type.SHORT -> bb.asShortBuffer().get((short[]) result);
+                case IObject.Type.INT -> bb.asIntBuffer().get((int[]) result);
+                case IObject.Type.LONG -> bb.asLongBuffer().get((long[]) result);
+                case IObject.Type.FLOAT -> bb.asFloatBuffer().get((float[]) result);
+                case IObject.Type.DOUBLE -> bb.asDoubleBuffer().get((double[]) result);
+                default -> { }
             }
         }
         return result;
     }
 
     @Override
-    public synchronized long[] readObjectArrayContent(ObjectArrayImpl array, int offset, int length)
+    public long[] readObjectArrayContent(ObjectArrayImpl array, int offset, int length)
             throws IOException, SnapshotException {
         long[] result = new long[length];
-        if (raf == null && length > 0 && array.getInfo() instanceof Long pos && pos > 0) {
+        HprofMap map = raf;
+        if (map == null && length > 0 && array.getInfo() instanceof Long pos && pos > 0) {
             requireDump(pos);
         }
-        if (raf == null || length == 0) {
+        if (map == null || length == 0) {
             return result;
         }
 
-        Object info = array.getInfo();
-        if (info instanceof Long filePos && filePos > 0) {
-            long dataOffset = filePos + ((long) offset * idSize);
-            raf.seek(dataOffset);
-            for (int i = 0; i < length; i++) {
-                result[i] = (idSize == 4) ? (raf.readInt() & 0xFFFFFFFFL) : raf.readLong();
+        if (array.getInfo() instanceof Long filePos && filePos > 0) {
+            byte[] buffer = new byte[length * idSize];
+            map.copy(filePos + (long) offset * idSize, buffer, 0, buffer.length);
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(buffer);
+            if (idSize == 4) {
+                for (int i = 0; i < length; i++) result[i] = bb.getInt() & 0xFFFFFFFFL;
+            } else {
+                bb.asLongBuffer().get(result);
             }
         }
         return result;
@@ -335,10 +339,11 @@ public class DhpHeapObjectReader implements IObjectReader {
     }
 
     @Override
-    public synchronized void close() throws IOException {
-        if (raf != null) {
-            raf.close();
-            raf = null;
+    public void close() throws IOException {
+        HprofMap map = raf;
+        raf = null;
+        if (map != null) {
+            map.close();
         }
         if (posStorage != null) {
             try {
