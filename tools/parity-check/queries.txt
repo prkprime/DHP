@@ -1,0 +1,98 @@
+# MAT commands and OQL run through MAT's own query engine on both backends (see run-parity.sh).
+# Lines starting with "oql:" are OQL queries; everything else is MAT command-line syntax.
+heap_dump_overview
+system_properties
+histogram
+histogram -groupBy BY_CLASSLOADER
+histogram -groupBy BY_SUPERCLASS
+histogram -groupBy BY_PACKAGE
+dominator_tree
+dominator_tree -groupBy BY_CLASS
+dominator_tree -groupBy BY_CLASSLOADER
+dominator_tree -groupBy BY_PACKAGE
+top_consumers
+big_drops_in_dominator_tree
+pie_biggest_objects
+thread_overview
+thread_details java.lang.Thread
+thread_stack java.lang.Thread
+classloaderexplorerquery
+duplicate_classes
+unreachable_objects
+gc_roots
+finalizer_overview
+finalizer_queue
+finalizer_in_processing
+finalizer_references_statistics
+references_statistics
+weak_references_statistics
+soft_references_statistics
+phantom_references_statistics
+find_strings dup-1.*
+find_strings unicode.*
+group_by_value java.lang.String
+arrays_grouped_by_size
+collections_grouped_by_size
+collection_fill_ratio
+array_fill_ratio
+map_collision_ratio java.util.HashMap
+hash_entries java.util.HashMap
+waste_in_char_arrays
+primitive_arrays_with_a_constant_value
+list_objects java.lang.Thread
+list_objects java.net.URLClassLoader
+list_objects gen.F0L3
+list_objects gen.Wide
+list_objects java.util.concurrent.ConcurrentHashMap
+immediate_dominators java.lang.Thread
+immediate_dominators java.net.URLClassLoader
+show_retained_set java.net.URLClassLoader
+show_retained_set gen.Wide
+path2gc java.net.URLClassLoader
+path2gc gen.En0
+merge_shortest_paths java.net.URLClassLoader
+class_references gen.Outer0
+reference_leak
+leakhunter
+find_leaks
+component_report_top
+oql: select * from java.lang.Thread
+oql: select * from java.net.URLClassLoader
+oql: select * from instanceof java.util.Map
+oql: select * from gen.En0
+oql: select * from gen.Rec3
+oql: select * from gen.Wide
+oql: select * from instanceof gen.F5L2
+oql: select s.@displayName, s.@usedHeapSize, s.@retainedHeapSize from java.lang.String s where s.@usedHeapSize > 100
+oql: select toString(s), s.value.length from java.lang.String s where s.value.length > 40
+oql: select s from java.lang.String s where toString(s) = "interned-literal"
+oql: select s.@displayName from java.lang.String s where toString(s) like "unicode.*"
+oql: select o.link from gen.F3L5 o where o.link != null
+oql: select o.tag, o.id from instanceof gen.Base o where o.id < 40
+oql: select o.@retainedHeapSize, o.@objectAddress, o.@clazz.@name from gen.Wide o
+oql: select a.length from int[] a where a.length > 15
+oql: select a.@length from byte[] a where a.@length > 50000
+oql: select c.@name, c.@classLoaderAddress from java.lang.Class c where c.@name like "gen\\.F1L.*"
+oql: select c.@name from instanceof java.lang.ClassLoader c
+oql: select classof(o).@name from gen.F2L4 o
+oql: select o.@GCRoots from java.lang.Thread o
+oql: select outbounds(o).@length from gen.F1L1 o
+oql: select inbounds(o) from gen.En1 o
+oql: select dominators(o) from gen.F0L1 o
+oql: select * from java.util.HashMap$Node n where n.next != null
+oql: select n.key, n.value from java.util.HashMap$Node n where n.key != null and n.hash < 1000
+oql: select * from java.lang.ref.WeakReference
+oql: select r.referent from java.lang.ref.SoftReference r
+oql: select * from java.util.ArrayList l where l.size > 1
+oql: select l.elementData.length, l.size from java.util.ArrayList l where l.size > 1
+oql: select b.@displayName from java.math.BigInteger b
+oql: select sb.@displayName from java.lang.StringBuilder sb
+oql: select o.@usedHeapSize from gen.F7L7 o
+oql: select * from objects ${snapshot.getClassesByName("gen.Outer0", false)}
+oql: select count(*) from java.lang.String
+oql: select max(s.@retainedHeapSize), min(s.@usedHeapSize) from java.lang.String s
+oql: select f.f0_0 from gen.F0L0 f
+oql: select o.@modifiers from gen.F1L1 o
+oql: select t.name, t.priority from java.lang.Thread t
+oql: select t.@threadName from java.lang.Thread t
+oql: select e.name, e.ordinal from instanceof java.lang.Enum e where e.ordinal > 1

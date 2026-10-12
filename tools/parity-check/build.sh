@@ -4,7 +4,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAT_HOME="${MAT_HOME:-$HERE/../mat/mat}"
 P="$MAT_HOME/plugins"
-CP="$(ls "$P"/org.eclipse.mat.{api,report,parser}_*.jar "$P"/org.eclipse.equinox.{app,common}_*.jar "$P"/org.eclipse.osgi_*.jar "$P"/org.eclipse.core.runtime_*.jar | tr '\n' ':')"
+CP="$(ls "$P"/org.eclipse.mat.{api,report,parser}_*.jar "$P"/org.eclipse.equinox.{app,common,registry}_*.jar "$P"/org.eclipse.osgi_*.jar "$P"/org.eclipse.core.runtime_*.jar | tr '\n' ':')"
 OUT="$HERE/build"; rm -rf "$OUT"; mkdir -p "$OUT/classes"
 javac -nowarn -d "$OUT/classes" -cp "$CP" "$HERE"/src/org/eclipse/mat/dhp/parity/*.java
 cp "$HERE/plugin.xml" "$OUT/classes/"
