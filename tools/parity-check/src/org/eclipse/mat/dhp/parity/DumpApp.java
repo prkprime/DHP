@@ -387,10 +387,13 @@ public class DumpApp implements IApplication {
     }
 
     private void queries(ISnapshot s, PrintWriter w, File file) throws Exception {
+        String timesFile = System.getenv("DHP_TIMES"); // optional: "<ms>\t<query>" per query
+        PrintWriter times = timesFile == null ? null : new PrintWriter(new java.io.FileWriter(timesFile));
         for (String line : Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)) {
             line = line.strip();
             if (line.isEmpty() || line.startsWith("#")) continue;
             w.println("QUERY " + line);
+            long t0 = System.nanoTime();
             try {
                 SnapshotQuery q = line.startsWith("oql:")
                         ? SnapshotQuery.lookup("oql", s).setArgument("queryString", line.substring(4).strip())
@@ -401,7 +404,12 @@ public class DumpApp implements IApplication {
             }
             w.println("END");
             w.flush();
+            if (times != null) {
+                times.println((System.nanoTime() - t0) / 1_000_000 + "\t" + line);
+                times.flush();
+            }
         }
+        if (times != null) times.close();
     }
 
     @Override
