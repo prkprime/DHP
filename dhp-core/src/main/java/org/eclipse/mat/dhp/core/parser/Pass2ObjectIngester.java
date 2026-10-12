@@ -155,6 +155,8 @@ public class Pass2ObjectIngester implements AutoCloseable {
                     r.referrerAddress(),
                     r.rootType(),
                     r.threadAddress(),
+                    addressToId.get(r.threadAddress()),
+                    addressToId.get(r.objectAddress()),
                     addressToId.get(r.threadAddress())));
         }
 
@@ -591,7 +593,8 @@ public class Pass2ObjectIngester implements AutoCloseable {
         for (var r : resolvedRoots) {
             int oid = r.objectId() >= 0 ? graph.newIdOf(r.objectId()) : -1;
             int tid = r.threadObjectId() >= 0 ? graph.newIdOf(r.threadObjectId()) : -1;
-            finalRoots.add(new HeapRecords.GcRootRecord(oid, r.objectAddress(), r.referrerAddress(), r.rootType(), r.threadAddress(), tid));
+            finalRoots.add(new HeapRecords.GcRootRecord(oid, r.objectAddress(), r.referrerAddress(), r.rootType(), r.threadAddress(), tid,
+                    r.oldObjectId() >= 0 ? r.oldObjectId() : r.objectId(), r.oldThreadObjectId() >= 0 ? r.oldThreadObjectId() : r.threadObjectId()));
         }
         graph.setGcRoots(finalRoots);
 
@@ -621,7 +624,8 @@ public class Pass2ObjectIngester implements AutoCloseable {
             List<HeapStorageEngine.ResolvedClassMetadata> resolvedClasses = new ArrayList<>(keptClasses.size());
             for (HeapRecords.ClassRecord cls : keptClasses) {
                 int classObjId = graph.newIdOf(addressToId.get(cls.classId()));
-                int superObjId = cls.superClassId() != 0 ? graph.newIdOf(addressToId.get(cls.superClassId())) : -1;
+                // MAT looks the (null) super address up like any other: address 0 is object 0, the artificial class loader
+                int superObjId = graph.newIdOf(addressToId.get(cls.superClassId()));
                 int loaderObjId = graph.newIdOf(cls.classLoaderId() != 0 ? addressToId.get(cls.classLoaderId()) : systemClassLoaderObjId);
                 long staticFieldsSize = 0;
                 for (var sf : cls.staticFields()) {

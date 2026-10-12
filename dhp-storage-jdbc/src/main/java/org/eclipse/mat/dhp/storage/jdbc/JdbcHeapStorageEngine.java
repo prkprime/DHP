@@ -175,7 +175,10 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     "referrer_address BIGINT, " +
                     "root_type INT NOT NULL, " +
                     "thread_address BIGINT, " +
-                    "thread_object_id INT DEFAULT -1" +
+                    "thread_object_id INT DEFAULT -1, " +
+                    "old_object_id INT DEFAULT -1, " +
+                    "old_thread_object_id INT DEFAULT -1, " +
+                    "root_seq INT NOT NULL DEFAULT 0" +
                     ");");
 
         }
@@ -478,9 +481,13 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         return s.replace("%00", "\0").replace("%3B", ";").replace("%3A", ":").replace("%25", "%");
     }
 
+    /** Position of the next root; the order roots were reported in is what MAT's own structures are built from. */
+    private int nextRootSeq;
+
     @Override
     public void insertGcRootsBatch(List<HeapRecords.GcRootRecord> gcRoots) throws SQLException {
-        String sql = "INSERT INTO dhp_gc_roots(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id) VALUES(?, ?, ?, ?, ?, ?)";
+        nextRootSeq = 0;
+        String sql = "INSERT INTO dhp_gc_roots(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id, old_object_id, old_thread_object_id, root_seq) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (Statement del = connection.createStatement()) {
             del.execute("DELETE FROM dhp_gc_roots"); // a retried ingestion must not duplicate roots
         }
@@ -492,6 +499,9 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                 ps.setInt(4, root.rootType());
                 ps.setLong(5, root.threadAddress());
                 ps.setInt(6, root.threadObjectId());
+                ps.setInt(7, root.oldObjectId());
+                ps.setInt(8, root.oldThreadObjectId());
+                ps.setInt(9, nextRootSeq++);
                 ps.addBatch();
             }
             ps.executeBatch();
@@ -501,7 +511,12 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     @Override
     public synchronized void appendGcRoots(List<HeapRecords.GcRootRecord> gcRoots) throws SQLException {
-        String sql = "INSERT INTO dhp_gc_roots(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id) VALUES(?, ?, ?, ?, ?, ?)";
+        if (nextRootSeq == 0) {
+            try (Statement st = connection.createStatement(); ResultSet rs = st.executeQuery("SELECT coalesce(max(root_seq) + 1, 0) FROM dhp_gc_roots")) {
+                nextRootSeq = rs.next() ? rs.getInt(1) : 0;
+            }
+        }
+        String sql = "INSERT INTO dhp_gc_roots(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id, old_object_id, old_thread_object_id, root_seq) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             for (HeapRecords.GcRootRecord root : gcRoots) {
                 long address = root.objectAddress() != 0 ? root.objectAddress() : getObjectAddress(root.objectId());
@@ -511,6 +526,9 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                 ps.setInt(4, root.rootType());
                 ps.setLong(5, root.threadAddress());
                 ps.setInt(6, root.threadObjectId());
+                ps.setInt(7, root.oldObjectId());
+                ps.setInt(8, root.oldThreadObjectId());
+                ps.setInt(9, nextRootSeq++);
                 ps.addBatch();
             }
             ps.executeBatch();
@@ -885,44 +903,57 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         flushPuts();
         long t1 = System.currentTimeMillis();
 
-        // Dominated lists: counting sort by dominator, each list ordered by retained size (desc), then ID
+        // Dominated lists in exactly the order MAT produces them: all objects sorted by dominator (vertex = id + 2, the
+        // virtual root is vertex 1) with MAT's hybrid sort, then every list sorted by retained size, descending, with the
+        // same sort (see MatSort): ties are left in the order MAT's algorithm leaves them.
         int[] start = new int[n + 2];   // index p + 1 (so that the -1 "super root" list sits at slot 0)
         for (int i = 0; i < n; i++) start[idom[i] + 1 + 1]++;
         for (int i = 0; i < n + 1; i++) start[i + 1] += start[i];
-        int[] fill = java.util.Arrays.copyOf(start, n + 1);
-        int[] children = new int[n];
-        for (int i = 0; i < n; i++) children[fill[idom[i] + 1]++] = i;
-        fill = null;
-        it.unimi.dsi.fastutil.ints.IntComparator cmp = (a, b) -> {
-            int c = Long.compare(retained[b], retained[a]);
-            return c != 0 ? c : Integer.compare(a, b);
-        };
-        // Lists are independent: sort blocks of parents in parallel; very long lists use the parallel sort
+        int[] domKeys = new int[n + 2];
+        int[] ids = new int[n + 2];
+        for (int i = 0; i < n; i++) {
+            domKeys[i + 2] = idom[i] + 2;
+            ids[i + 2] = i;
+        }
+        org.eclipse.mat.dhp.core.graph.MatSort.sort(domKeys, ids, 2, n);
+        domKeys = null;
         final int[] startF = start;
-        final int[] childF = children;
-        java.util.stream.IntStream.range(0, (n + 1 + 8191) / 8192).parallel().forEach(blk -> {
-            int pEnd = Math.min(n + 1, (blk + 1) * 8192);
-            for (int p = blk * 8192; p < pEnd; p++) {
-                int s0 = startF[p], e0 = startF[p + 1];
-                if (e0 - s0 > 1 && e0 - s0 <= 1_000_000) {
-                    it.unimi.dsi.fastutil.ints.IntArrays.quickSort(childF, s0, e0, cmp);
+        final int[] idsF = ids;
+        final ThreadLocal<long[]> keyScratch = ThreadLocal.withInitial(() -> new long[256]);
+        final ThreadLocal<int[]> valScratch = ThreadLocal.withInitial(() -> new int[256]);
+        // The lists are independent: sort blocks of parents in parallel (each list is sorted by the sequential algorithm)
+        java.util.stream.IntStream.range(0, (n + 1 + 4095) / 4096).parallel().forEach(blk -> {
+            int pEnd = Math.min(n + 1, (blk + 1) * 4096);
+            for (int p = blk * 4096; p < pEnd; p++) {
+                int from = 2 + startF[p], len = startF[p + 1] - startF[p];
+                if (len < 2) continue;
+                long[] keys = keyScratch.get();
+                int[] vals = valScratch.get();
+                if (keys.length < len) {
+                    keys = new long[Math.max(len, keys.length * 2)];
+                    vals = new int[keys.length];
+                    keyScratch.set(keys);
+                    valScratch.set(vals);
                 }
+                for (int k = 0; k < len; k++) {
+                    int id = idsF[from + k];
+                    vals[k] = id;
+                    keys[k] = retained[id];
+                }
+                org.eclipse.mat.dhp.core.graph.MatSort.sortDesc(keys, vals, len);
+                System.arraycopy(vals, 0, idsF, from, len);
             }
         });
-        for (int p = 0; p <= n; p++) {
-            int s0 = start[p], e0 = start[p + 1];
-            if (e0 - s0 > 1_000_000) {
-                it.unimi.dsi.fastutil.ints.IntArrays.parallelQuickSort(children, s0, e0, cmp);
-            }
-        }
         // root list (dominator -1)
-        putChunk(K_ROOT_CHILDREN, 0, toBytes(children, start[0], start[1] - start[0]));
-        int parents = n;
-        int[] holder = new int[0];
-        writeEdgeChunks(parents, K_CHILD, K_CHILD_HUGE, id -> {
-            int s = start[id + 1], e = start[id + 2];
-            return java.util.Arrays.copyOfRange(children, s, e);
-        }, id -> start[id + 2] - start[id + 1]);
+        putChunk(K_ROOT_CHILDREN, 0, toBytes(ids, 2 + start[0], start[1] - start[0]));
+        int[][] holder = {new int[256]};
+        writeEdgeChunks(n, K_CHILD, K_CHILD_HUGE, id -> {
+            int from = 2 + startF[id + 1], len = startF[id + 2] - startF[id + 1];
+            int[] buf = holder[0];
+            if (buf.length < len) buf = holder[0] = new int[Math.max(len, buf.length * 2)];
+            System.arraycopy(idsF, from, buf, 0, len);
+            return buf;
+        }, id -> startF[id + 2] - startF[id + 1]);
         saveClassInstances(n);
         if (isSqlite) {
             setJournalPragmas("WAL", "NORMAL");
@@ -1151,32 +1182,12 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public List<HeapRecords.GcRootRecord> getGcRoots() throws SQLException {
         List<HeapRecords.GcRootRecord> list = new ArrayList<>();
-        try (Statement stmt = connection.createStatement()) {
-            boolean hasExtendedCols = false;
-            try (ResultSet rs = stmt.executeQuery("SELECT object_id, object_address, referrer_address, root_type, thread_address, thread_object_id FROM dhp_gc_roots")) {
-                hasExtendedCols = true;
-                while (rs.next()) {
-                    list.add(new HeapRecords.GcRootRecord(
-                            rs.getInt(1),
-                            rs.getLong(2),
-                            rs.getLong(3),
-                            rs.getInt(4),
-                            rs.getLong(5),
-                            rs.getInt(6)
-                    ));
-                }
-            } catch (SQLException ignored) {}
-            if (!hasExtendedCols) {
-                try (ResultSet rs = stmt.executeQuery("SELECT object_address, referrer_address, root_type, thread_address FROM dhp_gc_roots")) {
-                    while (rs.next()) {
-                        list.add(new HeapRecords.GcRootRecord(
-                                rs.getLong(1),
-                                rs.getLong(2),
-                                rs.getInt(3),
-                                rs.getLong(4)
-                        ));
-                    }
-                }
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT object_id, object_address, referrer_address, root_type, thread_address, thread_object_id, old_object_id, old_thread_object_id FROM dhp_gc_roots ORDER BY root_seq")) {
+            while (rs.next()) {
+                list.add(new HeapRecords.GcRootRecord(
+                        rs.getInt(1), rs.getLong(2), rs.getLong(3), rs.getInt(4), rs.getLong(5), rs.getInt(6),
+                        rs.getInt(7), rs.getInt(8)));
             }
         }
         return list;

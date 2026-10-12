@@ -260,8 +260,9 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
 
                 List<Field> staticFields = new ArrayList<>();
                 for (var sf : cls.staticFields()) {
+                    // a null reference static is a plain null in MAT, not a reference to address 0
                     Object val = (sf.type() == 2 && sf.value() instanceof Number n)
-                            ? new org.eclipse.mat.snapshot.model.ObjectReference(null, n.longValue())
+                            ? (n.longValue() == 0 ? null : new org.eclipse.mat.snapshot.model.ObjectReference(null, n.longValue()))
                             : sf.value();
                     staticFields.add(new Field(sf.name(), sf.type(), val));
                 }
@@ -321,58 +322,10 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 }
             }
 
-            // Populate GC roots
-            HashMapIntObject<List<XGCRootInfo>> gcRootsMap = new HashMapIntObject<>();
-            HashMapIntObject<HashMapIntObject<List<XGCRootInfo>>> thread2objects2roots = new HashMapIntObject<>();
-            for (HeapRecords.GcRootRecord root : storage.getGcRoots()) {
-                int objId = root.objectId() >= 0 ? root.objectId() : storage.getObjectIdByAddress(root.objectAddress());
-                if (objId >= 0) {
-                    if (root.threadAddress() != 0) {
-                        int threadObjId = root.threadObjectId() >= 0 ? root.threadObjectId() : storage.getObjectIdByAddress(root.threadAddress());
-                        if (threadObjId >= 0) {
-                            var objMap = thread2objects2roots.get(threadObjId);
-                            if (objMap == null) {
-                                objMap = new HashMapIntObject<>();
-                                thread2objects2roots.put(threadObjId, objMap);
-                            }
-                            List<XGCRootInfo> list = objMap.get(objId);
-                            if (list == null) {
-                                list = new ArrayList<>();
-                                objMap.put(objId, list);
-                            }
-                            // like MAT: the referrer of a stack local is its thread object
-                            var xgc = new XGCRootInfo(root.objectAddress(), root.threadAddress(), RootTypes.toMat(root.rootType()));
-                            xgc.setObjectId(objId);
-                            xgc.setContextId(threadObjId);
-                            list.add(xgc);
-                        }
-                    } else {
-                        List<XGCRootInfo> list = gcRootsMap.get(objId);
-                        if (list == null) {
-                            list = new ArrayList<>();
-                            gcRootsMap.put(objId, list);
-                        }
-                        var xgc = new XGCRootInfo(root.objectAddress(), root.referrerAddress(), RootTypes.toMat(root.rootType()));
-                        xgc.setObjectId(objId);
-                        list.add(xgc);
-                    }
-                }
-            }
-
-            HashMapIntObject<XGCRootInfo[]> roots = new HashMapIntObject<>();
-            for (int objId : gcRootsMap.getAllKeys()) {
-                roots.put(objId, gcRootsMap.get(objId).toArray(new XGCRootInfo[0]));
-            }
-
-            HashMapIntObject<HashMapIntObject<XGCRootInfo[]>> rootsPerThread = new HashMapIntObject<>();
-            for (int threadId : thread2objects2roots.getAllKeys()) {
-                var objMap = thread2objects2roots.get(threadId);
-                var targetObjMap = new HashMapIntObject<XGCRootInfo[]>();
-                for (int objId : objMap.getAllKeys()) {
-                    targetObjMap.put(objId, objMap.get(objId).toArray(new XGCRootInfo[0]));
-                }
-                rootsPerThread.put(threadId, targetObjMap);
-            }
+            // GC roots and the {@code <Java Local>} references of threads, built like MAT builds them (also its map order)
+            RootMaps rootMaps = RootMaps.build(storage.getGcRoots());
+            HashMapIntObject<XGCRootInfo[]> roots = rootMaps.roots;
+            HashMapIntObject<HashMapIntObject<XGCRootInfo[]>> rootsPerThread = rootMaps.rootsPerThread;
 
             info.setNumberOfGCRoots(roots.size());
 

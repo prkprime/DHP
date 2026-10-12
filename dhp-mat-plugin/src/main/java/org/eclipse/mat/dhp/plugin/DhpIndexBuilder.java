@@ -190,7 +190,8 @@ public class DhpIndexBuilder implements IIndexBuilder {
                 for (var sf : cls.staticFields()) {
                     Object val = sf.value();
                     if (sf.type() == 2 && val instanceof Number n) {
-                        val = new org.eclipse.mat.snapshot.model.ObjectReference(null, n.longValue());
+                        // a null reference static is a plain null in MAT, not a reference to address 0
+                        val = n.longValue() == 0 ? null : new org.eclipse.mat.snapshot.model.ObjectReference(null, n.longValue());
                     }
                     staticFields.add(new Field(sf.name(), sf.type(), val));
                 }

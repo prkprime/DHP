@@ -66,16 +66,27 @@ public final class HeapRecords {
             long calculatedSize
     ) {}
 
+    /**
+     * A GC root. {@code objectId} / {@code threadObjectId} are the final object IDs; {@code oldObjectId} /
+     * {@code oldThreadObjectId} are the IDs before unreachable objects were removed (MAT's hash maps of roots are
+     * ordered by those, so the plugin needs them to reproduce MAT's iteration order). -1 when unknown.
+     */
     public record GcRootRecord(
             int objectId,
             long objectAddress,
             long referrerAddress,
             int rootType,
             long threadAddress,
-            int threadObjectId
+            int threadObjectId,
+            int oldObjectId,
+            int oldThreadObjectId
     ) {
+        public GcRootRecord(int objectId, long objectAddress, long referrerAddress, int rootType, long threadAddress, int threadObjectId) {
+            this(objectId, objectAddress, referrerAddress, rootType, threadAddress, threadObjectId, -1, -1);
+        }
+
         public GcRootRecord(long objectAddress, long referrerAddress, int rootType, long threadAddress) {
-            this(-1, objectAddress, referrerAddress, rootType, threadAddress, -1);
+            this(-1, objectAddress, referrerAddress, rootType, threadAddress, -1, -1, -1);
         }
     }
 
