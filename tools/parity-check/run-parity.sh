@@ -54,6 +54,12 @@ python3 -I "$HERE/compare.py" "$WORK/native.objects.s.tsv" "$WORK/dhp.objects.s.
 cut -f1 "$WORK/native.objects.tsv" | cmp -s - <(cut -f1 "$WORK/dhp.objects.tsv") && echo "object ids: identical" || { echo "object ids: DIFFERENT"; status=1; }
 for k in $(echo $MODES | tr ' ' '\n' | grep -v '^objects$'); do
   f=txt
+  if [[ $k == queries ]]; then
+    # identity hash codes and stack traces differ by construction: compare per query after normalizing them
+    res="$(python3 -I "$HERE/query_diff.py" "$WORK/native.$k.$f" "$WORK/dhp.$k.$f" 3)"
+    echo "$res" | tail -1 | grep -q "'ORDER-ONLY': 0, 'DIFFERENT': 0" && echo "queries: identical ($(echo "$res" | tail -1))" || { echo "queries: DIFFERENT"; echo "$res"; status=1; }
+    continue
+  fi
   if diff -q "$WORK/native.$k.$f" "$WORK/dhp.$k.$f" >/dev/null; then echo "$k: identical ($(wc -l < "$WORK/native.$k.$f") lines)"
   else echo "$k: DIFFERENT ($(diff "$WORK/native.$k.$f" "$WORK/dhp.$k.$f" | grep -c '^[<>]') differing lines) -> diff $WORK/native.$k.$f $WORK/dhp.$k.$f"; status=1; fi
 done

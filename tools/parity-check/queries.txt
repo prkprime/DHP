@@ -96,3 +96,5 @@ oql: select o.@modifiers from gen.F1L1 o
 oql: select t.name, t.priority from java.lang.Thread t
 oql: select t.@threadName from java.lang.Thread t
 oql: select e.name, e.ordinal from instanceof java.lang.Enum e where e.ordinal > 1
+oql: select f.@objectId, f.@objectAddress from gen.F0L0 f
+oql: select f.@objectId from instanceof gen.F5L2 f

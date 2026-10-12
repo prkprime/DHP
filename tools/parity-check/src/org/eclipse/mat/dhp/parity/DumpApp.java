@@ -72,6 +72,7 @@ public class DumpApp implements IApplication {
             switch (mode) {
                 case "objects" -> dumpObjects(snapshot, w);
                 case "loaders" -> dumpLoaders(snapshot, w);
+                case "classes" -> dumpClasses(snapshot, w);
                 case "inspect" -> {
                     long mod = args.length > 3 ? Long.parseLong(args[3]) : 1000L;
                     inspect(snapshot, w, mod);
@@ -136,6 +137,13 @@ public class DumpApp implements IApplication {
             w.println(sb);
         }
         System.out.println("PARITY written objects");
+    }
+
+    /** All classes in the order MAT enumerates them (hash map order), with their ids. */
+    private void dumpClasses(ISnapshot snapshot, PrintWriter w) throws Exception {
+        for (IClass c : snapshot.getClasses()) {
+            w.println(c.getObjectId() + "\t" + c.getName() + "\t" + c.getNumberOfObjects());
+        }
     }
 
     private void dumpLoaders(ISnapshot snapshot, PrintWriter w) throws Exception {

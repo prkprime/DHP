@@ -97,6 +97,12 @@ public interface HeapStorageEngine extends Closeable {
             long usedSize
     ) {}
 
+    /** Every class of the dump in CLASS_DUMP order, including those removed with the unreachable objects: {seq, old id, address, new id or -1}. */
+    default void saveClassOrder(java.util.List<long[]> rows) throws SQLException {}
+
+    /** Rows saved by {@link #saveClassOrder}, ordered by dump sequence; empty if the database predates them. */
+    default java.util.List<long[]> getClassOrder() throws SQLException { return java.util.List.of(); }
+
     record ClassStats(
             int classObjId,
             int instanceCount,

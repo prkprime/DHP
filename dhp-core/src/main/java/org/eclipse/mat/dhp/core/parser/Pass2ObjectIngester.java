@@ -574,9 +574,18 @@ public class Pass2ObjectIngester implements AutoCloseable {
                     removedCount.addTo(cid, 1);
                     removedSize.addTo(cid, sz);
                 }
-                int[] removedClassIds = removedCount.keySet().toIntArray();
-                Arrays.sort(removedClassIds);
-                for (int cid : removedClassIds) {
+                // MAT lists the records in the iteration order of a java.util.HashMap<Integer, ...> sized for all objects
+                // (bucket = spread hash of the old class id); ties among equally sized rows are shown in that order
+                int tableSize = totalExpectedObjects <= 1 ? 1 : Integer.highestOneBit(totalExpectedObjects - 1) << 1;
+                long[] byBucket = new long[removedCount.size()];
+                int bi = 0;
+                for (int cid : removedCount.keySet()) {
+                    int bucket = (cid ^ (cid >>> 16)) & (tableSize - 1);
+                    byBucket[bi++] = ((long) bucket << 32) | cid;
+                }
+                Arrays.sort(byBucket);
+                for (long packed : byBucket) {
+                    int cid = (int) packed;
                     HeapRecords.ClassRecord cr = classByOldId.get(cid);
                     unreachableHistogram.append(cr != null ? cr.classId() : 0L).append(',')
                             .append(removedCount.get(cid)).append(',').append(removedSize.get(cid)).append(',')
@@ -607,6 +616,12 @@ public class Pass2ObjectIngester implements AutoCloseable {
                 }
             }
             storage.saveClasses(keptClasses);
+            List<long[]> classOrder = new ArrayList<>(pass1.getClasses().size());
+            for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
+                int oldId = addressToId.get(cls.classId());
+                classOrder.add(new long[]{classOrder.size(), oldId, cls.classId(), graph.newIdOf(oldId)});
+            }
+            storage.saveClassOrder(classOrder);
             storage.insertGcRootsBatch(finalRoots);
 
             List<HeapStorageEngine.ClassStats> statsList = new ArrayList<>();
@@ -643,6 +658,7 @@ public class Pass2ObjectIngester implements AutoCloseable {
             storage.saveSnapshotInfo("unreachableHistogram", unreachableHistogram.toString());
 
             storage.saveObjects(graph);
+            graph.normalizeEdges();
             storage.saveOutboundEdges(graph);
             storage.finishIngestion();
         } catch (SQLException e) {

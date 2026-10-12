@@ -117,6 +117,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             "dhp_chunks",
             "dhp_gc_roots",
             "dhp_class_stats",
+            "dhp_class_order",
             "dhp_classes",
             "dhp_snapshot_info"
         };
@@ -156,6 +157,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     "used_size BIGINT DEFAULT 0, " +
                     "static_fields_data TEXT" +
                     ");");
+
+            stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_class_order (seq INT, old_id INT, class_id BIGINT, new_id INT)");
 
             stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_class_stats (" +
                     "class_id INT PRIMARY KEY, " +
@@ -294,6 +297,35 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         }
         connection.commit();
         log.info("Persisted pre-resolved class hierarchy & metadata for {} classes.", classes.size());
+    }
+
+    @Override
+    public void saveClassOrder(List<long[]> rows) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement("INSERT INTO dhp_class_order(seq, old_id, class_id, new_id) VALUES(?, ?, ?, ?)")) {
+            for (long[] r : rows) {
+                ps.setInt(1, (int) r[0]);
+                ps.setInt(2, (int) r[1]);
+                ps.setLong(3, r[2]);
+                ps.setInt(4, (int) r[3]);
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+        connection.commit();
+    }
+
+    @Override
+    public List<long[]> getClassOrder() throws SQLException {
+        List<long[]> list = new ArrayList<>();
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT seq, old_id, class_id, new_id FROM dhp_class_order ORDER BY seq")) {
+            while (rs.next()) {
+                list.add(new long[]{rs.getInt(1), rs.getInt(2), rs.getLong(3), rs.getInt(4)});
+            }
+        } catch (SQLException e) {
+            return List.of(); // ingested before this table existed
+        }
+        return list;
     }
 
     @Override
@@ -961,7 +993,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             // The tables were UNLOGGED for fast loading; they would be emptied by a server crash, so make them durable
             long tl = System.currentTimeMillis();
             try (Statement stmt = connection.createStatement()) {
-                for (String table : new String[]{"dhp_snapshot_info", "dhp_classes", "dhp_class_stats", "dhp_gc_roots", "dhp_chunks"}) {
+                for (String table : new String[]{"dhp_snapshot_info", "dhp_classes", "dhp_class_order", "dhp_class_stats", "dhp_gc_roots", "dhp_chunks"}) {
                     stmt.execute("ALTER TABLE " + table + " SET LOGGED");
                 }
                 connection.commit();

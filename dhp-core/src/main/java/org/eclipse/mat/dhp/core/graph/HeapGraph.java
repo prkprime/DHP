@@ -284,6 +284,58 @@ public final class HeapGraph {
         return huge.length;
     }
 
+    /**
+     * Brings every out-edge list into the form MAT stores it in: the class reference stays first, the remaining targets
+     * follow in ascending id order, without duplicates (and without a repeat of the class) or dangling targets. Object ids
+     * are address ranks, so this is MAT's address order. Run once after the final ids are known.
+     */
+    public void normalizeEdges() {
+        final int n = objectCount;
+        final int block = 1 << 14;
+        java.util.concurrent.atomic.AtomicLong total = new java.util.concurrent.atomic.AtomicLong();
+        java.util.stream.IntStream.range(0, (n + block - 1) / block).parallel().forEach(b -> {
+            long sum = 0;
+            for (int id = b * block, end = Math.min(n, id + block); id < end; id++) {
+                int s = edgeStart[id];
+                if (s > 0) {
+                    int[] chunk = edgeChunks[s >>> CHUNK_SHIFT];
+                    int off = s & CHUNK_MASK;
+                    int len = normalizeList(chunk, off + 1, chunk[off], n);
+                    chunk[off] = len;
+                    sum += len;
+                }
+            }
+            total.addAndGet(sum);
+        });
+        long edges = total.get();
+        // out-of-line lists are replaced (the map must not be touched concurrently)
+        for (int id : hugeEdges.keySet().toIntArray()) {
+            int[] list = hugeEdges.get(id);
+            int len = normalizeList(list, 0, list.length, n);
+            hugeEdges.put(id, len == list.length ? list : Arrays.copyOf(list, len));
+            edges += len;
+        }
+        this.edgeCount = edges;
+    }
+
+    /** Normalizes {@code a[from, from+len)} in place and returns the new length. */
+    private static int normalizeList(int[] a, int from, int len, int n) {
+        if (len <= 1) {
+            return len;
+        }
+        int first = a[from];
+        Arrays.sort(a, from + 1, from + len);
+        int w = from + 1;
+        for (int r = from + 1; r < from + len; r++) {
+            int v = a[r];
+            if (v < 0 || v >= n || v == first || (w > from + 1 && a[w - 1] == v)) {
+                continue;
+            }
+            a[w++] = v;
+        }
+        return w - from;
+    }
+
     /** Frees the edge log (after the edges were persisted and the dominator phase no longer needs them). */
     public void releaseEdges() {
         edgeStart = null;

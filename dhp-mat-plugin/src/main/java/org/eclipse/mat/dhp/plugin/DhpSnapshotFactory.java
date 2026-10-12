@@ -223,7 +223,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             } catch (Exception ignored) {}
 
             // Populate class cache
-            HashMapIntObject<ClassImpl> classesById = new HashMapIntObject<>();
+            HashMapIntObject<ClassImpl> rawClasses = new HashMapIntObject<>();
             ClassImpl javaLangClass = null;
             var classStats = storage.getClassStats();
             java.lang.reflect.Field countField = null;
@@ -299,11 +299,17 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                     } catch (Exception ignored) {}
                 }
 
-                classesById.put(classObjId, c);
+                rawClasses.put(classObjId, c);
 
                 if ("java.lang.Class".equals(cls.name())) {
                     javaLangClass = c;
                 }
+            }
+
+            ClassOrder.Result ordered = ClassOrder.rebuild(rawClasses, storage.getClassOrder());
+            final HashMapIntObject<ClassImpl> classesById = ordered.classes();
+            if (javaLangClass != null) {
+                javaLangClass = classesById.get(javaLangClass.getObjectId());
             }
 
             if (javaLangClass != null) {
@@ -312,7 +318,9 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 }
             }
 
-            for (int key : classesById.getAllKeys()) {
+            // subclasses are linked in MAT's order (its by-address map), which is what instanceof queries enumerate
+            int[] linkKeys = ordered.linkOrder() != null ? ordered.linkOrder() : classesById.getAllKeys();
+            for (int key : linkKeys) {
                 ClassImpl c = classesById.get(key);
                 if (c.getSuperClassId() >= 0) {
                     ClassImpl superC = classesById.get(c.getSuperClassId());

@@ -7,6 +7,7 @@ import re, sys
 def norm(line):
     line = re.sub(r"(\[?[A-Za-z$.]+)@[0-9a-f]{5,8}\b", r"\1@HASH", line)
     line = re.sub(r"/[^\s\t]*/(native|dhp)/", "/WORK/", line)
+    line = line.split("  at ")[0]  # stack traces of failing queries differ in the plugin frames by construction
     return line
 def blocks(path):
     d, cur, name = {}, [], None

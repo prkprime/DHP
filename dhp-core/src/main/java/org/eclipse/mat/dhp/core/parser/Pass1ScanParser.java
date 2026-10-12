@@ -32,7 +32,8 @@ public class Pass1ScanParser {
     private final Set<Long> referencedStringIds = new HashSet<>();
     private final Map<Long, Long> classSerialNumberToId = new HashMap<>();
     private final Map<Long, Long> classIdToNameId = new HashMap<>();
-    private final Map<Long, HeapRecords.ClassRecord> classes = new HashMap<>();
+    // insertion (CLASS_DUMP) order matters: MAT's class map iteration order is derived from it
+    private final Map<Long, HeapRecords.ClassRecord> classes = new java.util.LinkedHashMap<>();
     private final LongArrayList objectAddresses = new LongArrayList();
     private long[] sortedInstanceAddresses;
     private int uniqueInstanceCount;

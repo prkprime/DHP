@@ -74,6 +74,8 @@ public class DominatorTreeEngine {
         final int mask = HeapGraph.RAW_CHUNK_MASK;
 
         // 2. Build inHead and inTo CSR graph (with superRoot as predecessor to all GC roots)
+        // MAT lists the instances of a class (the objects whose first reference is that class) before all other referrers
+        it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap pseudoCount = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
         int[] inHead = new int[n + 1];
         for (int u = 0; u < n; u++) {
             int s = starts[u];
@@ -83,11 +85,19 @@ public class DominatorTreeEngine {
                 int end = off + c[off];
                 for (int e = off + 1; e <= end; e++) {
                     int v = c[e];
-                    if (v >= 0 && v < n) inHead[v + 1]++;
+                    if (v >= 0 && v < n) {
+                        inHead[v + 1]++;
+                        if (e == off + 1) pseudoCount.addTo(v, 1);
+                    }
                 }
             } else if (s < 0) {
-                for (int v : graph.hugeEdgesOf(u)) {
-                    if (v >= 0 && v < n) inHead[v + 1]++;
+                int[] huge = graph.hugeEdgesOf(u);
+                for (int i = 0; i < huge.length; i++) {
+                    int v = huge[i];
+                    if (v >= 0 && v < n) {
+                        inHead[v + 1]++;
+                        if (i == 0) pseudoCount.addTo(v, 1);
+                    }
                 }
             }
         }
@@ -107,6 +117,11 @@ public class DominatorTreeEngine {
         // Temporarily reuse dfsStack as the insertion cursor of each inbound list
         int[] inPos = dfsStack;
         System.arraycopy(inHead, 0, inPos, 0, n);
+        it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap pseudoPos = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap(pseudoCount.size());
+        for (var pe : pseudoCount.int2IntEntrySet()) {
+            pseudoPos.put(pe.getIntKey(), inPos[pe.getIntKey()]);
+            inPos[pe.getIntKey()] += pe.getIntValue();
+        }
         for (int r : gcRootIds) {
             inTo[inPos[r]++] = superRoot;
         }
@@ -118,11 +133,13 @@ public class DominatorTreeEngine {
                 int end = off + c[off];
                 for (int e = off + 1; e <= end; e++) {
                     int v = c[e];
-                    if (v >= 0 && v < n) inTo[inPos[v]++] = u;
+                    if (v >= 0 && v < n) inTo[e == off + 1 ? pseudoPos.addTo(v, 1) : inPos[v]++] = u;
                 }
             } else if (s < 0) {
-                for (int v : graph.hugeEdgesOf(u)) {
-                    if (v >= 0 && v < n) inTo[inPos[v]++] = u;
+                int[] huge = graph.hugeEdgesOf(u);
+                for (int i = 0; i < huge.length; i++) {
+                    int v = huge[i];
+                    if (v >= 0 && v < n) inTo[i == 0 ? pseudoPos.addTo(v, 1) : inPos[v]++] = u;
                 }
             }
         }
