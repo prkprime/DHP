@@ -36,7 +36,7 @@ public final class InPlaceLongSort {
             dualPivotQuicksort(a, fromIndex, toIndex - 1);
         } else {
             ForkJoinPool pool = ForkJoinPool.commonPool();
-            pool.invoke(new ParallelSortTask(a, fromIndex, toIndex - 1));
+            pool.invoke(new ParallelSortTask(a, fromIndex, toIndex - 1, 0));
         }
     }
 
@@ -51,28 +51,33 @@ public final class InPlaceLongSort {
     }
 
     private static final class ParallelSortTask extends RecursiveAction {
+        private static final int MAX_DEPTH = 48; // past this the input is adversarial for the pivot rule: sort sequentially
         private final long[] a;
         private final int low;
         private final int high;
+        private final int depth;
 
-        ParallelSortTask(long[] a, int low, int high) {
+        ParallelSortTask(long[] a, int low, int high, int depth) {
             this.a = a;
             this.low = low;
             this.high = high;
+            this.depth = depth;
         }
 
         @Override
         protected void compute() {
-            if (high - low < SEQUENTIAL_THRESHOLD) {
+            if (high - low < SEQUENTIAL_THRESHOLD || depth > MAX_DEPTH) {
                 dualPivotQuicksort(a, low, high);
                 return;
             }
 
             int p = partition(a, low, high);
-            invokeAll(
-                    new ParallelSortTask(a, low, p - 1),
-                    new ParallelSortTask(a, p + 1, high)
-            );
+            // fork one side and keep the call stack shallow on the other
+            ParallelSortTask left = new ParallelSortTask(a, low, p - 1, depth + 1);
+            ParallelSortTask right = new ParallelSortTask(a, p + 1, high, depth + 1);
+            right.fork();
+            left.compute();
+            right.join();
         }
     }
 

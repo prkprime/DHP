@@ -62,7 +62,8 @@ import java.util.regex.Pattern;
  * threads with deep stacks and locals, monitors, cycles, shared structures, duplicates and unreachable garbage.</p>
  *
  * Usage (no package so that the single-file source launcher works):
- *   java -Xmx6g -XX:+UseParallelGC tools/dump-generator/ComplexJvmHeapDumpGenerator.java out.hprof [liveGB] [seed] [live|all]
+ *   java -Xmx6g -XX:+UseParallelGC tools/dump-generator/ComplexJvmHeapDumpGenerator.java out.hprof [liveGB] [seed] [live|all] [payloadBytes]
+ * payloadBytes > 0 adds bulk byte[] buffers (up to that size) to the batches, lowering the object count per GB like real dumps.
  * With "all" (default) unreachable objects are included in the dump (no GC before dumping).
  */
 public class ComplexJvmHeapDumpGenerator {
@@ -244,6 +245,7 @@ public class ComplexJvmHeapDumpGenerator {
         double liveGb = args.length > 1 ? Double.parseDouble(args[1]) : 2.8;
         long seed = args.length > 2 ? Long.parseLong(args[2]) : 7L;
         boolean live = args.length > 3 && args[3].equalsIgnoreCase("live");
+        final int payload = args.length > 4 ? Integer.parseInt(args[4]) : 0;
         long target = (long) (liveGb * 1024L * 1024L * 1024L);
         Random r = new Random(seed);
         Runtime rt = Runtime.getRuntime();
@@ -426,6 +428,8 @@ public class ComplexJvmHeapDumpGenerator {
 
         // bulk instances of generated classes, strings, payloads, collections until the live target is reached
         List<Object[]> bulk = new ArrayList<>();
+        List<byte[]> blobs = new ArrayList<>();
+        KEEP.add(blobs);
         KEEP.add(bulk);
         long lastReport = System.currentTimeMillis();
         int round = 0;
@@ -452,6 +456,7 @@ public class ComplexJvmHeapDumpGenerator {
                     default -> { }
                 }
                 batch[i] = o;
+                if (payload > 0 && (i & 1) == 0) blobs.add(new byte[256 + r.nextInt(payload)]);
             }
             bulk.add(batch);
             // unreachable garbage with cycles (removed by MAT unless it keeps unreachable objects)
