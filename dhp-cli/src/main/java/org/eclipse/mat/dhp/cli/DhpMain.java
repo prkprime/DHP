@@ -80,6 +80,9 @@ public class DhpMain implements Callable<Integer> {
     @Option(names = {"--membership-set"}, description = "Membership set strategy: bitset (default) or roaring")
     private String membershipSetStrategy;
 
+    @Option(names = {"--keep-unreachable"}, description = "Keep objects that are unreachable from GC roots (as MAT does with keep_unreachable_objects). Default: remove them like MAT's default.")
+    private boolean keepUnreachable = false;
+
     @Option(names = {"--estimate", "-e"}, description = "Run fast structure scan to estimate required heap and disk space, then exit")
     private boolean estimateOnly = false;
 
@@ -91,6 +94,12 @@ public class DhpMain implements Callable<Integer> {
 
         if (dumpFile == null || !dumpFile.exists()) {
             System.err.println("Error: Valid HPROF heap dump file must be specified with --dump or in config file.");
+            return 1;
+        }
+
+        if (dumpFile.getName().toLowerCase().endsWith(".gz")) {
+            System.err.println("Error: compressed heap dumps are not supported. The object positions DHP records refer to the "
+                    + "decompressed stream, so MAT could not read object contents from the .gz file. Decompress it first (gunzip).");
             return 1;
         }
 
@@ -154,6 +163,9 @@ public class DhpMain implements Callable<Integer> {
             memoryBudget = parseMemoryString(memoryBudgetString);
         }
 
+        if (keepUnreachable) {
+            System.setProperty("dhp.keep.unreachable", "true");
+        }
         if (addressMapStrategy != null && !addressMapStrategy.isBlank()) {
             System.setProperty("dhp.address.map", addressMapStrategy.trim().toLowerCase());
         }
@@ -224,8 +236,9 @@ public class DhpMain implements Callable<Integer> {
 
             System.out.println("[Phase 2/3] Streaming object instances & references into database...");
             long t2 = System.currentTimeMillis();
+            org.eclipse.mat.dhp.core.graph.HeapGraph graph;
             try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
-                ingester.ingest(dumpFile);
+                graph = ingester.ingest(dumpFile);
             }
             long p2Time = System.currentTimeMillis() - t2;
             System.out.println(String.format("   Ingested & indexed %,d reachable heap objects (%.2f s).", storage.getObjectCount(), p2Time / 1000.0));
@@ -233,7 +246,7 @@ public class DhpMain implements Callable<Integer> {
             System.out.println("[Phase 3/3] Calculating Dominator Tree & Retained Sizes...");
             long t3 = System.currentTimeMillis();
             DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
-            domEngine.computeAndStore();
+            domEngine.computeAndStore(graph);
             long p3Time = System.currentTimeMillis() - t3;
             System.out.println(String.format("   Dominator tree and retained sizes computed (%.2f s).", p3Time / 1000.0));
 
@@ -331,26 +344,7 @@ public class DhpMain implements Callable<Integer> {
     }
 
     public static long parseMemoryString(String val) {
-        if (val == null || val.isBlank()) return 0L;
-        val = val.trim().toUpperCase();
-        long multiplier = 1L;
-        String numStr = val;
-        if (val.endsWith("GB") || val.endsWith("G")) {
-            multiplier = 1024L * 1024L * 1024L;
-            numStr = val.replaceAll("[^0-9.]", "");
-        } else if (val.endsWith("MB") || val.endsWith("M")) {
-            multiplier = 1024L * 1024L;
-            numStr = val.replaceAll("[^0-9.]", "");
-        } else if (val.endsWith("KB") || val.endsWith("K")) {
-            multiplier = 1024L;
-            numStr = val.replaceAll("[^0-9.]", "");
-        } else if (val.endsWith("B")) {
-            numStr = val.replaceAll("[^0-9.]", "");
-        }
-        if (numStr.contains(".")) {
-            return (long) (Double.parseDouble(numStr) * multiplier);
-        }
-        return Long.parseLong(numStr) * multiplier;
+        return MemoryGovernor.parseSize(val);
     }
 
     public static void main(String[] args) {

@@ -37,14 +37,35 @@ public class Pass1ScanParser {
     private long[] sortedInstanceAddresses;
     private int uniqueInstanceCount;
     private final List<HeapRecords.GcRootRecord> gcRoots = new ArrayList<>();
+    // Thread serial number -> thread object address (from ROOT_THREAD_OBJECT), as MAT's Pass1Parser tracks it.
+    private final Map<Long, Long> threadSerialToAddress = new HashMap<>();
+
+    // Stack traces for MAT's <prefix>threads file (thread overview, stack frames and local variables)
+    private record StackFrameRec(String method, String signature, String sourceFile, long classSerialNumber, int lineNumber) {}
+    private record StackTraceRec(long threadSerialNumber, long[] frameIds) {}
+    private final Map<Long, String> classNameById = new HashMap<>();
+    private final Map<Long, StackFrameRec> stackFrames = new HashMap<>();
+    private final Map<Long, StackTraceRec> stackTraces = new java.util.LinkedHashMap<>();
+    private final Map<Long, List<long[]>> threadLocals = new HashMap<>(); // thread serial -> {objectAddress, frameNumber}
     private final Map<Long, Long> classToSuperClass = new HashMap<>();
 
     private HeapRecords.Header header;
+
+    // Heap layout detection, mirroring Eclipse MAT's HprofParserHandlerImpl / Pass1Parser:
+    // references are 4 bytes when compressed oops are detected on a 64-bit dump, headers always hold an id-sized pointer,
+    // and objects are aligned to the GCD of the address gaps (at least 8).
+    private int refSize = 8;
+    private int objectAlign = 8;
+    private boolean foundCompressed;
+    private final boolean[] requiredPrimitiveArrays = new boolean[16];
+    private long previousArrayStart;
+    private long previousArrayUncompressedEnd;
 
     public void scan(File file) throws IOException {
         try (HprofBinaryReader reader = new HprofBinaryReader(file)) {
             this.header = reader.readHeader();
             int idSize = reader.getIdSize();
+            this.refSize = idSize;
 
             while (true) {
                 int tag = reader.readByte();
@@ -71,6 +92,40 @@ public class Pass1ScanParser {
                         classSerialNumberToId.put(classSerNum, classId);
                         classIdToNameId.put(classId, nameId);
                         referencedStringIds.add(nameId);
+                        String rawClassName = strings.get(nameId);
+                        if (rawClassName != null) {
+                            int paren = rawClassName.indexOf('(');
+                            classNameById.put(classId, paren < 0 ? rawClassName.replace('/', '.')
+                                    : rawClassName.substring(0, paren).replace('/', '.') + rawClassName.substring(paren));
+                        }
+                    }
+                    case HprofConstants.Record.UNLOAD_CLASS -> {
+                        long classSerNum = reader.readUnsignedInt();
+                        reader.skipBytes(length - 4);
+                        Long unloaded = classSerialNumberToId.get(classSerNum);
+                        if (unloaded != null) {
+                            classNameById.remove(unloaded); // like MAT: only active classes keep a name
+                        }
+                    }
+                    case HprofConstants.Record.STACK_FRAME -> {
+                        long frameId = reader.readId();
+                        long methodName = reader.readId();
+                        long methodSig = reader.readId();
+                        long srcFile = reader.readId();
+                        long classSerNum = reader.readUnsignedInt();
+                        int lineNr = reader.readInt();
+                        stackFrames.put(frameId, new StackFrameRec(stringConstant(methodName), stringConstant(methodSig),
+                                stringConstant(srcFile), classSerNum, lineNr));
+                    }
+                    case HprofConstants.Record.STACK_TRACE -> {
+                        long traceSerial = reader.readUnsignedInt();
+                        long threadSerial = reader.readUnsignedInt();
+                        long frameCount = reader.readUnsignedInt();
+                        long[] frameIds = new long[(int) frameCount];
+                        for (int i = 0; i < frameCount; i++) {
+                            frameIds[i] = reader.readId();
+                        }
+                        stackTraces.put(traceSerial, new StackTraceRec(threadSerial, frameIds));
                     }
                     case HprofConstants.Record.HEAP_DUMP, HprofConstants.Record.HEAP_DUMP_SEGMENT -> {
                         scanHeapDumpSegment(reader, length, idSize);
@@ -99,33 +154,6 @@ public class Pass1ScanParser {
                 ));
             }
         }
-
-        // Ensure primitive array classes exist
-        long pseudoId = -100L;
-        for (String primType : new String[]{"boolean[]", "char[]", "float[]", "double[]", "byte[]", "short[]", "int[]", "long[]"}) {
-            boolean found = false;
-            for (HeapRecords.ClassRecord c : classes.values()) {
-                if (primType.equals(c.name())) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                long id = pseudoId--;
-                classes.put(id, new HeapRecords.ClassRecord(
-                        id,
-                        0L,
-                        0L,
-                        primType,
-                        0,
-                        List.of(),
-                        List.of()
-                ));
-            }
-        }
-
-        // Recalculate runtime instance sizes with exact header + field alignment (MAT parity)
-        calculateRuntimeInstanceSizes(header.idSize());
 
         // Prune strings map to keep only referenced names, freeing potentially millions of strings
         int totalStringsFound = strings.size();
@@ -160,6 +188,13 @@ public class Pass1ScanParser {
             this.sortedInstanceAddresses = new long[0];
         }
 
+        // Object alignment (needs the sorted addresses), then runtime instance sizes with exact header + field
+        // alignment (MAT parity)
+        this.objectAlign = calculateAlignment();
+        createRequiredFakeClasses();
+        calculateRuntimeInstanceSizes(header.idSize());
+        mergeAllIdentifiers();
+
         log.info("Pass 1 Completed: Parsed {} strings, {} classes, {} unique objects, {} GC roots",
                 totalStringsFound, classes.size(), uniqueInstanceCount, gcRoots.size());
     }
@@ -178,25 +213,27 @@ public class Pass1ScanParser {
                 }
                 case HprofConstants.DumpSegment.ROOT_JNI_GLOBAL -> {
                     long objAddr = reader.readId();
-                    long jniGlobalRef = reader.readId();
-                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, jniGlobalRef, subTag, 0));
+                    reader.readId(); // JNI global reference handle: MAT ignores it (root context stays empty)
+                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, 0));
                 }
                 case HprofConstants.DumpSegment.ROOT_JNI_LOCAL -> {
                     long objAddr = reader.readId();
                     long threadSerNum = reader.readUnsignedInt();
-                    reader.skipBytes(4); // frame number
-                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadSerNum));
+                    int frameNumber = reader.readInt();
+                    threadLocals.computeIfAbsent(threadSerNum, k -> new ArrayList<>()).add(new long[]{objAddr, frameNumber});
+                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadAddressOf(threadSerNum)));
                 }
                 case HprofConstants.DumpSegment.ROOT_JAVA_FRAME -> {
                     long objAddr = reader.readId();
                     long threadSerNum = reader.readUnsignedInt();
-                    reader.skipBytes(4); // frame number
-                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadSerNum));
+                    int frameNumber = reader.readInt();
+                    threadLocals.computeIfAbsent(threadSerNum, k -> new ArrayList<>()).add(new long[]{objAddr, frameNumber});
+                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadAddressOf(threadSerNum)));
                 }
                 case HprofConstants.DumpSegment.ROOT_NATIVE_STACK -> {
                     long objAddr = reader.readId();
                     long threadSerNum = reader.readUnsignedInt();
-                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadSerNum));
+                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadAddressOf(threadSerNum)));
                 }
                 case HprofConstants.DumpSegment.ROOT_STICKY_CLASS -> {
                     long objAddr = reader.readId();
@@ -205,7 +242,7 @@ public class Pass1ScanParser {
                 case HprofConstants.DumpSegment.ROOT_THREAD_BLOCK -> {
                     long objAddr = reader.readId();
                     long threadSerNum = reader.readUnsignedInt();
-                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadSerNum));
+                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadAddressOf(threadSerNum)));
                 }
                 case HprofConstants.DumpSegment.ROOT_MONITOR_USED -> {
                     long objAddr = reader.readId();
@@ -215,7 +252,8 @@ public class Pass1ScanParser {
                     long objAddr = reader.readId();
                     long threadSerNum = reader.readUnsignedInt();
                     reader.skipBytes(4); // stack trace serial
-                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, threadSerNum));
+                    threadSerialToAddress.put(threadSerNum, objAddr);
+                    gcRoots.add(new HeapRecords.GcRootRecord(objAddr, 0, subTag, 0));
                 }
                 case HprofConstants.DumpSegment.CLASS_DUMP -> {
                     long classId = reader.readId();
@@ -296,10 +334,18 @@ public class Pass1ScanParser {
                 case HprofConstants.DumpSegment.OBJECT_ARRAY_DUMP -> {
                     long objAddr = reader.readId();
                     objectAddresses.add(objAddr);
+                    // MAT's compressed-oops heuristic: an array starting inside the span the previous array would
+                    // occupy with 8-byte references means references are really 4 bytes wide.
+                    if (!foundCompressed && idSize == 8 && objAddr > previousArrayStart && objAddr < previousArrayUncompressedEnd) {
+                        refSize = 4;
+                        foundCompressed = true;
+                    }
                     reader.skipBytes(4); // stack trace
                     int arrayLength = reader.readInt();
                     long elementClassId = reader.readId();
                     reader.skipBytes((long) arrayLength * idSize);
+                    previousArrayStart = objAddr;
+                    previousArrayUncompressedEnd = objAddr + 16 + (long) arrayLength * 8;
                 }
                 case HprofConstants.DumpSegment.PRIMITIVE_ARRAY_DUMP -> {
                     long objAddr = reader.readId();
@@ -309,10 +355,219 @@ public class Pass1ScanParser {
                     int elementType = reader.readByte();
                     int elementSize = HprofConstants.Type.sizeOf(elementType, idSize);
                     reader.skipBytes((long) arrayLength * elementSize);
+                    requiredPrimitiveArrays[elementType] = true;
                 }
                 default -> throw new IOException("Unknown dump segment type: " + subTag + " at position " + reader.getPosition());
             }
         }
+    }
+
+    private static String primitiveArrayName(int elementType) {
+        return switch (elementType) {
+            case HprofConstants.Type.BOOLEAN -> "boolean[]";
+            case HprofConstants.Type.CHAR -> "char[]";
+            case HprofConstants.Type.FLOAT -> "float[]";
+            case HprofConstants.Type.DOUBLE -> "double[]";
+            case HprofConstants.Type.BYTE -> "byte[]";
+            case HprofConstants.Type.SHORT -> "short[]";
+            case HprofConstants.Type.INT -> "int[]";
+            case HprofConstants.Type.LONG -> "long[]";
+            default -> "unknown[]";
+        };
+    }
+
+    private boolean hasClassNamed(String name) {
+        for (HeapRecords.ClassRecord c : classes.values()) {
+            if (name.equals(c.name())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Mirrors MAT's createRequiredFakeClasses: java.lang.Class / java.lang.ClassLoader when the dump lacks them and the
+     * array classes of the primitive array types in use, placed at the first free multiples of the object alignment.
+     */
+    private void createRequiredFakeClasses() {
+        long jlo = 0L;
+        for (HeapRecords.ClassRecord c : classes.values()) {
+            if ("java.lang.Object".equals(c.name())) {
+                jlo = c.classId();
+                break;
+            }
+        }
+        long next = 0;
+        java.util.List<String> names = new ArrayList<>(List.of("java.lang.Class", "java.lang.ClassLoader"));
+        for (int type = HprofConstants.Type.BOOLEAN; type <= HprofConstants.Type.LONG; type++) {
+            if (requiredPrimitiveArrays[type]) {
+                names.add(primitiveArrayName(type));
+            }
+        }
+        for (String name : names) {
+            if (hasClassNamed(name)) {
+                continue;
+            }
+            do {
+                next += objectAlign;
+            } while (classes.containsKey(next)
+                    || (uniqueInstanceCount > 0 && java.util.Arrays.binarySearch(sortedInstanceAddresses, 0, uniqueInstanceCount, next) >= 0));
+            classes.put(next, new HeapRecords.ClassRecord(next, jlo, 0L, name, 0, List.of(), List.of()));
+        }
+    }
+
+    /**
+     * Turns the sorted instance addresses into the identifier array of the whole heap, exactly as MAT numbers objects:
+     * the artificial system class loader (address 0) followed by every object, class objects included, in address order.
+     * Object ID = position in this array.
+     */
+    private void mergeAllIdentifiers() {
+        long[] cls = classes.keySet().stream().mapToLong(Long::longValue).filter(a -> a > 0).sorted().toArray();
+        int ni = uniqueInstanceCount;
+        long[] inst = sortedInstanceAddresses;
+        int total = ni + cls.length + 1;
+        if (inst.length < total) {
+            inst = java.util.Arrays.copyOf(inst, total);
+        }
+        int i = ni - 1;
+        int j = cls.length - 1;
+        int k = total - 1;
+        while (j >= 0 || i >= 0) {
+            if (j < 0 || (i >= 0 && inst[i] > cls[j])) {
+                inst[k--] = inst[i--];
+            } else {
+                inst[k--] = cls[j--];
+            }
+        }
+        inst[0] = 0L; // system class loader
+        this.sortedInstanceAddresses = inst;
+        this.uniqueInstanceCount = total;
+    }
+
+    private String stringConstant(long id) {
+        if (id == 0L) {
+            return "";
+        }
+        String v = strings.get(id);
+        return v != null ? v : "Unresolved Name 0x" + Long.toHexString(id);
+    }
+
+    private String formatFrame(StackFrameRec f) {
+        Long classId = classSerialNumberToId.get(f.classSerialNumber());
+        String className = classId == null ? "<UNKNOWN CLASS>" : classNameById.get(classId);
+        String loc;
+        int line = f.lineNumber();
+        if (line > 0) {
+            loc = f.sourceFile() + ":" + line;
+        } else if (line == 0 || line == -1) {
+            loc = f.sourceFile() != null ? f.sourceFile() : "Unknown Source";
+        } else if (line == -2) {
+            loc = (f.sourceFile() != null ? f.sourceFile() : "") + "(Compiled Code)";
+        } else if (line == -3) {
+            loc = (f.sourceFile() != null ? f.sourceFile() : "") + "(Native Method)";
+        } else {
+            loc = "";
+        }
+        return "  at " + className + "." + f.method() + f.signature() + " (" + loc + ")";
+    }
+
+    /**
+     * Writes the stack traces in the format of MAT's own HPROF parser (<prefix>threads), which MAT reads to show
+     * thread stacks and the local variables of each frame. Nothing is written for dumps without call stacks.
+     *
+     * @return true if a file was written
+     */
+    public boolean writeThreadsFile(File out) throws IOException {
+        // MAT: one stack trace with an empty stack is always reported, even if the dump has no call stacks
+        if (stackTraces.size() <= 1) {
+            return false;
+        }
+        try (java.io.PrintWriter w = new java.io.PrintWriter(new java.io.OutputStreamWriter(
+                new java.io.FileOutputStream(out), StandardCharsets.UTF_8))) {
+            for (StackTraceRec trace : stackTraces.values()) {
+                Long tid = threadSerialToAddress.get(trace.threadSerialNumber());
+                if (tid == null) {
+                    continue;
+                }
+                w.print("Thread 0x" + Long.toHexString(tid) + "\n");
+                StringBuilder stack = new StringBuilder();
+                for (long frameId : trace.frameIds()) {
+                    StackFrameRec f = stackFrames.get(frameId);
+                    if (f != null) {
+                        stack.append(formatFrame(f)).append("\r\n");
+                    }
+                }
+                w.print(stack + "\n");
+                w.print("  locals:\n");
+                List<long[]> locals = threadLocals.get(trace.threadSerialNumber());
+                if (locals != null) {
+                    for (long[] l : locals) {
+                        w.print("    objectId=0x" + Long.toHexString(l[0]) + ", line=" + (int) l[1] + "\n");
+                    }
+                }
+                w.print("\n");
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Address of the thread object for a thread serial number, or 0 when that thread has not been seen yet.
+     * Like MAT, roots that belong to a known thread (stack locals) are not GC roots themselves: the thread object
+     * references them instead. Roots of unknown threads stay plain roots.
+     */
+    private long threadAddressOf(long threadSerialNumber) {
+        Long addr = threadSerialToAddress.get(threadSerialNumber);
+        return addr != null ? addr : 0L;
+    }
+
+    /**
+     * GCD of the gaps between consecutive object addresses (class objects included), clamped to [8, 256]; the same
+     * computation as MAT's HprofParserHandlerImpl.calculateAlignment().
+     */
+    private int calculateAlignment() {
+        long[] classAddrs = classes.keySet().stream().mapToLong(Long::longValue).filter(a -> a > 0).sorted().toArray();
+        long[] inst = sortedInstanceAddresses;
+        int ni = uniqueInstanceCount;
+        int i = 0, c = 0;
+        long prev = 0;
+        long align = 0;
+        while (i < ni || c < classAddrs.length) {
+            long next;
+            if (c >= classAddrs.length || (i < ni && inst[i] < classAddrs[c])) {
+                next = inst[i++];
+            } else {
+                next = classAddrs[c++];
+            }
+            long diff = next - prev;
+            prev = next;
+            if (next == diff) continue;
+            if (align == 0) {
+                align = diff;
+            } else {
+                long mx = Math.max(align, diff);
+                long mn = Math.min(align, diff);
+                long d = mx % mn;
+                while (d != 0) {
+                    mx = mn;
+                    mn = d;
+                    d = mx % mn;
+                }
+                align = mn;
+                if (align <= 8) break;
+            }
+        }
+        return Math.max((int) Math.min(align, 256), 8);
+    }
+
+    /** Size of (possibly compressed) references in the heap, as detected like MAT does. */
+    public int getRefSize() {
+        return refSize;
+    }
+
+    /** Alignment between successive objects, as detected like MAT does. */
+    public int getObjectAlign() {
+        return objectAlign;
     }
 
     public LongArrayList getObjectAddresses() {
@@ -394,17 +649,7 @@ public class Pass1ScanParser {
     }
 
     public long getPrimitiveArrayClassId(int elementType) {
-        String name = switch (elementType) {
-            case HprofConstants.Type.BOOLEAN -> "boolean[]";
-            case HprofConstants.Type.CHAR -> "char[]";
-            case HprofConstants.Type.FLOAT -> "float[]";
-            case HprofConstants.Type.DOUBLE -> "double[]";
-            case HprofConstants.Type.BYTE -> "byte[]";
-            case HprofConstants.Type.SHORT -> "short[]";
-            case HprofConstants.Type.INT -> "int[]";
-            case HprofConstants.Type.LONG -> "long[]";
-            default -> "unknown[]";
-        };
+        String name = primitiveArrayName(elementType);
         for (HeapRecords.ClassRecord c : classes.values()) {
             if (name.equals(c.name())) {
                 return c.classId();
@@ -415,8 +660,8 @@ public class Pass1ScanParser {
 
     private void calculateRuntimeInstanceSizes(int idSize) {
         int pointerSize = idSize;
-        int refSize = idSize;
-        int objectAlign = 8;
+        int refSize = this.refSize;
+        int objectAlign = this.objectAlign;
 
         Map<Long, Integer> calculatedSizes = new HashMap<>();
         for (HeapRecords.ClassRecord cls : new ArrayList<>(classes.values())) {

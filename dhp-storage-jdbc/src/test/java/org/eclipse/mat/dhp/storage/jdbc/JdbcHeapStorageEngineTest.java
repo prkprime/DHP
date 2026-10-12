@@ -47,18 +47,25 @@ class JdbcHeapStorageEngineTest {
         assertThat(retrieved).isNotNull();
         assertThat(retrieved.name()).isEqualTo("java.lang.Object");
 
-        // Insert objects batch
-        List<HeapStorageEngine.RawObjectRecord> objects = List.of(
-                new HeapStorageEngine.RawObjectRecord(0, 0x1000L, 100L, 24L, 500L, false),
-                new HeapStorageEngine.RawObjectRecord(1, 0x2000L, 100L, 32L, 600L, false)
-        );
-        storage.insertObjectsBatch(objects);
+        // Persist a small graph through the bulk API
+        var map = new org.eclipse.mat.dhp.core.memory.SortedAddressToIdMap(
+                new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap(), new long[]{0x1000L, 0x2000L}, 0);
+        var graph = new org.eclipse.mat.dhp.core.graph.HeapGraph(2, 0, map);
+        graph.setObject(0, 0, 24L, 500L, false);
+        graph.setObject(1, 0, 32L, 600L, true);
+        graph.setEdges(0, new int[]{1, 0}, 2);
+        storage.saveObjects(graph);
+        storage.saveOutboundEdges(graph);
         storage.finishIngestion();
+        assertThat(storage.getOutboundReferences(0)).containsExactly(1, 0);
+        assertThat(storage.getOutboundReferences(1)).isEmpty();
+        assertThat(storage.isArray(1)).isTrue();
+        assertThat(storage.getObjectFilePosition(1)).isEqualTo(600L);
 
         assertThat(storage.getObjectCount()).isEqualTo(2);
         assertThat(storage.getObjectAddress(0)).isEqualTo(0x1000L);
         assertThat(storage.getObjectIdByAddress(0x2000L)).isEqualTo(1);
-        assertThat(storage.getObjectClassId(0)).isEqualTo(100L);
+        assertThat(storage.getObjectClassId(0)).isEqualTo(0L);
         assertThat(storage.getObjectUsedSize(0)).isEqualTo(24L);
     }
 

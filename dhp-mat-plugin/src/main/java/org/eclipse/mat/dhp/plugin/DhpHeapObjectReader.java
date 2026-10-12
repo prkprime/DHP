@@ -33,9 +33,10 @@ import java.util.Properties;
 public class DhpHeapObjectReader implements IObjectReader {
 
     private RandomAccessFile raf;
+    /** Why object payloads cannot be read (null when the dump file is open). */
+    private String dumpProblem;
     private int idSize = 8;
-    private java.sql.Connection dbConn;
-    private java.sql.PreparedStatement psPos;
+    private org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine posStorage;
 
     @Override
     public void open(ISnapshot snapshot) throws SnapshotException, IOException {
@@ -59,7 +60,13 @@ public class DhpHeapObjectReader implements IObjectReader {
                 }
             } catch (Exception ignored) {}
         }
-        if (file.exists() && !file.isDirectory()) {
+        if (file.getName().toLowerCase().endsWith(".gz")) {
+            // positions recorded during ingestion refer to the decompressed stream, which cannot be seeked here
+            this.dumpProblem = "compressed heap dumps are not supported for object inspection, decompress " + file;
+        } else if (!file.exists() || file.isDirectory()) {
+            this.dumpProblem = "the HPROF dump " + file + " is not available";
+        }
+        if (dumpProblem == null) {
             this.raf = new RandomAccessFile(file, "r");
             this.idSize = snapshot.getSnapshotInfo().getIdentifierSize();
             if (this.idSize <= 0) {
@@ -94,12 +101,18 @@ public class DhpHeapObjectReader implements IObjectReader {
                 try {
                     Class.forName("org.sqlite.JDBC");
                 } catch (ClassNotFoundException ignored) {}
-                this.dbConn = java.sql.DriverManager.getConnection(jdbcUrl, user != null ? user : "", pass != null ? pass : "");
-                this.psPos = dbConn.prepareStatement("SELECT file_position FROM dhp_objects WHERE object_id = ?");
+                this.posStorage = new org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine(
+                        jdbcUrl, user != null ? user : "", pass != null ? pass : "", 64L * 1024 * 1024);
                 System.out.println("[DHP-Reader] Successfully connected to database: " + jdbcUrl);
             } catch (Exception e) {
                 System.err.println("[DHP-Reader] Could not connect to database " + jdbcUrl + ": " + e.getMessage());
             }
+        }
+    }
+
+    private void requireDump(long filePos) throws SnapshotException {
+        if (raf == null && filePos > 0) {
+            throw new SnapshotException("Cannot read object data: " + (dumpProblem != null ? dumpProblem : "the HPROF dump is not open"));
         }
     }
 
@@ -118,14 +131,9 @@ public class DhpHeapObjectReader implements IObjectReader {
             try {
                 filePos = posLookup.get(objectId);
             } catch (Exception ignored) {}
-        } else if (psPos != null && objectId >= 0) {
+        } else if (posStorage != null && objectId >= 0) {
             try {
-                psPos.setInt(1, objectId);
-                try (java.sql.ResultSet rs = psPos.executeQuery()) {
-                    if (rs.next()) {
-                        filePos = rs.getLong(1);
-                    }
-                }
+                filePos = posStorage.getObjectFilePosition(objectId);
             } catch (Exception ignored) {}
         }
 
@@ -145,6 +153,7 @@ public class DhpHeapObjectReader implements IObjectReader {
                 // Primitive array: header is [id: idSize][serial: 4][size: 4][type: 1]
                 int arrayLen = 0;
                 long dataPos = 0;
+                requireDump(filePos);
                 if (raf != null && filePos > 0) {
                     raf.seek(filePos + 1 + idSize + 4);
                     arrayLen = raf.readInt();
@@ -157,6 +166,7 @@ public class DhpHeapObjectReader implements IObjectReader {
                 // Object array: header is [id: idSize][serial: 4][size: 4][classId: idSize]
                 int arrayLen = 0;
                 long dataPos = 0;
+                requireDump(filePos);
                 if (raf != null && filePos > 0) {
                     raf.seek(filePos + 1 + idSize + 4);
                     arrayLen = raf.readInt();
@@ -169,6 +179,7 @@ public class DhpHeapObjectReader implements IObjectReader {
         }
 
         // If no file stream available (or synthetic object), return shallow instance
+        requireDump(filePos);
         if (raf == null || address == 0) {
             ClassImpl cImpl = (ClassImpl) targetClass;
             return snapshot.isClassLoader(objectId)
@@ -265,6 +276,9 @@ public class DhpHeapObjectReader implements IObjectReader {
         int elementSize = IPrimitiveArray.ELEMENT_SIZE[type];
         Object result = Array.newInstance(IPrimitiveArray.COMPONENT_TYPE[type], length);
 
+        if (raf == null && length > 0 && array.getInfo() instanceof Long pos && pos > 0) {
+            requireDump(pos);
+        }
         if (raf == null || length == 0) {
             return result;
         }
@@ -297,6 +311,9 @@ public class DhpHeapObjectReader implements IObjectReader {
     public synchronized long[] readObjectArrayContent(ObjectArrayImpl array, int offset, int length)
             throws IOException, SnapshotException {
         long[] result = new long[length];
+        if (raf == null && length > 0 && array.getInfo() instanceof Long pos && pos > 0) {
+            requireDump(pos);
+        }
         if (raf == null || length == 0) {
             return result;
         }
@@ -323,17 +340,11 @@ public class DhpHeapObjectReader implements IObjectReader {
             raf.close();
             raf = null;
         }
-        if (psPos != null) {
+        if (posStorage != null) {
             try {
-                psPos.close();
+                posStorage.close();
             } catch (Exception ignored) {}
-            psPos = null;
-        }
-        if (dbConn != null) {
-            try {
-                dbConn.close();
-            } catch (Exception ignored) {}
-            dbConn = null;
+            posStorage = null;
         }
     }
 }

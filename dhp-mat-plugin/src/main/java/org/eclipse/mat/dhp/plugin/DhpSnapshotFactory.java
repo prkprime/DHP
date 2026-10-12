@@ -112,6 +112,8 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
         }
 
         log.info("Opening DHP heap dump descriptor: {}", file.getAbsolutePath());
+        JdbcHeapStorageEngine openedStorage = null;   // for cleanup if opening fails half way
+        DhpHeapObjectReader reader = null;
         try {
             Properties props = new Properties();
             try (FileInputStream fis = new FileInputStream(file)) {
@@ -151,14 +153,32 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             String memStr = props.getProperty("memory.budget");
             if (memStr != null) {
                 try {
-                    memoryBudget = Long.parseLong(memStr);
+                    memoryBudget = MemoryGovernor.parseSize(memStr);
                 } catch (Exception ignored) {}
+            }
+
+            // MAT reads <prefix>threads for thread stacks; the CLI writes it next to the dump, so follow the dump when
+            // the descriptor lives elsewhere or has another name
+            if (hprofFile != null && !new File(prefix + "threads").exists()) {
+                String dumpName = hprofFile.getName();
+                int dot = dumpName.lastIndexOf('.');
+                File dumpDir = hprofFile.getAbsoluteFile().getParentFile();
+                File dumpThreads = new File(dumpDir, (dot > 0 ? dumpName.substring(0, dot) : dumpName) + ".threads");
+                if (dumpThreads.exists()) {
+                    prefix = new File(dumpDir, (dot > 0 ? dumpName.substring(0, dot) : dumpName) + ".").getAbsolutePath().replace('\\', '/');
+                }
             }
 
             MemoryGovernor governor = new MemoryGovernor(memoryBudget, 4);
             JdbcHeapStorageEngine storage = new JdbcHeapStorageEngine(jdbcUrl, user, password, governor.getTotalAllocatedBytes());
+            openedStorage = storage;
             if (!storage.hasExistingTables()) {
                 storage.initializeSchema();
+            }
+
+            if (hprofFile != null && hprofFile.getName().toLowerCase().endsWith(".gz") && storage.getObjectCount() == 0) {
+                throw new SnapshotException("Compressed heap dumps are not supported (recorded positions refer to the decompressed "
+                        + "stream): decompress " + hprofFile.getName() + " first");
             }
 
             // Ingest on the fly if tables are empty
@@ -167,12 +187,16 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 Pass1ScanParser pass1 = new Pass1ScanParser();
                 pass1.scan(hprofFile);
 
+                org.eclipse.mat.dhp.core.graph.HeapGraph graph;
+
                 try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
-                    ingester.ingest(hprofFile);
+
+                    graph = ingester.ingest(hprofFile);
+
                 }
 
                 DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
-                domEngine.computeAndStore();
+                domEngine.computeAndStore(graph);
             }
 
             int objectCount = storage.getObjectCount();
@@ -182,7 +206,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             XSnapshotInfo info = new XSnapshotInfo();
             info.setPath(hprofFile != null ? hprofFile.getAbsolutePath() : file.getAbsolutePath());
             info.setPrefix(prefix);
-            info.setProperty("$heapFormat", "dhp");
+            info.setProperty("$heapFormat", "hprof"); // what MAT reports for an HPROF dump (DHP specifics live in the dhp.* properties)
             info.setProperty("dhp.hprofPath", hprofFile != null ? hprofFile.getAbsolutePath() : "");
             info.setProperty("dhp.db.url", jdbcUrl);
             info.setProperty("dhp.db.user", user);
@@ -190,6 +214,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             info.setNumberOfObjects(objectCount);
             info.setNumberOfClasses(allClasses.size());
             info.setUsedHeapSize(totalHeapSize);
+            SnapshotProps.apply(info, storage);
             try {
                 String idSizeStr = storage.getSnapshotInfo("idSize");
                 if (idSizeStr != null) {
@@ -253,6 +278,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                         fds.toArray(new FieldDescriptor[0])
                 );
                 c.setObjectId(classObjId);
+                c.setCacheEntry(Integer.valueOf(classObjId)); // key of the class -> objects lookup (c2objects)
                 c.setCacheEntry(classObjId);
                 if (superClassObjId >= 0) {
                     c.setSuperClassIndex(superClassObjId);
@@ -314,7 +340,8 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                                 list = new ArrayList<>();
                                 objMap.put(objId, list);
                             }
-                            var xgc = new XGCRootInfo(root.objectAddress(), root.referrerAddress(), root.rootType());
+                            // like MAT: the referrer of a stack local is its thread object
+                            var xgc = new XGCRootInfo(root.objectAddress(), root.threadAddress(), RootTypes.toMat(root.rootType()));
                             xgc.setObjectId(objId);
                             xgc.setContextId(threadObjId);
                             list.add(xgc);
@@ -325,30 +352,9 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                             list = new ArrayList<>();
                             gcRootsMap.put(objId, list);
                         }
-                        var xgc = new XGCRootInfo(root.objectAddress(), root.referrerAddress(), root.rootType());
+                        var xgc = new XGCRootInfo(root.objectAddress(), root.referrerAddress(), RootTypes.toMat(root.rootType()));
                         xgc.setObjectId(objId);
                         list.add(xgc);
-                    }
-                }
-            }
-
-            if (sysLoaderObjId >= 0 && !gcRootsMap.containsKey(sysLoaderObjId)) {
-                List<XGCRootInfo> list = new ArrayList<>();
-                var xgc = new XGCRootInfo(0L, 0L, 1);
-                xgc.setObjectId(sysLoaderObjId);
-                list.add(xgc);
-                gcRootsMap.put(sysLoaderObjId, list);
-            }
-
-            for (HeapRecords.ClassRecord cls : allClasses) {
-                if (cls.classLoaderId() == 0L) {
-                    int classObjId = cls.classObjId() >= 0 ? cls.classObjId() : storage.getObjectIdByAddress(cls.classId());
-                    if (classObjId >= 0 && !gcRootsMap.containsKey(classObjId)) {
-                        List<XGCRootInfo> list = new ArrayList<>();
-                        var xgc = new XGCRootInfo(cls.classId(), 0L, 2);
-                        xgc.setObjectId(classObjId);
-                        list.add(xgc);
-                        gcRootsMap.put(classObjId, list);
                     }
                 }
             }
@@ -434,7 +440,6 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                             it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet set = new it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet();
                             if (classId >= 0) set.add(classId);
                             for (int x : orig) set.add(x);
-                            for (int x : bootstrapClassIdsArray) set.add(x);
                             return set.toIntArray();
                         }
                         int[] refs = storage.getOutboundReferences(id);
@@ -483,7 +488,7 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 log.warn("Could not instantiate RetainedSizeCache: {}", t.getMessage());
             }
 
-            DhpHeapObjectReader reader = new DhpHeapObjectReader();
+            reader = new DhpHeapObjectReader();
 
             Class<?> snapshotImplClass = loadParserClass("org.eclipse.mat.parser.internal.SnapshotImpl");
             Constructor<?> ctor = snapshotImplClass.getDeclaredConstructor(
@@ -514,12 +519,32 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
 
             reader.open(snapshot);
 
+            // Let MAT derive the class loader labels (class specific names), the used heap size and the counts exactly
+            // like it does for snapshots it parsed itself. Needs the reader, hence after open().
+            try {
+                java.lang.reflect.Method calc = snapshotImplClass.getDeclaredMethod("calculateLoaderLabels");
+                calc.setAccessible(true);
+                calc.invoke(snapshot);
+            } catch (Exception e) {
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                log.warn("Could not compute class loader labels through MAT: {}", cause.toString());
+                System.err.println("[DHP] Could not compute class loader labels through MAT: " + cause);
+                cause.printStackTrace();
+            }
+
             openSnapshots.put(snapshot, new DhpSnapshotContext(snapshot, reader, storage));
             log.info("DHP Snapshot successfully opened with ZERO index files on disk for {}", file.getName());
             return snapshot;
 
         } catch (Exception e) {
             log.error("Failed to open DHP snapshot for {}: {}", file.getAbsolutePath(), e.getMessage(), e);
+            // do not leak the database connections and the dump file handle of a snapshot that never opened
+            if (reader != null) {
+                try { reader.close(); } catch (Exception ignored) {}
+            }
+            if (openedStorage != null) {
+                try { openedStorage.close(); } catch (Exception ignored) {}
+            }
             throw new SnapshotException("Failed to open DHP snapshot", e);
         }
     }

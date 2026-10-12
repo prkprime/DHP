@@ -1,5 +1,8 @@
 package org.eclipse.mat.dhp.core.parser;
 
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import org.eclipse.mat.dhp.core.graph.HeapGraph;
 import org.eclipse.mat.dhp.core.memory.IAddressToIdMap;
 import org.eclipse.mat.dhp.core.memory.IObjectMembershipSet;
 import org.eclipse.mat.dhp.core.memory.MemoryGovernor;
@@ -10,32 +13,53 @@ import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
-import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
-import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
-
 import java.io.File;
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
 import java.sql.SQLException;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 
 /**
- * Pass 2 Stream Parser:
- * Streams object instances and arrays from HPROF directly into JDBC storage batches.
- * Dynamically adjusts batch sizing according to MemoryGovernor.
+ * Pass 2 stream parser.
+ *
+ * <p>Streams object instances and arrays from the HPROF file into an in-memory {@link HeapGraph} (primitive columns
+ * plus a compact edge log) and then hands the finished graph to the storage engine in a few bulk writes. Nothing is
+ * written to the database per object, which removes the per-row JDBC cost that used to dominate ingestion.</p>
  */
 public class Pass2ObjectIngester implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(Pass2ObjectIngester.class);
+    private static final VarHandle INT_BE = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.BIG_ENDIAN);
+    private static final VarHandle LONG_BE = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.BIG_ENDIAN);
+    private static final int ARRAY_BLOCK = 8192;
 
     private final Pass1ScanParser pass1;
     private final HeapStorageEngine storage;
     private final MemoryGovernor governor;
 
     private IAddressToIdMap addressToId;
-    private final Map<Long, List<HeapRecords.ClassRecord>> classHierarchyCache = new HashMap<>();
+    private HeapGraph graph;
+
+    /** Per-class precomputed field layout. */
+    private static final class ClassLayout {
+        final HeapRecords.ClassRecord record;          // null if the class was never described
+        final List<HeapRecords.ClassRecord> hierarchy; // class first, then its super classes
+        final int assignedClassObjId;
+        final int[] refOffsets;                        // byte offsets of OBJECT fields (complete instance data)
+        final int totalFieldBytes;
+
+        ClassLayout(HeapRecords.ClassRecord record, List<HeapRecords.ClassRecord> hierarchy,
+                    int assignedClassObjId, int[] refOffsets, int totalFieldBytes) {
+            this.record = record;
+            this.hierarchy = hierarchy;
+            this.assignedClassObjId = assignedClassObjId;
+            this.refOffsets = refOffsets;
+            this.totalFieldBytes = totalFieldBytes;
+        }
+    }
 
     public Pass2ObjectIngester(Pass1ScanParser pass1, HeapStorageEngine storage, MemoryGovernor governor) {
         this.pass1 = pass1;
@@ -44,100 +68,116 @@ public class Pass2ObjectIngester implements AutoCloseable {
         this.addressToId = new SortedAddressToIdMap(new Long2IntOpenHashMap(), new long[0], 0);
     }
 
-    public void ingest(File file) throws IOException, SQLException {
-        log.info("Starting Pass 2 Object Ingestion into Database...");
+    public HeapGraph ingest(File file) throws IOException, SQLException {
+        log.info("Starting Pass 2 Object Ingestion...");
+        long tStart = System.currentTimeMillis();
 
         // Save metadata & classes from Pass 1
         storage.saveSnapshotInfo("version", pass1.getHeader().version());
         storage.saveSnapshotInfo("idSize", String.valueOf(pass1.getHeader().idSize()));
         storage.saveSnapshotInfo("creationTime", String.valueOf(pass1.getHeader().creationTime()));
-        storage.saveClasses(pass1.getClasses().values());
         List<HeapRecords.GcRootRecord> allRoots = new ArrayList<>(pass1.getGcRoots());
-        boolean hasZero = false;
+        // MAT fallback: when the dump marks no sticky (system) classes at all, classes of the system loader are roots
+        boolean foundSystemClasses = false;
+        java.util.Set<Long> rootedAddresses = new java.util.HashSet<>();
         for (var r : allRoots) {
-            if (r.objectAddress() == 0L) {
-                hasZero = true;
-                break;
+            rootedAddresses.add(r.objectAddress());
+            if (r.rootType() == HprofConstants.DumpSegment.ROOT_STICKY_CLASS) {
+                foundSystemClasses = true;
             }
         }
-        if (!hasZero) {
-            allRoots.add(new HeapRecords.GcRootRecord(0L, 0L, 1, 0L));
+        if (!foundSystemClasses) {
+            for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
+                if (cls.classLoaderId() == 0L && !cls.name().endsWith("[]") && cls.classId() > 0
+                        && !rootedAddresses.contains(cls.classId())) {
+                    allRoots.add(new HeapRecords.GcRootRecord(cls.classId(), 0L, HprofConstants.DumpSegment.ROOT_STICKY_CLASS, 0L));
+                }
+            }
         }
-        storage.insertGcRootsBatch(allRoots);
 
         int idSize = pass1.getHeader().idSize();
-        int batchSize = governor.getBatchSize();
+        final int refSize = pass1.getRefSize();       // 4 with compressed oops, like MAT detects
+        final int objAlign = pass1.getObjectAlign();  // GCD of address gaps, at least 8
 
-        List<HeapStorageEngine.RawObjectRecord> objectBatch = new ArrayList<>(batchSize);
-        List<HeapStorageEngine.ReferenceEdge> edgeBatch = new ArrayList<>(batchSize);
-
-        int currentObjectId = 0;
-        Long2IntOpenHashMap classAddressToId = new Long2IntOpenHashMap();
-        classAddressToId.defaultReturnValue(-1);
-
-        // 1. Pre-register system classloader at address 0
-        int systemClassLoaderObjId = currentObjectId++;
-        classAddressToId.put(0L, systemClassLoaderObjId);
-
-        // 2. Pre-register all classes as heap objects and map address -> objectId
+        // Object IDs follow MAT: position in the sorted array of all object addresses (address 0 = artificial system
+        // class loader first, class objects interleaved with instances). Pass 1 delivers that array.
         long javaLangClassAddress = 0L;
         long classLoaderClassAddress = 0L;
+        long classLoaderInstanceSize = 0;
         for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
             if ("java.lang.Class".equals(cls.name())) {
                 javaLangClassAddress = cls.classId();
             }
             if ("java.lang.ClassLoader".equals(cls.name())) {
                 classLoaderClassAddress = cls.classId();
-            }
-        }
-
-        for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
-            if (!classAddressToId.containsKey(cls.classId())) {
-                int classObjId = currentObjectId++;
-                classAddressToId.put(cls.classId(), classObjId);
-            }
-        }
-
-        long classLoaderInstanceSize = 0;
-        long javaLangClassInstanceSize = 0;
-        for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
-            if ("java.lang.ClassLoader".equals(cls.name())) {
                 classLoaderInstanceSize = cls.instanceSize();
-            }
-            if ("java.lang.Class".equals(cls.name())) {
-                javaLangClassInstanceSize = cls.instanceSize();
             }
         }
         if (classLoaderInstanceSize == 0) classLoaderInstanceSize = 4L * idSize;
-        if (javaLangClassInstanceSize == 0) javaLangClassInstanceSize = 4L * idSize;
 
-        int javaLangClassObjId = (javaLangClassAddress != 0 && classAddressToId.containsKey(javaLangClassAddress))
-                ? classAddressToId.get(javaLangClassAddress)
-                : -1;
-        int classLoaderClassObjId = (classLoaderClassAddress != 0 && classAddressToId.containsKey(classLoaderClassAddress))
-                ? classAddressToId.get(classLoaderClassAddress)
-                : (javaLangClassObjId != -1 ? javaLangClassObjId : 0);
-
-        int baseInstanceId = currentObjectId;
-        long[] sortedInstances = pass1.getSortedInstanceAddresses();
-        int instanceCount = pass1.getUniqueInstanceCount();
+        long[] allIdentifiers = pass1.getSortedInstanceAddresses();
+        int identifierCount = pass1.getUniqueInstanceCount();
         File tempDir = file.getAbsoluteFile().getParentFile();
 
         this.addressToId = governor.createAddressMap(
-                classAddressToId,
-                sortedInstances,
-                instanceCount,
-                baseInstanceId,
+                new Long2IntOpenHashMap(),
+                allIdentifiers,
+                identifierCount,
+                0,
                 tempDir
         );
         pass1.releaseSortedInstanceAddresses();
 
         int totalExpectedObjects = addressToId.size();
-        IObjectMembershipSet writtenObjects = governor.createMembershipSet(totalExpectedObjects);
-        IObjectMembershipSet processedClassDumps = governor.createMembershipSet(baseInstanceId + 16);
+        final int systemClassLoaderObjId = addressToId.get(0L);
+        final java.util.BitSet isClass = new java.util.BitSet(totalExpectedObjects);
+        for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
+            int cid = addressToId.get(cls.classId());
+            if (cid >= 0) {
+                isClass.set(cid);
+            }
+        }
 
-        Int2IntOpenHashMap classCounts = new Int2IntOpenHashMap();
-        Int2LongOpenHashMap classTotalSizes = new Int2LongOpenHashMap();
+        int javaLangClassObjId = javaLangClassAddress != 0 ? addressToId.get(javaLangClassAddress) : -1;
+        int classLoaderClassObjId = (classLoaderClassAddress != 0 && addressToId.get(classLoaderClassAddress) >= 0)
+                ? addressToId.get(classLoaderClassAddress)
+                : (javaLangClassObjId != -1 ? javaLangClassObjId : 0);
+
+        IObjectMembershipSet writtenObjects = governor.createMembershipSet(totalExpectedObjects);
+        IObjectMembershipSet processedClassDumps = governor.createMembershipSet(totalExpectedObjects);
+
+        // Resolve GC roots now that the address map exists (no per-root database lookups later)
+        List<HeapRecords.GcRootRecord> resolvedRoots = new ArrayList<>(allRoots.size());
+        for (var r : allRoots) {
+            resolvedRoots.add(new HeapRecords.GcRootRecord(
+                    addressToId.get(r.objectAddress()),
+                    r.objectAddress(),
+                    r.referrerAddress(),
+                    r.rootType(),
+                    r.threadAddress(),
+                    addressToId.get(r.threadAddress())));
+        }
+
+        // Stack-local roots of known threads are not roots: the thread object references them (MAT semantics)
+        it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<it.unimi.dsi.fastutil.ints.IntArrayList> threadLocals = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
+        for (var r : resolvedRoots) {
+            if (r.threadAddress() != 0 && r.threadObjectId() >= 0 && r.objectId() >= 0) {
+                var list = threadLocals.computeIfAbsent(r.threadObjectId(), k -> new it.unimi.dsi.fastutil.ints.IntArrayList());
+                if (!list.contains(r.objectId())) {
+                    list.add(r.objectId());
+                }
+            }
+        }
+
+        HeapGraph graph = new HeapGraph(totalExpectedObjects, 0, addressToId);
+        graph.setGcRoots(resolvedRoots);
+        this.graph = graph;
+
+        // Class statistics keyed by class object ID
+        it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap classCounts = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
+        it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap classTotalSizes = new it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap();
+
+        int[] edgeScratch = new int[1024];
 
         writtenObjects.add(systemClassLoaderObjId);
         if (classLoaderClassObjId >= 0) {
@@ -145,20 +185,17 @@ public class Pass2ObjectIngester implements AutoCloseable {
             classTotalSizes.addTo(classLoaderClassObjId, classLoaderInstanceSize);
         }
 
-        objectBatch.add(new HeapStorageEngine.RawObjectRecord(
-                systemClassLoaderObjId, 0L, classLoaderClassObjId, classLoaderInstanceSize, 0L, false
-        ));
-        int sysSeq = 0;
-        if (classLoaderClassObjId >= 0) {
-            edgeBatch.add(new HeapStorageEngine.ReferenceEdge(systemClassLoaderObjId, sysSeq++, classLoaderClassObjId));
-        }
-        for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
-            if (cls.classLoaderId() == 0L) {
-                int cid = addressToId.get(cls.classId());
-                if (cid >= 0) {
-                    edgeBatch.add(new HeapStorageEngine.ReferenceEdge(systemClassLoaderObjId, sysSeq++, cid));
-                }
+        graph.setObject(systemClassLoaderObjId, classLoaderClassObjId, classLoaderInstanceSize, 0L, false);
+        {
+            int sysLen = 0;
+            int needed = 1 + pass1.getClasses().size();
+            if (edgeScratch.length < needed) edgeScratch = new int[needed];
+            if (classLoaderClassObjId >= 0) {
+                edgeScratch[sysLen++] = classLoaderClassObjId;
             }
+            // Like MAT, the artificial system class loader only references the ClassLoader class; classes point
+            // at it, not the other way round.
+            graph.setEdges(systemClassLoaderObjId, edgeScratch, sysLen);
         }
 
         for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
@@ -166,23 +203,27 @@ public class Pass2ObjectIngester implements AutoCloseable {
             int classTypeObjId = javaLangClassObjId != -1 ? javaLangClassObjId : classObjId;
             long staticFieldsSize = 0;
             for (var sf : cls.staticFields()) {
-                staticFieldsSize += (sf.type() == HprofConstants.Type.OBJECT) ? idSize : HprofConstants.Type.sizeOf(sf.type(), idSize);
+                staticFieldsSize += (sf.type() == HprofConstants.Type.OBJECT) ? refSize : HprofConstants.Type.sizeOf(sf.type(), idSize);
             }
-            long size = javaLangClassInstanceSize + alignUpToX(staticFieldsSize, 8);
+            long size = alignUpToX(staticFieldsSize, objAlign); // MAT default: statics only (no java.lang.Class instance size)
             writtenObjects.add(classObjId);
             classCounts.addTo(classTypeObjId, 1);
             classTotalSizes.addTo(classTypeObjId, size);
-            objectBatch.add(new HeapStorageEngine.RawObjectRecord(
-                    classObjId, cls.classId(), classTypeObjId, size, 0L, false
-            ));
-            if (objectBatch.size() >= batchSize) {
-                storage.insertObjectsBatch(objectBatch);
-                objectBatch.clear();
-            }
+            graph.setObject(classObjId, classTypeObjId, size, 0L, false);
         }
 
         log.info("Pass 2 Pre-registration complete: classes={}, instances={}, totalExpectedObjects={}",
-                pass1.getClasses().size(), instanceCount, totalExpectedObjects);
+                pass1.getClasses().size(), identifierCount, totalExpectedObjects);
+
+        // Primitive array class lookups, resolved once per element type
+        int[] primClassObjIds = new int[16];
+        Arrays.fill(primClassObjIds, Integer.MIN_VALUE);
+
+        Long2ObjectOpenHashMap<ClassLayout> layouts = new Long2ObjectOpenHashMap<>();
+        long lastClassAddr = Long.MIN_VALUE;
+        ClassLayout lastLayout = null;
+
+        byte[] bytesScratch = new byte[4096];
 
         try (HprofBinaryReader reader = new HprofBinaryReader(file)) {
             reader.readHeader(); // skip header
@@ -236,20 +277,25 @@ public class Pass2ObjectIngester implements AutoCloseable {
                                 if (isFirstClassDump) {
                                     processedClassDumps.add(classObjId);
                                 }
-                                int edgeSeq = 0;
+                                if (edgeScratch.length < sfCount + 3) {
+                                    edgeScratch = new int[sfCount + 3];
+                                }
+                                int len = 0;
                                 if (classObjId != -1 && isFirstClassDump) {
                                     if (javaLangClassObjId != -1) {
-                                        edgeBatch.add(new HeapStorageEngine.ReferenceEdge(classObjId, edgeSeq++, javaLangClassObjId));
+                                        edgeScratch[len++] = javaLangClassObjId;
                                     }
-                                    if (superClassId != 0 && addressToId.containsKey(superClassId)) {
-                                        edgeBatch.add(new HeapStorageEngine.ReferenceEdge(classObjId, edgeSeq++, addressToId.get(superClassId)));
+                                    if (superClassId != 0) {
+                                        int superId = addressToId.get(superClassId);
+                                        if (superId >= 0) {
+                                            edgeScratch[len++] = superId;
+                                        }
                                     }
-                                    int clId = (classLoaderId != 0 && addressToId.containsKey(classLoaderId))
-                                            ? addressToId.get(classLoaderId)
-                                            : systemClassLoaderObjId;
-                                    if (clId >= 0) {
-                                        edgeBatch.add(new HeapStorageEngine.ReferenceEdge(classObjId, edgeSeq++, clId));
+                                    int clId = (classLoaderId != 0) ? addressToId.get(classLoaderId) : -1;
+                                    if (clId < 0) {
+                                        clId = systemClassLoaderObjId;
                                     }
+                                    edgeScratch[len++] = clId;
                                 }
                                 for (int i = 0; i < sfCount; i++) {
                                     reader.skipBytes(idSize); // fieldNameId
@@ -257,14 +303,17 @@ public class Pass2ObjectIngester implements AutoCloseable {
                                     if (t == HprofConstants.Type.OBJECT) {
                                         long refAddr = reader.readId();
                                         if (refAddr != 0 && classObjId != -1 && isFirstClassDump) {
-                                            if (addressToId.containsKey(refAddr)) {
-                                                int targetId = addressToId.get(refAddr);
-                                                edgeBatch.add(new HeapStorageEngine.ReferenceEdge(classObjId, edgeSeq++, targetId));
+                                            int targetId = addressToId.get(refAddr);
+                                            if (targetId >= 0) {
+                                                edgeScratch[len++] = targetId;
                                             }
                                         }
                                     } else {
                                         reader.skipBytes(HprofConstants.Type.sizeOf(t, idSize));
                                     }
+                                }
+                                if (classObjId != -1 && isFirstClassDump) {
+                                    graph.setEdges(classObjId, edgeScratch, len);
                                 }
 
                                 int ifCount = reader.readUnsignedShort();
@@ -277,62 +326,105 @@ public class Pass2ObjectIngester implements AutoCloseable {
                                 reader.skipBytes(4); // stack trace
                                 long classAddr = reader.readId();
                                 int bytesFollow = reader.readInt();
-                                byte[] instanceBytes = reader.readBytes(bytesFollow);
+
+                                ClassLayout layout;
+                                if (classAddr == lastClassAddr) {
+                                    layout = lastLayout;
+                                } else {
+                                    layout = layouts.get(classAddr);
+                                    if (layout == null) {
+                                        layout = buildLayout(classAddr, idSize, javaLangClassObjId, isClass);
+                                        layouts.put(classAddr, layout);
+                                    }
+                                    lastClassAddr = classAddr;
+                                    lastLayout = layout;
+                                }
 
                                 int objId = addressToId.get(objAddr);
-                                if (objId == -1 || writtenObjects.contains(objId)) {
+                                boolean skip = objId == -1 || writtenObjects.contains(objId);
+                                boolean needBytes = !skip && layout.refOffsets.length > 0;
+                                byte[] instanceBytes = null;
+                                if (needBytes) {
+                                    if (bytesScratch.length < bytesFollow) {
+                                        bytesScratch = new byte[Math.max(bytesFollow, bytesScratch.length * 2)];
+                                    }
+                                    reader.readFully(bytesScratch, bytesFollow);
+                                    instanceBytes = bytesScratch;
+                                } else {
+                                    reader.skipBytes(bytesFollow);
+                                }
+                                if (skip) {
                                     continue;
                                 }
 
                                 writtenObjects.add(objId);
-                                int assignedClassId = addressToId.containsKey(classAddr)
-                                        ? addressToId.get(classAddr)
-                                        : (javaLangClassObjId != -1 ? javaLangClassObjId : 0);
-
-                                HeapRecords.ClassRecord clsRecord = pass1.getClasses().get(classAddr);
+                                int assignedClassId = layout.assignedClassObjId;
+                                HeapRecords.ClassRecord clsRecord = layout.record;
                                 long usedSize = (clsRecord != null && clsRecord.instanceSize() > 0)
                                         ? clsRecord.instanceSize()
-                                        : alignUpToX(bytesFollow + (2L * idSize), 8);
+                                        : alignUpToX(bytesFollow + (long) idSize + refSize, objAlign);
                                 classCounts.addTo(assignedClassId, 1);
                                 classTotalSizes.addTo(assignedClassId, usedSize);
-                                objectBatch.add(new HeapStorageEngine.RawObjectRecord(
-                                        objId, objAddr, assignedClassId, usedSize, objPos, false
-                                ));
+                                graph.setObject(objId, assignedClassId, usedSize, objPos, false);
 
-                                int edgeSeq = 0;
+                                int refCapacity = 1 + layout.refOffsets.length;
+                                if (edgeScratch.length < refCapacity) {
+                                    edgeScratch = new int[Math.max(refCapacity, edgeScratch.length * 2)];
+                                }
+                                int len = 0;
                                 if (assignedClassId >= 0) {
-                                    edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, edgeSeq++, assignedClassId));
+                                    edgeScratch[len++] = assignedClassId;
                                 }
 
-                                // Extract outbound references from instance fields by traversing class hierarchy
-                                List<HeapRecords.ClassRecord> hierarchy = resolveClassHierarchy(classAddr);
-                                int offset = 0;
-                                for (HeapRecords.ClassRecord cls : hierarchy) {
-                                    for (HeapRecords.FieldDescriptor field : cls.fields()) {
-                                        int fieldType = field.type();
-                                        int fieldSize = HprofConstants.Type.sizeOf(fieldType, idSize);
-                                        if (offset + fieldSize > instanceBytes.length) {
-                                            break;
-                                        }
-                                        if (fieldType == HprofConstants.Type.OBJECT) {
-                                            long refAddr = readIdFromBytes(instanceBytes, offset, idSize);
-                                            if (refAddr != 0L && addressToId.containsKey(refAddr)) {
+                                if (instanceBytes != null) {
+                                    if (layout.totalFieldBytes <= bytesFollow) {
+                                        // Fast path: complete instance data, precomputed reference offsets
+                                        int[] offsets = layout.refOffsets;
+                                        for (int k = 0; k < offsets.length; k++) {
+                                            long refAddr = idSize == 8
+                                                    ? (long) LONG_BE.get(instanceBytes, offsets[k])
+                                                    : ((int) INT_BE.get(instanceBytes, offsets[k])) & 0xFFFFFFFFL;
+                                            if (refAddr != 0L) {
                                                 int targetId = addressToId.get(refAddr);
-                                                edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, edgeSeq++, targetId));
+                                                if (targetId >= 0) {
+                                                    edgeScratch[len++] = targetId;
+                                                }
                                             }
                                         }
-                                        offset += fieldSize;
+                                    } else {
+                                        // Truncated instance data: replicate the exact field walk of the original parser
+                                        int offset = 0;
+                                        for (HeapRecords.ClassRecord cls : layout.hierarchy) {
+                                            for (HeapRecords.FieldDescriptor field : cls.fields()) {
+                                                int fieldType = field.type();
+                                                int fieldSize = HprofConstants.Type.sizeOf(fieldType, idSize);
+                                                if (offset + fieldSize > bytesFollow) {
+                                                    break;
+                                                }
+                                                if (fieldType == HprofConstants.Type.OBJECT) {
+                                                    long refAddr = readIdFromBytes(instanceBytes, offset, idSize);
+                                                    if (refAddr != 0L) {
+                                                        int targetId = addressToId.get(refAddr);
+                                                        if (targetId >= 0) {
+                                                            edgeScratch[len++] = targetId;
+                                                        }
+                                                    }
+                                                }
+                                                offset += fieldSize;
+                                            }
+                                        }
                                     }
                                 }
-
-                                if (objectBatch.size() >= batchSize) {
-                                    storage.insertObjectsBatch(objectBatch);
-                                    objectBatch.clear();
+                                var locals = threadLocals.get(objId);
+                                if (locals != null) {
+                                    if (edgeScratch.length < len + locals.size()) {
+                                        edgeScratch = Arrays.copyOf(edgeScratch, len + locals.size());
+                                    }
+                                    for (int k = 0; k < locals.size(); k++) {
+                                        edgeScratch[len++] = locals.getInt(k);
+                                    }
                                 }
-                                if (edgeBatch.size() >= batchSize) {
-                                    storage.insertOutboundReferencesBatch(edgeBatch);
-                                    edgeBatch.clear();
-                                }
+                                graph.setEdges(objId, edgeScratch, len);
                             }
 
                             case HprofConstants.DumpSegment.OBJECT_ARRAY_DUMP -> {
@@ -349,38 +441,58 @@ public class Pass2ObjectIngester implements AutoCloseable {
                                 }
 
                                 writtenObjects.add(objId);
-                                int assignedClassId = addressToId.containsKey(elementClassAddr)
-                                        ? addressToId.get(elementClassAddr)
-                                        : 0;
+                                int ec = addressToId.get(elementClassAddr);
+                                int assignedClassId = (ec >= 0 && isClass.get(ec)) ? ec : 0;
 
-                                long usedSize = alignUpToX(2L * idSize + 4 + (long) arrayLength * idSize, 8);
+                                long usedSize = alignUpToX((long) idSize + refSize + 4 + (long) arrayLength * refSize, objAlign);
                                 classCounts.addTo(assignedClassId, 1);
                                 classTotalSizes.addTo(assignedClassId, usedSize);
-                                objectBatch.add(new HeapStorageEngine.RawObjectRecord(
-                                        objId, objAddr, assignedClassId, usedSize, objPos, true
-                                ));
+                                graph.setObject(objId, assignedClassId, usedSize, objPos, true);
 
-                                int edgeSeq = 0;
+                                int len = 0;
                                 if (assignedClassId >= 0) {
-                                    edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, edgeSeq++, assignedClassId));
+                                    edgeScratch[len++] = assignedClassId;
                                 }
 
-                                // Read references
-                                for (int i = 0; i < arrayLength; i++) {
-                                    long refAddr = reader.readId();
-                                    if (refAddr != 0 && addressToId.containsKey(refAddr)) {
-                                        int targetId = addressToId.get(refAddr);
-                                        edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, edgeSeq++, targetId));
+                                // Read references in blocks to bound the transient byte buffer; the edge scratch grows
+                                // with the references actually found, not with the declared length (sparse arrays).
+                                int remaining = arrayLength;
+                                while (remaining > 0) {
+                                    int block = Math.min(remaining, ARRAY_BLOCK);
+                                    if (edgeScratch.length < len + block + 1) {
+                                        edgeScratch = Arrays.copyOf(edgeScratch, Math.max(len + block + 1, edgeScratch.length * 2));
                                     }
+                                    int blockBytes = block * idSize;
+                                    if (bytesScratch.length < blockBytes) {
+                                        bytesScratch = new byte[Math.max(blockBytes, bytesScratch.length * 2)];
+                                    }
+                                    reader.readFully(bytesScratch, blockBytes);
+                                    if (idSize == 8) {
+                                        for (int i = 0, p = 0; i < block; i++, p += 8) {
+                                            long refAddr = (long) LONG_BE.get(bytesScratch, p);
+                                            if (refAddr != 0) {
+                                                int targetId = addressToId.get(refAddr);
+                                                if (targetId >= 0) {
+                                                    edgeScratch[len++] = targetId;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        for (int i = 0, p = 0; i < block; i++, p += 4) {
+                                            long refAddr = ((int) INT_BE.get(bytesScratch, p)) & 0xFFFFFFFFL;
+                                            if (refAddr != 0) {
+                                                int targetId = addressToId.get(refAddr);
+                                                if (targetId >= 0) {
+                                                    edgeScratch[len++] = targetId;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    remaining -= block;
                                 }
-
-                                if (objectBatch.size() >= batchSize) {
-                                    storage.insertObjectsBatch(objectBatch);
-                                    objectBatch.clear();
-                                }
-                                if (edgeBatch.size() >= batchSize) {
-                                    storage.insertOutboundReferencesBatch(edgeBatch);
-                                    edgeBatch.clear();
+                                graph.setEdges(objId, edgeScratch, len);
+                                if (edgeScratch.length > (1 << 20)) {
+                                    edgeScratch = new int[1024];
                                 }
                             }
 
@@ -399,30 +511,26 @@ public class Pass2ObjectIngester implements AutoCloseable {
                                 }
 
                                 writtenObjects.add(objId);
-                                long primClassAddr = pass1.getPrimitiveArrayClassId(elementType);
-                                int assignedClassId = addressToId.containsKey(primClassAddr)
-                                        ? addressToId.get(primClassAddr)
-                                        : 0;
+                                int assignedClassId;
+                                if (elementType >= 0 && elementType < primClassObjIds.length) {
+                                    assignedClassId = primClassObjIds[elementType];
+                                    if (assignedClassId == Integer.MIN_VALUE) {
+                                        int pid = addressToId.get(pass1.getPrimitiveArrayClassId(elementType));
+                                        assignedClassId = (pid >= 0 && isClass.get(pid)) ? pid : 0;
+                                        primClassObjIds[elementType] = assignedClassId;
+                                    }
+                                } else {
+                                    int pid = addressToId.get(pass1.getPrimitiveArrayClassId(elementType));
+                                    assignedClassId = (pid >= 0 && isClass.get(pid)) ? pid : 0;
+                                }
 
-                                long usedSize = alignUpToX(alignUpToX(2L * idSize + 4, idSize) + (long) arrayLength * elementSize, 8);
+                                long usedSize = alignUpToX(alignUpToX((long) idSize + refSize + 4, refSize) + (long) arrayLength * elementSize, objAlign);
                                 classCounts.addTo(assignedClassId, 1);
                                 classTotalSizes.addTo(assignedClassId, usedSize);
-                                objectBatch.add(new HeapStorageEngine.RawObjectRecord(
-                                        objId, objAddr, assignedClassId, usedSize, objPos, true
-                                ));
+                                graph.setObject(objId, assignedClassId, usedSize, objPos, true);
 
-                                if (assignedClassId >= 0) {
-                                    edgeBatch.add(new HeapStorageEngine.ReferenceEdge(objId, 0, assignedClassId));
-                                }
-
-                                if (objectBatch.size() >= batchSize) {
-                                    storage.insertObjectsBatch(objectBatch);
-                                    objectBatch.clear();
-                                }
-                                if (edgeBatch.size() >= batchSize) {
-                                    storage.insertOutboundReferencesBatch(edgeBatch);
-                                    edgeBatch.clear();
-                                }
+                                edgeScratch[0] = assignedClassId;
+                                graph.setEdges(objId, edgeScratch, 1);
                             }
 
                             default -> throw new IOException("Unknown subtag: " + subTag);
@@ -433,60 +541,171 @@ public class Pass2ObjectIngester implements AutoCloseable {
                 }
             }
         }
+        long tParsed = System.currentTimeMillis();
+        log.info("Pass 2 parse complete in {} ms: {} objects, {} edges", tParsed - tStart,
+                writtenObjects.size(), graph.edgeCount());
 
-        // Flush remaining batches
-        if (!objectBatch.isEmpty()) {
-            storage.insertObjectsBatch(objectBatch);
-            objectBatch.clear();
+        // Old object ID -> class record, for statistics and the unreachable-objects histogram
+        it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<HeapRecords.ClassRecord> classByOldId = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
+        for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
+            int oid = addressToId.get(cls.classId());
+            if (oid >= 0) {
+                classByOldId.put(oid, cls);
+            }
         }
-        if (!edgeBatch.isEmpty()) {
-            storage.insertOutboundReferencesBatch(edgeBatch);
-            edgeBatch.clear();
+
+        // MAT's default: objects that cannot be reached from a GC root are removed and the remaining IDs are
+        // renumbered (-Ddhp.keep.unreachable=true keeps them instead, as MAT does with keep_unreachable_objects).
+        StringBuilder unreachableHistogram = new StringBuilder();
+        if (!Boolean.getBoolean("dhp.keep.unreachable")) {
+            int[] rootIds = rootIdsOf(resolvedRoots, totalExpectedObjects);
+            java.util.BitSet reachable = new java.util.BitSet(totalExpectedObjects);
+            int reachableCount = org.eclipse.mat.dhp.core.graph.UnreachableRoots.mark(graph, totalExpectedObjects, reachable, rootIds, rootIds.length);
+            if (reachableCount < totalExpectedObjects) {
+                it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap removedCount = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
+                it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap removedSize = new it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap();
+                for (int old = reachable.nextClearBit(0); old >= 0 && old < totalExpectedObjects; old = reachable.nextClearBit(old + 1)) {
+                    int cid = graph.classObjId(old);
+                    long sz = graph.usedSize(old);
+                    classCounts.addTo(cid, -1);
+                    classTotalSizes.addTo(cid, -sz);
+                    removedCount.addTo(cid, 1);
+                    removedSize.addTo(cid, sz);
+                }
+                int[] removedClassIds = removedCount.keySet().toIntArray();
+                Arrays.sort(removedClassIds);
+                for (int cid : removedClassIds) {
+                    HeapRecords.ClassRecord cr = classByOldId.get(cid);
+                    unreachableHistogram.append(cr != null ? cr.classId() : 0L).append(',')
+                            .append(removedCount.get(cid)).append(',').append(removedSize.get(cid)).append(',')
+                            .append(cr != null ? cr.name() : "unknown").append('\n');
+                }
+                log.info("Removing {} unreachable objects (MAT default) ...", totalExpectedObjects - reachableCount);
+                graph.compact(reachable);
+            }
         }
+        final int finalObjectCount = graph.objectCount();
+
+        // Resolved GC roots with the final object IDs
+        List<HeapRecords.GcRootRecord> finalRoots = new ArrayList<>(resolvedRoots.size());
+        for (var r : resolvedRoots) {
+            int oid = r.objectId() >= 0 ? graph.newIdOf(r.objectId()) : -1;
+            int tid = r.threadObjectId() >= 0 ? graph.newIdOf(r.threadObjectId()) : -1;
+            finalRoots.add(new HeapRecords.GcRootRecord(oid, r.objectAddress(), r.referrerAddress(), r.rootType(), r.threadAddress(), tid));
+        }
+        graph.setGcRoots(finalRoots);
 
         // Save precomputed class stats and pre-resolved class hierarchy
         try {
-            List<HeapStorageEngine.ClassStats> statsList = new ArrayList<>(classCounts.size());
-            for (var entry : classCounts.int2IntEntrySet()) {
-                int cid = entry.getIntKey();
-                statsList.add(new HeapStorageEngine.ClassStats(cid, entry.getIntValue(), classTotalSizes.get(cid)));
+            List<HeapRecords.ClassRecord> keptClasses = new ArrayList<>(pass1.getClasses().size());
+            for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
+                if (graph.newIdOf(addressToId.get(cls.classId())) >= 0) {
+                    keptClasses.add(cls);
+                }
+            }
+            storage.saveClasses(keptClasses);
+            storage.insertGcRootsBatch(finalRoots);
+
+            List<HeapStorageEngine.ClassStats> statsList = new ArrayList<>();
+            long totalHeap = 0;
+            int[] statClassIds = classCounts.keySet().toIntArray();
+            Arrays.sort(statClassIds);
+            for (int cid : statClassIds) {
+                if (classCounts.get(cid) > 0) {
+                    statsList.add(new HeapStorageEngine.ClassStats(graph.newIdOf(cid), classCounts.get(cid), classTotalSizes.get(cid)));
+                }
+                totalHeap += classTotalSizes.get(cid);
             }
             storage.saveClassStats(statsList);
 
-            List<HeapStorageEngine.ResolvedClassMetadata> resolvedClasses = new ArrayList<>(pass1.getClasses().size());
-            for (HeapRecords.ClassRecord cls : pass1.getClasses().values()) {
-                int classObjId = addressToId.get(cls.classId());
-                int superObjId = cls.superClassId() != 0 ? addressToId.get(cls.superClassId()) : -1;
-                int loaderObjId = cls.classLoaderId() != 0 ? addressToId.get(cls.classLoaderId()) : 0;
+            List<HeapStorageEngine.ResolvedClassMetadata> resolvedClasses = new ArrayList<>(keptClasses.size());
+            for (HeapRecords.ClassRecord cls : keptClasses) {
+                int classObjId = graph.newIdOf(addressToId.get(cls.classId()));
+                int superObjId = cls.superClassId() != 0 ? graph.newIdOf(addressToId.get(cls.superClassId())) : -1;
+                int loaderObjId = graph.newIdOf(cls.classLoaderId() != 0 ? addressToId.get(cls.classLoaderId()) : systemClassLoaderObjId);
                 long staticFieldsSize = 0;
                 for (var sf : cls.staticFields()) {
-                    staticFieldsSize += (sf.type() == HprofConstants.Type.OBJECT) ? idSize : HprofConstants.Type.sizeOf(sf.type(), idSize);
+                    staticFieldsSize += (sf.type() == HprofConstants.Type.OBJECT) ? refSize : HprofConstants.Type.sizeOf(sf.type(), idSize);
                 }
-                long size = javaLangClassInstanceSize + alignUpToX(staticFieldsSize, 8);
+                long size = alignUpToX(staticFieldsSize, objAlign); // MAT default: statics only (no java.lang.Class instance size)
                 resolvedClasses.add(new HeapStorageEngine.ResolvedClassMetadata(cls.classId(), classObjId, superObjId, loaderObjId, size));
             }
             storage.updateClassesMetadata(resolvedClasses);
 
+            storage.saveSnapshotInfo("totalHeapSize", String.valueOf(totalHeap));
+            storage.saveSnapshotInfo("numberOfOutboundReferences", String.valueOf(graph.edgeCount()));
+            storage.saveSnapshotInfo("refSize", String.valueOf(refSize));
+            storage.saveSnapshotInfo("objectAlign", String.valueOf(objAlign));
+            storage.saveSnapshotInfo("unreachableHistogram", unreachableHistogram.toString());
+
+            storage.saveObjects(graph);
+            storage.saveOutboundEdges(graph);
             storage.finishIngestion();
         } catch (SQLException e) {
-            throw new IOException("Failed to run database indexing", e);
+            throw new IOException("Failed to persist ingested heap graph", e);
         }
-        log.info("Pass 2 Completed: Ingested objects in database (writtenObjects={}).", writtenObjects.size());
+        try {
+            String dumpName = file.getName();
+            int dot = dumpName.lastIndexOf('.');
+            File threads = new File(file.getAbsoluteFile().getParentFile(), (dot > 0 ? dumpName.substring(0, dot) : dumpName) + ".threads");
+            if (pass1.writeThreadsFile(threads)) {
+                log.info("Wrote thread stacks to {}", threads);
+            }
+        } catch (IOException e) {
+            log.warn("Could not write thread stacks: {}", e.getMessage());
+        }
+        graph.releaseObjectColumns();
+        graph.releaseUsedSizes();
+        log.info("Pass 2 Completed in {} ms (parse {} ms, persist {} ms): objects={}",
+                System.currentTimeMillis() - tStart, tParsed - tStart, System.currentTimeMillis() - tParsed,
+                writtenObjects.size());
+        return graph;
     }
 
-    private List<HeapRecords.ClassRecord> resolveClassHierarchy(long classId) {
-        List<HeapRecords.ClassRecord> cached = classHierarchyCache.get(classId);
-        if (cached != null) return cached;
+    private static int[] rootIdsOf(List<HeapRecords.GcRootRecord> roots, int n) {
+        java.util.BitSet seen = new java.util.BitSet(n);
+        it.unimi.dsi.fastutil.ints.IntArrayList list = new it.unimi.dsi.fastutil.ints.IntArrayList();
+        for (var r : roots) {
+            int id = r.objectId();
+            if (id >= 0 && id < n && r.threadAddress() == 0 && !seen.get(id)) {
+                seen.set(id);
+                list.add(id);
+            }
+        }
+        return list.toIntArray();
+    }
 
+    private ClassLayout buildLayout(long classAddr, int idSize, int javaLangClassObjId, java.util.BitSet isClass) {
+        HeapRecords.ClassRecord record = pass1.getClasses().get(classAddr);
         List<HeapRecords.ClassRecord> hierarchy = new ArrayList<>();
-        HeapRecords.ClassRecord curr = pass1.getClasses().get(classId);
+        HeapRecords.ClassRecord curr = record;
         while (curr != null) {
             hierarchy.add(curr);
             if (curr.superClassId() == 0L) break;
             curr = pass1.getClasses().get(curr.superClassId());
         }
-        classHierarchyCache.put(classId, hierarchy);
-        return hierarchy;
+        int assigned = addressToId.get(classAddr);
+        if (assigned < 0 || !isClass.get(assigned)) {
+            assigned = javaLangClassObjId != -1 ? javaLangClassObjId : 0;
+        }
+        int offset = 0;
+        int refs = 0;
+        for (HeapRecords.ClassRecord cls : hierarchy) {
+            for (HeapRecords.FieldDescriptor f : cls.fields()) {
+                if (f.type() == HprofConstants.Type.OBJECT) refs++;
+            }
+        }
+        int[] refOffsets = new int[refs];
+        int r = 0;
+        for (HeapRecords.ClassRecord cls : hierarchy) {
+            for (HeapRecords.FieldDescriptor f : cls.fields()) {
+                if (f.type() == HprofConstants.Type.OBJECT) {
+                    refOffsets[r++] = offset;
+                }
+                offset += HprofConstants.Type.sizeOf(f.type(), idSize);
+            }
+        }
+        return new ClassLayout(record, hierarchy, assigned, refOffsets, offset);
     }
 
     private static long readIdFromBytes(byte[] bytes, int offset, int idSize) {
@@ -504,6 +723,11 @@ public class Pass2ObjectIngester implements AutoCloseable {
 
     public IAddressToIdMap getAddressToId() {
         return addressToId;
+    }
+
+    /** The graph built by the last {@link #ingest(File)} call. */
+    public HeapGraph getGraph() {
+        return graph;
     }
 
     @Override

@@ -52,16 +52,14 @@ public final class ResourceEstimator {
         long recommendedMinHeapBytes = roundUpHeap(estimatedPeakHeapBytes);
         String recommendedXmx = formatXmx(recommendedMinHeapBytes);
 
-        // 2. Disk Space Calculation (SQLite Database + WAL + B-Tree Indexes)
-        // - dhp_objects: N * 40 bytes
-        // - dhp_outbound_references & dhp_inbound_references: ~2.5 * N * 20 bytes = 50 * N bytes
-        // - dhp_dominator_tree: N * 16 bytes
-        // - B-Tree indexes: ~1.2x table size
-        // - Total DB file: ~ N * 230 bytes
-        // - WAL buffer headroom during bulk indexing: +50%
-        long baseDiskBytes = (n * 230L) + (classCount * 1024L) + (100L * 1024 * 1024);
-        // Also ensure it is scaled if HPROF file has massive payloads
-        long estimatedDiskBytes = Math.max(baseDiskBytes, (long) (hprofSizeBytes * 1.25));
+        // 2. Disk Space Calculation (SQLite chunked blob store, measured: ~113 bytes per object at ~2.5 edges/object)
+        // - object columns (address, class, size, file position, flags): ~28 bytes
+        // - outbound + inbound reference lists: ~2 * (2.5 * 4 + 4) = 28 bytes
+        // - dominator, retained size, dominated lists, class instance lists: ~28 bytes
+        // - page fill overhead: ~1.3x
+        long baseDiskBytes = (n * 135L) + (classCount * 1024L) + (100L * 1024 * 1024);
+        // Bulk ingestion runs without a journal, so there is no WAL headroom to add.
+        long estimatedDiskBytes = baseDiskBytes;
 
         String banner = buildBanner(hprofSizeBytes, uniqueObjectCount, classCount, gcRootCount,
                 estimatedPeakHeapBytes, recommendedXmx, estimatedDiskBytes);
@@ -124,7 +122,7 @@ public final class ResourceEstimator {
         sb.append("*\n");
         sb.append(String.format("* Estimated Peak JVM Heap:  %s\n", formatSize(estimatedPeakHeap)));
         sb.append(String.format("* RECOMMENDED MINIMUM HEAP: %s (with 35%% safety headroom)\n", recommendedXmx));
-        sb.append(String.format("* RECOMMENDED FREE DISK:    %s (Database + Indexes + WAL)\n", formatSize(estimatedDisk)));
+        sb.append(String.format("* RECOMMENDED FREE DISK:    %s (chunked database)\n", formatSize(estimatedDisk)));
         sb.append(line);
         return sb.toString();
     }

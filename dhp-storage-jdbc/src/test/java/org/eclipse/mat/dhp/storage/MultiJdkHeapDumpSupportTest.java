@@ -34,13 +34,13 @@ class MultiJdkHeapDumpSupportTest {
 
             storage.initializeSchema();
             Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor);
-            ingester.ingest(dumpFile);
+            var graph = ingester.ingest(dumpFile);
 
             assertThat(storage.getObjectCount()).isGreaterThan(1000);
             assertThat(storage.getAllClasses()).isNotEmpty();
 
             DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
-            domEngine.computeAndStore();
+            domEngine.computeAndStore(graph);
         }
     }
 
@@ -68,12 +68,12 @@ class MultiJdkHeapDumpSupportTest {
 
             storage.initializeSchema();
             Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor);
-            ingester.ingest(dumpFile);
+            var graph = ingester.ingest(dumpFile);
 
             assertThat(storage.getObjectCount()).isGreaterThan(1000);
 
             DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
-            domEngine.computeAndStore();
+            domEngine.computeAndStore(graph);
             assertThat(storage.getRetainedSize(0)).isGreaterThanOrEqualTo(0);
         }
     }
@@ -102,12 +102,12 @@ class MultiJdkHeapDumpSupportTest {
 
             storage.initializeSchema();
             Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor);
-            ingester.ingest(dumpFile);
+            var graph = ingester.ingest(dumpFile);
 
             assertThat(storage.getObjectCount()).isGreaterThan(1000);
 
             DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
-            domEngine.computeAndStore();
+            domEngine.computeAndStore(graph);
             assertThat(storage.getRetainedSize(0)).isGreaterThanOrEqualTo(0);
         }
     }

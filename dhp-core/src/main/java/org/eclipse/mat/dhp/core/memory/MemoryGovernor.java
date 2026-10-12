@@ -105,6 +105,26 @@ public final class MemoryGovernor {
         return new BitSetMembershipSet(estimatedObjects);
     }
 
+    /** Parses sizes such as 512M, 2G, 4GB, 1.5G or a raw byte count (K/M/G suffixes are powers of 1024). */
+    public static long parseSize(String val) {
+        if (val == null || val.isBlank()) return 0L;
+        val = val.trim().toUpperCase();
+        long multiplier = 1L;
+        String numStr = val;
+        if (val.endsWith("GB") || val.endsWith("G")) {
+            multiplier = 1024L * 1024L * 1024L;
+        } else if (val.endsWith("MB") || val.endsWith("M")) {
+            multiplier = 1024L * 1024L;
+        } else if (val.endsWith("KB") || val.endsWith("K")) {
+            multiplier = 1024L;
+        }
+        numStr = val.replaceAll("[^0-9.]", "");
+        if (numStr.contains(".")) {
+            return (long) (Double.parseDouble(numStr) * multiplier);
+        }
+        return Long.parseLong(numStr) * multiplier;
+    }
+
     public long getTotalAllocatedBytes() {
         return totalAllocatedBytes;
     }

@@ -1,20 +1,22 @@
 package org.eclipse.mat.dhp.core.graph;
 
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.SQLException;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.BitSet;
 
 /**
- * Computes dominator tree relationships and retained sizes
- * using the Lengauer-Tarjan algorithm and bottom-up retained size accumulation,
- * persisting results directly into the database.
+ * Computes dominator tree relationships and retained sizes using the Lengauer-Tarjan algorithm and bottom-up
+ * retained size accumulation on the in-memory {@link HeapGraph}, persisting inbound references and dominator
+ * results through the storage engine.
+ *
+ * <p>Memory is managed in stages so that the peak stays well below the sum of all structures: the outbound edge
+ * log is released as soon as the DFS is done, the inbound CSR as soon as the semi-dominator pass is done, and the
+ * shallow-size column is only reloaded for the final accumulation.</p>
  */
 public class DominatorTreeEngine {
     private static final Logger log = LoggerFactory.getLogger(DominatorTreeEngine.class);
@@ -25,47 +27,72 @@ public class DominatorTreeEngine {
         this.storage = storage;
     }
 
-    public void computeAndStore() throws SQLException {
+    public void computeAndStore(HeapGraph graph) throws SQLException {
         log.info("Starting Lengauer-Tarjan Dominator Tree & Retained Size computation...");
+        long t0 = System.currentTimeMillis();
 
-        int objectCount = storage.getObjectCount();
-        if (objectCount == 0) return;
+        int n = graph.objectCount();
+        if (n == 0) return;
 
-        int n = objectCount;
         int superRoot = n; // Artificial super root index
         int totalVertices = n + 2; // Supports 1-indexed vertex array up to n + 1
 
-        // 1. Load outbound CSR and shallow sizes directly into retainedSizes buffer
-        CsrGraph outGraph = storage.loadOutboundCsr(n);
-        long[] retainedSizes = storage.loadAllObjectUsedSizes(n);
-
-        // 2. Collect unique GC root object IDs
-        Set<Integer> gcRootsSet = new LinkedHashSet<>();
-        for (var root : storage.getGcRoots()) {
-            int rootId = root.objectId() >= 0 ? root.objectId() : storage.getObjectIdByAddress(root.objectAddress());
-            if (rootId >= 0 && rootId < n) {
-                gcRootsSet.add(rootId);
+        // 1. Collect unique GC root object IDs
+        BitSet rootSeen = new BitSet(n);
+        IntArrayList rootList = new IntArrayList();
+        for (var root : graph.gcRoots()) {
+            int rootId = root.objectId();
+            // Roots of a known thread (stack locals) are reached through the thread object, as in MAT
+            if (rootId >= 0 && rootId < n && root.threadAddress() == 0 && !rootSeen.get(rootId)) {
+                rootSeen.set(rootId);
+                rootList.add(rootId);
             }
         }
-        int[] gcRootIds = gcRootsSet.stream().mapToInt(Integer::intValue).toArray();
+        rootSeen = null;
+        int[] gcRootIds = rootList.toIntArray();
         log.info("Collected {} unique GC root objects for dominator analysis", gcRootIds.length);
 
-        // 3. Build inHead and inTo CSR graph (with superRoot as predecessor to all GC roots)
+        // Like MAT, keep unreachable objects by promoting some of them to artificial roots
+        long tu = System.currentTimeMillis();
+        int[] extraRoots = UnreachableRoots.findExtraRoots(graph, n, gcRootIds);
+        if (extraRoots.length > 0) {
+            int[] all = java.util.Arrays.copyOf(gcRootIds, gcRootIds.length + extraRoots.length);
+            System.arraycopy(extraRoots, 0, all, gcRootIds.length, extraRoots.length);
+            gcRootIds = all;
+            java.util.List<org.eclipse.mat.dhp.core.model.HeapRecords.GcRootRecord> records = new java.util.ArrayList<>(extraRoots.length);
+            for (int id : extraRoots) {
+                records.add(new org.eclipse.mat.dhp.core.model.HeapRecords.GcRootRecord(
+                        id, 0L /* resolved from the stored address column */, 0L, org.eclipse.mat.dhp.core.model.HprofConstants.ROOT_UNREACHABLE, 0L, -1));
+            }
+            storage.appendGcRoots(records);
+        }
+        log.info("Unreachable-object roots: {} extra roots in {} ms", extraRoots.length, System.currentTimeMillis() - tu);
+
+        int[] starts = graph.rawStarts();
+        int[][] chunks = graph.rawChunks();
+        final int shift = HeapGraph.RAW_CHUNK_SHIFT;
+        final int mask = HeapGraph.RAW_CHUNK_MASK;
+
+        // 2. Build inHead and inTo CSR graph (with superRoot as predecessor to all GC roots)
         int[] inHead = new int[n + 1];
         for (int u = 0; u < n; u++) {
-            int start = outGraph.edgeStart(u);
-            int end = outGraph.edgeEnd(u);
-            for (int e = start; e < end; e++) {
-                int v = outGraph.to()[e];
-                if (v >= 0 && v < n) {
-                    inHead[v + 1]++;
+            int s = starts[u];
+            if (s > 0) {
+                int[] c = chunks[s >>> shift];
+                int off = s & mask;
+                int end = off + c[off];
+                for (int e = off + 1; e <= end; e++) {
+                    int v = c[e];
+                    if (v >= 0 && v < n) inHead[v + 1]++;
+                }
+            } else if (s < 0) {
+                for (int v : graph.hugeEdgesOf(u)) {
+                    if (v >= 0 && v < n) inHead[v + 1]++;
                 }
             }
         }
         for (int r : gcRootIds) {
-            if (r >= 0 && r < n) {
-                inHead[r + 1]++;
-            }
+            inHead[r + 1]++;
         }
         for (int i = 0; i < n; i++) {
             inHead[i + 1] += inHead[i];
@@ -73,47 +100,46 @@ public class DominatorTreeEngine {
         int totalInEdges = inHead[n];
         int[] inTo = new int[totalInEdges];
 
-        // Allocate scratch arrays (reused across phases to bound memory footprint)
+        // Scratch arrays (reused across phases to bound the memory footprint)
         int[] dfsStack = new int[totalVertices];
         int[] edgePos = new int[totalVertices];
 
-        // Temporarily reuse dfsStack as inPos
+        // Temporarily reuse dfsStack as the insertion cursor of each inbound list
         int[] inPos = dfsStack;
         System.arraycopy(inHead, 0, inPos, 0, n);
-
         for (int r : gcRootIds) {
-            if (r >= 0 && r < n) {
-                inTo[inPos[r]++] = superRoot;
-            }
+            inTo[inPos[r]++] = superRoot;
         }
         for (int u = 0; u < n; u++) {
-            int start = outGraph.edgeStart(u);
-            int end = outGraph.edgeEnd(u);
-            for (int e = start; e < end; e++) {
-                int v = outGraph.to()[e];
-                if (v >= 0 && v < n) {
-                    inTo[inPos[v]++] = u;
+            int s = starts[u];
+            if (s > 0) {
+                int[] c = chunks[s >>> shift];
+                int off = s & mask;
+                int end = off + c[off];
+                for (int e = off + 1; e <= end; e++) {
+                    int v = c[e];
+                    if (v >= 0 && v < n) inTo[inPos[v]++] = u;
+                }
+            } else if (s < 0) {
+                for (int v : graph.hugeEdgesOf(u)) {
+                    if (v >= 0 && v < n) inTo[inPos[v]++] = u;
                 }
             }
         }
-        // Reset dfsStack before DFS traversal
         Arrays.fill(dfsStack, 0);
+        long t1 = System.currentTimeMillis();
+        log.info("Inbound CSR built: {} edges in {} ms", totalInEdges, t1 - t0);
 
-        // 4. Lengauer-Tarjan structures
+        // Persist inbound references (superRoot entries are artificial and skipped)
+        storage.saveInboundEdges(inHead, inTo, n, superRoot);
+        long t2 = System.currentTimeMillis();
+        log.info("Inbound references persisted in {} ms", t2 - t1);
+
+        // 3. Iterative DFS from superRoot
         int[] semi = new int[totalVertices];
         int[] vertex = new int[totalVertices];
         int[] parent = new int[totalVertices];
-        int[] ancestor = new int[totalVertices];
-        int[] label = new int[totalVertices];
-        int[] dom = new int[totalVertices];
 
-        Arrays.fill(ancestor, -1);
-        Arrays.fill(dom, -1);
-        for (int i = 0; i < totalVertices; i++) {
-            label[i] = i;
-        }
-
-        // 5. Iterative DFS from superRoot
         int top = 0;
         dfsStack[0] = superRoot;
         edgePos[0] = 0;
@@ -133,10 +159,18 @@ public class DominatorTreeEngine {
                     w = gcRootIds[e];
                 }
             } else {
-                int start = outGraph.edgeStart(u);
-                int end = outGraph.edgeEnd(u);
-                if (start + e < end) {
-                    w = outGraph.to()[start + e];
+                int s = starts[u];
+                if (s > 0) {
+                    int[] c = chunks[s >>> shift];
+                    int off = s & mask;
+                    if (e < c[off]) {
+                        w = c[off + 1 + e];
+                    }
+                } else if (s < 0) {
+                    int[] huge = graph.hugeEdgesOf(u);
+                    if (e < huge.length) {
+                        w = huge[e];
+                    }
                 }
             }
 
@@ -153,12 +187,24 @@ public class DominatorTreeEngine {
                 top--;
             }
         }
-        log.info("DFS complete: reached {} of {} heap objects from GC roots", dfsCount - 1, n);
+        long t3 = System.currentTimeMillis();
+        log.info("DFS complete: reached {} of {} heap objects from GC roots in {} ms", dfsCount - 1, n, t3 - t2);
 
-        // Outbound graph is no longer needed: release memory immediately
-        outGraph = null;
+        // The outbound graph is no longer needed: release memory immediately
+        starts = null;
+        chunks = null;
+        graph.releaseEdges();
 
-        // 6. Lengauer-Tarjan algorithm: compute semi-dominators and dominators
+        // 4. Lengauer-Tarjan: compute semi-dominators and dominators
+        int[] ancestor = new int[totalVertices];
+        int[] label = new int[totalVertices];
+        int[] dom = new int[totalVertices];
+        Arrays.fill(ancestor, -1);
+        Arrays.fill(dom, -1);
+        for (int i = 0; i < totalVertices; i++) {
+            label[i] = i;
+        }
+
         // Reuse dfsStack and edgePos for bucketHead and bucketNext
         int[] bucketHead = dfsStack;
         int[] bucketNext = edgePos;
@@ -205,12 +251,16 @@ public class DominatorTreeEngine {
             }
         }
         dom[superRoot] = -1;
+        long t4 = System.currentTimeMillis();
+        log.info("Semi-dominator / dominator pass finished in {} ms", t4 - t3);
 
-        // Inbound graph is no longer needed: release memory immediately
+        // Inbound graph and DFS scratch are no longer needed: release memory immediately
         inHead = null;
         inTo = null;
+        vertex = null;
+        parent = null;
 
-        // 7. Retained size calculation: build dominator tree children and post-order traversal
+        // 5. Retained size calculation: build dominator tree children and post-order traversal
         // Reuse ancestor and label for domHead and domNext
         int[] domHead = ancestor;
         int[] domNext = label;
@@ -225,6 +275,8 @@ public class DominatorTreeEngine {
                 }
             }
         }
+
+        long[] retainedSizes = storage.loadAllObjectUsedSizes(n);
 
         // Reuse bucketHead and bucketNext for postStack and childPointer
         int[] postStack = bucketHead;
@@ -253,26 +305,29 @@ public class DominatorTreeEngine {
             }
         }
 
-        // 8. Batch save dominator tree to database
-        int batchSize = 50000;
-        List<HeapStorageEngine.DominatorNode> nodes = new ArrayList<>(batchSize);
+        // Final immediate dominator per object (-1 for top-level / unreachable objects)
         for (int i = 0; i < n; i++) {
-            int d = (semi[i] > 0 && dom[i] != superRoot) ? dom[i] : -1;
-            nodes.add(new HeapStorageEngine.DominatorNode(i, d, retainedSizes[i]));
-            if (nodes.size() >= batchSize) {
-                storage.saveDominatorTreeBatch(nodes);
-                nodes.clear();
-            }
+            dom[i] = (semi[i] > 0 && dom[i] != superRoot) ? dom[i] : -1;
         }
-        if (!nodes.isEmpty()) {
-            storage.saveDominatorTreeBatch(nodes);
-            nodes.clear();
-        }
+        long t5 = System.currentTimeMillis();
+        log.info("Retained sizes accumulated in {} ms", t5 - t4);
 
-        // Build Dominator Tree bulk indexes
-        storage.finishDominatorTree();
+        semi = null;
+        ancestor = null;
+        label = null;
+        domHead = null;
+        domNext = null;
+        bucketHead = null;
+        bucketNext = null;
+        postStack = null;
+        childPointer = null;
+        dfsStack = null;
+        edgePos = null;
 
-        log.info("Lengauer-Tarjan Dominator tree and retained sizes successfully persisted for {} objects.", n);
+        // 6. Persist dominator tree
+        storage.saveDominators(dom, retainedSizes, n);
+        log.info("Lengauer-Tarjan Dominator tree and retained sizes successfully persisted for {} objects in {} ms (total {} ms).",
+                n, System.currentTimeMillis() - t5, System.currentTimeMillis() - t0);
     }
 
     private int[] compressStack = new int[128];

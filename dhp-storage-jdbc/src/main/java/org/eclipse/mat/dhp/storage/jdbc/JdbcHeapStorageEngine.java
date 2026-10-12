@@ -1,6 +1,5 @@
 package org.eclipse.mat.dhp.storage.jdbc;
 
-import org.eclipse.mat.dhp.core.graph.CsrGraph;
 import org.eclipse.mat.dhp.core.model.HeapRecords;
 import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
 import org.slf4j.Logger;
@@ -64,6 +63,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     private void configureSqlite(long memoryBudgetBytes) throws SQLException {
         try (Statement stmt = connection.createStatement()) {
+            stmt.execute("PRAGMA page_size = 16384;"); // only effective on a fresh database
             stmt.execute("PRAGMA journal_mode = WAL;");
             stmt.execute("PRAGMA synchronous = NORMAL;");
             // Set cache size: negative number indicates KiB (cap at 128 MB to preserve OS RAM)
@@ -75,6 +75,18 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             stmt.execute("PRAGMA threads = 4;");
         }
         log.info("Configured SQLite for high performance bounded WAL ingestion with safe temp_store=FILE");
+    }
+
+    /** Journal mode cannot change inside a transaction, so switch to autocommit around the pragmas. */
+    private void setJournalPragmas(String journalMode, String synchronous) throws SQLException {
+        connection.commit();
+        connection.setAutoCommit(true);
+        try (Statement stmt = connection.createStatement()) {
+            stmt.execute("PRAGMA journal_mode = " + journalMode + ";");
+            stmt.execute("PRAGMA synchronous = " + synchronous + ";");
+        } finally {
+            connection.setAutoCommit(false);
+        }
     }
 
     private void configurePostgres() throws SQLException {
@@ -102,12 +114,9 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     public void dropExistingTables() throws SQLException {
         log.info("Dropping existing DHP tables cleanly...");
         String[] tables = {
-            "dhp_dominator_tree",
-            "dhp_outbound_references",
-            "dhp_inbound_references",
+            "dhp_chunks",
             "dhp_gc_roots",
             "dhp_class_stats",
-            "dhp_objects",
             "dhp_classes",
             "dhp_snapshot_info"
         };
@@ -123,6 +132,11 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public void initializeSchema() throws SQLException {
         String unlogged = isPostgres ? "UNLOGGED " : "";
+        if (isSqlite) {
+            // Bulk load: a crashed ingestion is simply redone, so skip the journal and fsyncs (every page is
+            // written once instead of twice). saveDominators() restores WAL once the data is complete.
+            setJournalPragmas("OFF", "OFF");
+        }
         try (Statement stmt = connection.createStatement()) {
             stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_snapshot_info (" +
                     "property_key VARCHAR(128) PRIMARY KEY, " +
@@ -149,25 +163,10 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     "total_size BIGINT NOT NULL" +
                     ");");
 
-            // Bulk ingestion tables: NO PRIMARY KEYS or secondary indexes upfront
-            stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_objects (" +
-                    "object_id INT NOT NULL, " +
-                    "object_address BIGINT NOT NULL, " +
-                    "class_id BIGINT NOT NULL, " +
-                    "used_size BIGINT NOT NULL, " +
-                    "file_position BIGINT NOT NULL, " +
-                    "is_array SMALLINT NOT NULL DEFAULT 0" +
-                    ");");
-
-            stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_outbound_references (" +
-                    "from_object_id INT NOT NULL, " +
-                    "seq INT NOT NULL, " +
-                    "to_object_id INT NOT NULL" +
-                    ");");
-
-            stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_inbound_references (" +
-                    "to_object_id INT NOT NULL, " +
-                    "from_object_id INT NOT NULL" +
+            // Chunked blob store for all per-object data (see saveObjects / saveOutboundEdges / ...)
+            stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_chunks (" +
+                    "chunk_key " + (isPostgres ? "BIGINT" : "INTEGER") + " PRIMARY KEY, " +
+                    "data " + (isPostgres ? "BYTEA" : "BLOB") + " NOT NULL" +
                     ");");
 
             stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_gc_roots (" +
@@ -179,11 +178,6 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     "thread_object_id INT DEFAULT -1" +
                     ");");
 
-            stmt.execute("CREATE " + unlogged + "TABLE IF NOT EXISTS dhp_dominator_tree (" +
-                    "object_id INT NOT NULL, " +
-                    "dominator_id INT NOT NULL, " +
-                    "retained_size BIGINT NOT NULL" +
-                    ");");
         }
         connection.commit();
         log.info("Initialized raw unindexed heap tables for maximum bulk ingestion throughput.");
@@ -204,6 +198,12 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     @Override
     public String getSnapshotInfo(String key) throws SQLException {
+        synchronized (connection) {
+            return getSnapshotInfoLocked(key);
+        }
+    }
+
+    private String getSnapshotInfoLocked(String key) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement("SELECT property_value FROM dhp_snapshot_info WHERE property_key = ?")) {
             ps.setString(1, key);
             try (ResultSet rs = ps.executeQuery()) {
@@ -259,8 +259,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     public void saveClassStats(Collection<ClassStats> stats) throws SQLException {
         if (stats == null || stats.isEmpty()) return;
         String sql = isPostgres
-                ? "INSERT INTO dhp_class_stats(class_id, instance_count, total_size) VALUES(?, ?, ?) ON CONFLICT DO NOTHING"
-                : "INSERT INTO dhp_class_stats(class_id, instance_count, total_size) VALUES(?, ?, ?)";
+                ? "INSERT INTO dhp_class_stats(class_id, instance_count, total_size) VALUES(?, ?, ?) ON CONFLICT (class_id) DO UPDATE SET instance_count = EXCLUDED.instance_count, total_size = EXCLUDED.total_size"
+                : "INSERT OR REPLACE INTO dhp_class_stats(class_id, instance_count, total_size) VALUES(?, ?, ?)";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             for (ClassStats s : stats) {
                 ps.setInt(1, s.classObjId());
@@ -479,55 +479,19 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     @Override
-    public void insertObjectsBatch(List<RawObjectRecord> objects) throws SQLException {
-        String sql = "INSERT INTO dhp_objects(object_id, object_address, class_id, used_size, file_position, is_array) VALUES(?, ?, ?, ?, ?, ?)";
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            for (RawObjectRecord obj : objects) {
-                ps.setInt(1, obj.objectId());
-                ps.setLong(2, obj.objectAddress());
-                ps.setLong(3, obj.classId());
-                ps.setLong(4, obj.usedSize());
-                ps.setLong(5, obj.filePosition());
-                ps.setShort(6, (short) (obj.isArray() ? 1 : 0));
-                ps.addBatch();
-            }
-            ps.executeBatch();
-        }
-        connection.commit();
-    }
-
-    @Override
-    public void insertOutboundReferencesBatch(List<ReferenceEdge> edges) throws SQLException {
-        String sqlOut = "INSERT INTO dhp_outbound_references(from_object_id, seq, to_object_id) VALUES(?, ?, ?)";
-        String sqlIn = "INSERT INTO dhp_inbound_references(to_object_id, from_object_id) VALUES(?, ?)";
-        try (PreparedStatement psOut = connection.prepareStatement(sqlOut);
-             PreparedStatement psIn = connection.prepareStatement(sqlIn)) {
-            for (ReferenceEdge edge : edges) {
-                psOut.setInt(1, edge.fromObjectId());
-                psOut.setInt(2, edge.seq());
-                psOut.setInt(3, edge.toObjectId());
-                psOut.addBatch();
-
-                psIn.setInt(1, edge.toObjectId());
-                psIn.setInt(2, edge.fromObjectId());
-                psIn.addBatch();
-            }
-            psOut.executeBatch();
-            psIn.executeBatch();
-        }
-        connection.commit();
-    }
-
-    @Override
     public void insertGcRootsBatch(List<HeapRecords.GcRootRecord> gcRoots) throws SQLException {
-        String sql = "INSERT INTO dhp_gc_roots(object_id, object_address, referrer_address, root_type, thread_address) VALUES(?, ?, ?, ?, ?)";
+        String sql = "INSERT INTO dhp_gc_roots(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id) VALUES(?, ?, ?, ?, ?, ?)";
+        try (Statement del = connection.createStatement()) {
+            del.execute("DELETE FROM dhp_gc_roots"); // a retried ingestion must not duplicate roots
+        }
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             for (HeapRecords.GcRootRecord root : gcRoots) {
-                ps.setInt(1, (int) root.objectAddress()); // mapped ID or temporary
+                ps.setInt(1, root.objectId());
                 ps.setLong(2, root.objectAddress());
                 ps.setLong(3, root.referrerAddress());
                 ps.setInt(4, root.rootType());
                 ps.setLong(5, root.threadAddress());
+                ps.setInt(6, root.threadObjectId());
                 ps.addBatch();
             }
             ps.executeBatch();
@@ -536,264 +500,29 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     @Override
-    public int runGarbageCollection() throws SQLException {
-        int n = getObjectCount();
-        if (n == 0) return 0;
-
-        log.info("Starting Database-side Garbage Collection for {} objects...", n);
-
-        // 1. Collect GC root object IDs
-        it.unimi.dsi.fastutil.ints.IntOpenHashSet rootSet = new it.unimi.dsi.fastutil.ints.IntOpenHashSet();
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery(
-                     "SELECT DISTINCT o.object_id FROM dhp_objects o JOIN dhp_gc_roots r ON o.object_address = r.object_address")) {
-            while (rs.next()) {
-                rootSet.add(rs.getInt(1));
+    public synchronized void appendGcRoots(List<HeapRecords.GcRootRecord> gcRoots) throws SQLException {
+        String sql = "INSERT INTO dhp_gc_roots(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id) VALUES(?, ?, ?, ?, ?, ?)";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            for (HeapRecords.GcRootRecord root : gcRoots) {
+                long address = root.objectAddress() != 0 ? root.objectAddress() : getObjectAddress(root.objectId());
+                ps.setInt(1, root.objectId());
+                ps.setLong(2, address);
+                ps.setLong(3, root.referrerAddress());
+                ps.setInt(4, root.rootType());
+                ps.setLong(5, root.threadAddress());
+                ps.setInt(6, root.threadObjectId());
+                ps.addBatch();
             }
-        }
-        int sysId = getObjectIdByAddress(0L);
-        if (sysId >= 0) rootSet.add(sysId);
-
-        // 2. Load outbound adjacency for reachability traversal
-        CsrGraph outAdj = loadOutboundCsr(n);
-
-        // 3. Fast BFS reachability traversal
-        java.util.BitSet reachable = new java.util.BitSet(n);
-        it.unimi.dsi.fastutil.ints.IntArrayFIFOQueue queue = new it.unimi.dsi.fastutil.ints.IntArrayFIFOQueue();
-
-        for (int r : rootSet) {
-            if (r >= 0 && r < n && !reachable.get(r)) {
-                reachable.set(r);
-                queue.enqueue(r);
-            }
-        }
-
-        while (!queue.isEmpty()) {
-            int u = queue.dequeueInt();
-            if (u >= 0 && u < n) {
-                int start = outAdj.edgeStart(u);
-                int end = outAdj.edgeEnd(u);
-                for (int i = start; i < end; i++) {
-                    int v = outAdj.to()[i];
-                    if (v >= 0 && v < n && !reachable.get(v)) {
-                        reachable.set(v);
-                        queue.enqueue(v);
-                    }
-                }
-            }
-        }
-
-        int reachableCount = reachable.cardinality();
-        int unreachableCount = n - reachableCount;
-        log.info("Database Garbage Collection analysis: {} reachable, {} unreachable (out of {} objects)",
-                reachableCount, unreachableCount, n);
-
-        if (unreachableCount == 0) {
-            saveSnapshotInfo("removedUnreachableObjects", "0");
-            saveSnapshotInfo("removedUnreachableBytes", "0");
-            return 0;
-        }
-
-        // 4. Calculate total unreachable bytes
-        long unreachableBytes = 0;
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT object_id, used_size FROM dhp_objects")) {
-            while (rs.next()) {
-                int oid = rs.getInt(1);
-                if (oid < n && !reachable.get(oid)) {
-                    unreachableBytes += rs.getLong(2);
-                }
-            }
-        }
-
-        // 5. Purge unreachable records and re-index contiguous IDs directly in the database
-        purgeUnreachableObjectsInDatabase(reachable, n, reachableCount);
-
-        saveSnapshotInfo("numberOfObjects", String.valueOf(reachableCount));
-        saveSnapshotInfo("removedUnreachableObjects", String.valueOf(unreachableCount));
-        saveSnapshotInfo("removedUnreachableBytes", String.valueOf(unreachableBytes));
-
-        log.info("Database Garbage Collection complete: removed {} unreachable objects ({} bytes). Live objects: {}",
-                unreachableCount, unreachableBytes, reachableCount);
-        return unreachableCount;
-    }
-
-    private void purgeUnreachableObjectsInDatabase(java.util.BitSet reachable, int n, int reachableCount) throws SQLException {
-        log.info("Purging {} unreachable records directly inside database tables...", n - reachableCount);
-        long t0 = System.currentTimeMillis();
-
-        String unlogged = isPostgres ? "UNLOGGED " : "";
-        try (Statement stmt = connection.createStatement()) {
-            stmt.execute("DROP TABLE IF EXISTS dhp_gc_map");
-            stmt.execute("CREATE " + unlogged + "TABLE dhp_gc_map (old_id INT PRIMARY KEY, new_id INT NOT NULL)");
-        }
-
-        String insertMapSql = "INSERT INTO dhp_gc_map(old_id, new_id) VALUES(?, ?)";
-        try (PreparedStatement ps = connection.prepareStatement(insertMapSql)) {
-            int newId = 0;
-            int batch = 0;
-            for (int oldId = 0; oldId < n; oldId++) {
-                if (reachable.get(oldId)) {
-                    ps.setInt(1, oldId);
-                    ps.setInt(2, newId++);
-                    ps.addBatch();
-                    if (++batch >= 10000) {
-                        ps.executeBatch();
-                        batch = 0;
-                    }
-                }
-            }
-            if (batch > 0) {
-                ps.executeBatch();
-            }
+            ps.executeBatch();
         }
         connection.commit();
-
-        try (Statement stmt = connection.createStatement()) {
-            // Rebuild dhp_objects
-            stmt.execute("DROP TABLE IF EXISTS dhp_objects_clean");
-            stmt.execute("CREATE " + unlogged + "TABLE dhp_objects_clean AS " +
-                    "SELECT m.new_id AS object_id, o.object_address, COALESCE(mc.new_id, o.class_id) AS class_id, o.used_size, o.file_position, o.is_array " +
-                    "FROM dhp_objects o " +
-                    "JOIN dhp_gc_map m ON o.object_id = m.old_id " +
-                    "LEFT JOIN dhp_gc_map mc ON o.class_id = mc.old_id");
-            stmt.execute("DROP TABLE dhp_objects" + (isPostgres ? " CASCADE" : ""));
-            stmt.execute("ALTER TABLE dhp_objects_clean RENAME TO dhp_objects");
-
-            // Rebuild dhp_outbound_references
-            stmt.execute("DROP TABLE IF EXISTS dhp_outbound_clean");
-            stmt.execute("CREATE " + unlogged + "TABLE dhp_outbound_clean AS " +
-                    "SELECT mf.new_id AS from_object_id, r.seq, mt.new_id AS to_object_id " +
-                    "FROM dhp_outbound_references r " +
-                    "JOIN dhp_gc_map mf ON r.from_object_id = mf.old_id " +
-                    "JOIN dhp_gc_map mt ON r.to_object_id = mt.old_id");
-            stmt.execute("DROP TABLE dhp_outbound_references" + (isPostgres ? " CASCADE" : ""));
-            stmt.execute("ALTER TABLE dhp_outbound_clean RENAME TO dhp_outbound_references");
-
-            // Rebuild dhp_inbound_references
-            stmt.execute("DROP TABLE IF EXISTS dhp_inbound_clean");
-            stmt.execute("CREATE " + unlogged + "TABLE dhp_inbound_clean AS " +
-                    "SELECT mt.new_id AS to_object_id, mf.new_id AS from_object_id " +
-                    "FROM dhp_inbound_references r " +
-                    "JOIN dhp_gc_map mt ON r.to_object_id = mt.old_id " +
-                    "JOIN dhp_gc_map mf ON r.from_object_id = mf.old_id");
-            stmt.execute("DROP TABLE dhp_inbound_references" + (isPostgres ? " CASCADE" : ""));
-            stmt.execute("ALTER TABLE dhp_inbound_clean RENAME TO dhp_inbound_references");
-
-            // Rebuild dhp_gc_roots
-            stmt.execute("DROP TABLE IF EXISTS dhp_gc_roots_clean");
-            stmt.execute("CREATE " + unlogged + "TABLE dhp_gc_roots_clean AS " +
-                    "SELECT o.object_id, r.object_address, r.referrer_address, r.root_type, r.thread_address, " +
-                    "coalesce((SELECT t.object_id FROM dhp_objects t WHERE t.object_address = r.thread_address), -1) AS thread_object_id " +
-                    "FROM dhp_gc_roots r " +
-                    "JOIN dhp_objects o ON r.object_address = o.object_address");
-            stmt.execute("DROP TABLE dhp_gc_roots" + (isPostgres ? " CASCADE" : ""));
-            stmt.execute("ALTER TABLE dhp_gc_roots_clean RENAME TO dhp_gc_roots");
-
-            stmt.execute("DROP TABLE dhp_gc_map");
-        }
-        connection.commit();
-        log.info("Database table purge and re-indexing finished in {} ms.", System.currentTimeMillis() - t0);
     }
 
     @Override
     public void finishIngestion() throws SQLException {
-        log.info("Ingestion completed. Creating primary unique indexes and secondary B-trees in bulk...");
         long start = System.currentTimeMillis();
         try (Statement stmt = connection.createStatement()) {
-            long t;
-
-            // 1. Primary/unique indexes built in bulk
-            t = System.currentTimeMillis();
-            stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_objects_pk ON dhp_objects(object_id);");
-            log.info("Index idx_dhp_objects_pk built in {} ms.", (System.currentTimeMillis() - t));
-
-            t = System.currentTimeMillis();
-            stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_outbound_pk ON dhp_outbound_references(from_object_id, seq);");
-            log.info("Index idx_dhp_outbound_pk built in {} ms.", (System.currentTimeMillis() - t));
-
-            // 2. Secondary lookup indexes
-            t = System.currentTimeMillis();
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_address ON dhp_objects(object_address);");
-            log.info("Index idx_dhp_objects_address built in {} ms.", (System.currentTimeMillis() - t));
-
-            t = System.currentTimeMillis();
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_class ON dhp_objects(class_id);");
-            log.info("Index idx_dhp_objects_class built in {} ms.", (System.currentTimeMillis() - t));
-
-            t = System.currentTimeMillis();
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_objects_arrays ON dhp_objects(object_id) WHERE is_array = 1;");
-            log.info("Index idx_dhp_objects_arrays built in {} ms.", (System.currentTimeMillis() - t));
-
-            t = System.currentTimeMillis();
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_inbound_to ON dhp_inbound_references(to_object_id);");
-            log.info("Index idx_dhp_inbound_to built in {} ms.", (System.currentTimeMillis() - t));
-
-            t = System.currentTimeMillis();
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_gc_roots_obj ON dhp_gc_roots(object_id);");
-            log.info("Index idx_dhp_gc_roots_obj built in {} ms.", (System.currentTimeMillis() - t));
-
-            // 3. Precompute class stats table (only if not pre-populated in memory)
-            boolean needClassStats = true;
-            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_class_stats")) {
-                if (rs.next() && rs.getInt(1) > 0) {
-                    needClassStats = false;
-                }
-            }
-            if (needClassStats) {
-                log.info("Populating class stats via fallback database aggregation...");
-                t = System.currentTimeMillis();
-                stmt.execute("DELETE FROM dhp_class_stats;");
-                stmt.execute("INSERT INTO dhp_class_stats(class_id, instance_count, total_size) " +
-                        "SELECT class_id, count(*), coalesce(sum(used_size), 0) FROM dhp_objects GROUP BY class_id;");
-                log.info("Class stats aggregated in {} ms.", (System.currentTimeMillis() - t));
-            }
-
-            // 4. Pre-resolve and backfill metadata in dhp_classes (only if not pre-populated in memory)
-            boolean needClassMetadata = true;
-            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_classes WHERE class_obj_id IS NOT NULL AND class_obj_id >= 0")) {
-                if (rs.next() && rs.getInt(1) > 0) {
-                    needClassMetadata = false;
-                }
-            }
-            if (needClassMetadata) {
-                log.info("Backfilling class metadata via fallback database queries...");
-                t = System.currentTimeMillis();
-                stmt.execute("UPDATE dhp_classes SET " +
-                        "class_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.class_id), -1), " +
-                        "super_class_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.super_class_id), -1), " +
-                        "class_loader_obj_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_classes.class_loader_id), -1), " +
-                        "used_size = coalesce((SELECT o.used_size FROM dhp_objects o WHERE o.object_address = dhp_classes.class_id), 0);");
-                log.info("Class metadata backfilled in {} ms.", (System.currentTimeMillis() - t));
-            }
-
-            // 5. Pre-resolve object_id and thread_object_id in dhp_gc_roots
-            t = System.currentTimeMillis();
-            stmt.execute("UPDATE dhp_gc_roots SET " +
-                    "object_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_gc_roots.object_address), -1), " +
-                    "thread_object_id = coalesce((SELECT o.object_id FROM dhp_objects o WHERE o.object_address = dhp_gc_roots.thread_address), -1);");
-            log.info("GC roots pre-resolved in {} ms.", (System.currentTimeMillis() - t));
-
-            // 6. Pre-calculate total heap size and object count into dhp_snapshot_info
-            long totalHeap = 0L;
-            try (ResultSet rs = stmt.executeQuery("SELECT coalesce(sum(total_size), 0) FROM dhp_class_stats")) {
-                if (rs.next()) totalHeap = rs.getLong(1);
-            }
-            saveSnapshotInfo("totalHeapSize", String.valueOf(totalHeap));
-
-            int count = 0;
-            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_objects")) {
-                if (rs.next()) count = rs.getInt(1);
-            }
-            saveSnapshotInfo("numberOfObjects", String.valueOf(count));
-
-            long edges = 0L;
-            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_outbound_references")) {
-                if (rs.next()) edges = rs.getLong(1);
-            }
-            saveSnapshotInfo("numberOfOutboundReferences", String.valueOf(edges));
-
-            // 7. Database optimizer statistics
             if (isSqlite) {
                 stmt.execute("PRAGMA optimize;");
             } else if (isPostgres) {
@@ -801,88 +530,497 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             }
         }
         connection.commit();
-        log.info("Bulk indexing successfully finished in {} ms.", System.currentTimeMillis() - start);
+        log.info("Ingestion finalized in {} ms.", System.currentTimeMillis() - start);
+    }
+
+    // =====================================================================================================
+    // Chunked blob store: per-object data is packed into fixed-size chunks (one row per chunk) instead of one
+    // row per object/edge. Ingestion issues ~1000x fewer inserts; point lookups fetch one small blob that is
+    // kept in a byte-bounded LRU cache.
+    // =====================================================================================================
+
+    static final int K_ADDR = 1, K_CLASS = 2, K_SIZE = 3, K_POS = 4, K_FLAGS = 5, K_OUT = 6, K_IN = 7,
+            K_DOM = 8, K_RET = 9, K_CHILD = 10, K_OUT_HUGE = 11, K_IN_HUGE = 12, K_CHILD_HUGE = 13,
+            K_ROOT_CHILDREN = 14, K_CLASS_INSTANCES = 15, K_ADDR_INDEX = 16;
+    static final int SC = 512;           // objects per scalar chunk (long chunks = 4 KB, three fit a 16 KB page)
+    static final int EC = 32;            // objects per edge chunk (fits the 32-bit "huge list" mask)
+    static final int HUGE_LIST = 16384;  // lists longer than this are stored out of line
+
+    private static final java.lang.invoke.VarHandle INT_LE =
+            java.lang.invoke.MethodHandles.byteArrayViewVarHandle(int[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
+    private static final java.lang.invoke.VarHandle LONG_LE =
+            java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
+
+    private static long key(int kind, long chunk) {
+        return ((long) kind << 32) | chunk;
+    }
+
+    private PreparedStatement psChunkPut;
+    private int pendingPuts;
+    private volatile int cachedObjectCount = -1;
+    private volatile long[] addrIndex;
+
+    // ---- concurrent read path -------------------------------------------------------------------------
+    // MAT calls the index adapters from many worker threads. Every thread gets its own read connection
+    // (SQLite WAL allows concurrent readers) and a small lock-free direct-mapped chunk cache, so reads never
+    // contend on a lock or a shared statement.
+    private static final int CACHE_SLOTS = 256;
+    private static final int CACHE_MAX_BLOB = 256 * 1024;
+
+    private final class ReadHandle {
+        final Connection conn;
+        final boolean shared;
+        final PreparedStatement psChunk;
+        final long[] keys = new long[CACHE_SLOTS];
+        final byte[][] vals = new byte[CACHE_SLOTS][];
+
+        ReadHandle(Connection conn, boolean shared) throws SQLException {
+            this.conn = conn;
+            this.shared = shared;
+            this.psChunk = conn.prepareStatement("SELECT data FROM dhp_chunks WHERE chunk_key = ?");
+            java.util.Arrays.fill(keys, -1L);
+        }
+    }
+
+    private final java.util.concurrent.ConcurrentLinkedQueue<ReadHandle> readHandles = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final ThreadLocal<ReadHandle> readHandle = new ThreadLocal<>();
+
+    private ReadHandle handle() throws SQLException {
+        ReadHandle h = readHandle.get();
+        if (h == null) {
+            boolean sharedOnly = isSqlite && (jdbcUrl.contains(":memory:") || jdbcUrl.contains("mode=memory"));
+            if (sharedOnly) {
+                synchronized (connection) {
+                    h = new ReadHandle(connection, true);
+                }
+            } else {
+                Connection c = DriverManager.getConnection(jdbcUrl, user, password);
+                if (isSqlite) {
+                    try (Statement st = c.createStatement()) {
+                        st.execute("PRAGMA cache_size = -32768;");
+                        st.execute("PRAGMA mmap_size = 2147483648;");
+                    }
+                }
+                h = new ReadHandle(c, false);
+            }
+            readHandles.add(h);
+            readHandle.set(h);
+        }
+        return h;
+    }
+
+    private byte[] chunk(int kind, long chunkNo) throws SQLException {
+        long k = key(kind, chunkNo);
+        ReadHandle h = handle();
+        int slot = (int) ((k ^ (k >>> 11) ^ (k >>> 29)) & (CACHE_SLOTS - 1));
+        if (h.keys[slot] == k) {
+            return h.vals[slot];
+        }
+        byte[] b;
+        if (h.shared) {
+            synchronized (connection) {
+                b = fetch(h, k);
+            }
+        } else {
+            b = fetch(h, k);
+        }
+        if (b == null || b.length <= CACHE_MAX_BLOB) {
+            h.keys[slot] = k;
+            h.vals[slot] = b;
+        }
+        return b;
+    }
+
+    private static byte[] fetch(ReadHandle h, long k) throws SQLException {
+        h.psChunk.setLong(1, k);
+        try (ResultSet rs = h.psChunk.executeQuery()) {
+            return rs.next() ? rs.getBytes(1) : null;
+        }
+    }
+
+    private void putChunk(int kind, long chunkNo, byte[] data) throws SQLException {
+        if (psChunkPut == null) {
+            psChunkPut = connection.prepareStatement(
+                    isPostgres ? "INSERT INTO dhp_chunks(chunk_key, data) VALUES(?, ?) ON CONFLICT (chunk_key) DO UPDATE SET data = EXCLUDED.data"
+                               : "INSERT OR REPLACE INTO dhp_chunks(chunk_key, data) VALUES(?, ?)");
+        }
+        psChunkPut.setLong(1, key(kind, chunkNo));
+        psChunkPut.setBytes(2, data);
+        psChunkPut.addBatch();
+        if (++pendingPuts >= 512) {
+            flushPuts();
+        }
+    }
+
+    private void flushPuts() throws SQLException {
+        if (pendingPuts > 0) {
+            psChunkPut.executeBatch();
+            connection.commit();
+            pendingPuts = 0;
+        }
     }
 
     @Override
-    public void finishDominatorTree() throws SQLException {
-        long start = System.currentTimeMillis();
-        log.info("Building Dominator Tree indexes in bulk...");
-        try (Statement stmt = connection.createStatement()) {
-            stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dhp_dominator_pk ON dhp_dominator_tree(object_id);");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_dominator ON dhp_dominator_tree(dominator_id, retained_size DESC);");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dhp_dom_retained ON dhp_dominator_tree(retained_size);");
-            if (isSqlite) {
-                stmt.execute("PRAGMA optimize;");
-            } else if (isPostgres) {
-                stmt.execute("ANALYZE dhp_dominator_tree;");
+    public synchronized void saveObjects(org.eclipse.mat.dhp.core.graph.HeapGraph g) throws SQLException {
+        long t0 = System.currentTimeMillis();
+        int n = g.objectCount();
+        int chunks = (n + SC - 1) / SC;
+        long[] firstAddr = new long[Math.max(1, chunks)];
+        byte[] bAddr = new byte[SC * 8], bClass = new byte[SC * 4], bSize = new byte[SC * 8],
+                bPos = new byte[SC * 8], bFlags = new byte[SC / 8];
+        for (int c = 0; c < chunks; c++) {
+            int from = c * SC;
+            int len = Math.min(SC, n - from);
+            java.util.Arrays.fill(bFlags, (byte) 0);
+            for (int i = 0; i < len; i++) {
+                int id = from + i;
+                long a = g.addressOf(id);
+                LONG_LE.set(bAddr, i * 8, a);
+                INT_LE.set(bClass, i * 4, g.classObjId(id));
+                LONG_LE.set(bSize, i * 8, g.usedSize(id));
+                LONG_LE.set(bPos, i * 8, g.filePosition(id));
+                if (g.isArray(id)) bFlags[i >> 3] |= (byte) (1 << (i & 7));
+            }
+            firstAddr[c] = len > 0 ? g.addressOf(from) : 0L;
+            putChunk(K_ADDR, c, java.util.Arrays.copyOf(bAddr, len * 8));
+            putChunk(K_CLASS, c, java.util.Arrays.copyOf(bClass, len * 4));
+            putChunk(K_SIZE, c, java.util.Arrays.copyOf(bSize, len * 8));
+            putChunk(K_POS, c, java.util.Arrays.copyOf(bPos, len * 8));
+            putChunk(K_FLAGS, c, java.util.Arrays.copyOf(bFlags, (len + 7) / 8));
+        }
+        byte[] idx = new byte[firstAddr.length * 8];
+        for (int i = 0; i < firstAddr.length; i++) LONG_LE.set(idx, i * 8, firstAddr[i]);
+        putChunk(K_ADDR_INDEX, 0, idx);
+
+        flushPuts();
+        // numberOfObjects is persisted last (end of saveDominators): readers treat a missing value as "no snapshot",
+        // so an interrupted ingestion is never mistaken for a complete one.
+        cachedObjectCount = n;
+        addrIndex = firstAddr;
+        log.info("Persisted {} objects in {} chunks ({} ms)", n, chunks, System.currentTimeMillis() - t0);
+    }
+
+    /**
+     * Objects grouped by class (counting sort over the stored class column). Done at the end of ingestion from the
+     * persisted column, when the large in-memory structures have been released, instead of while the whole graph is
+     * still on the heap.
+     */
+    private void saveClassInstances(int n) throws SQLException {
+        long t0 = System.currentTimeMillis();
+        it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap counts = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
+        scanKind(K_CLASS, (c, b) -> {
+            for (int i = 0; i * 4 < b.length; i++) {
+                int cl = (int) INT_LE.get(b, i * 4);
+                if (cl >= 0 && c * SC + i < n) counts.addTo(cl, 1);
+            }
+        });
+        int[] classIds = counts.keySet().toIntArray();
+        java.util.Arrays.sort(classIds);
+        it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap start = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
+        int total = 0;
+        for (int cl : classIds) {
+            start.put(cl, total);
+            total += counts.get(cl);
+        }
+        int[] sorted = new int[total];
+        it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap fill = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap(start);
+        scanKind(K_CLASS, (c, b) -> {
+            for (int i = 0; i * 4 < b.length; i++) {
+                int cl = (int) INT_LE.get(b, i * 4);
+                int id = c * SC + i;
+                if (cl >= 0 && id < n) sorted[fill.addTo(cl, 1)] = id;
+            }
+        });
+        for (int cl : classIds) {
+            putChunk(K_CLASS_INSTANCES, cl, toBytes(sorted, start.get(cl), counts.get(cl)));
+        }
+        flushPuts();
+        log.info("Persisted instance lists of {} classes ({} ms)", classIds.length, System.currentTimeMillis() - t0);
+    }
+
+    private static byte[] toBytes(int[] a, int from, int len) {
+        byte[] b = new byte[len * 4];
+        for (int i = 0; i < len; i++) INT_LE.set(b, i * 4, a[from + i]);
+        return b;
+    }
+
+    private static int[] toInts(byte[] b, int byteFrom, int count) {
+        int[] r = new int[count];
+        for (int i = 0; i < count; i++) r[i] = (int) INT_LE.get(b, byteFrom + i * 4);
+        return r;
+    }
+
+    /** Writes edge-list chunks; {@code src} supplies the list of one object. */
+    private interface ListSource {
+        int load(int id, int[] dst);   // returns length, dst grows via scratch holder
+    }
+
+    @Override
+    public synchronized void saveOutboundEdges(org.eclipse.mat.dhp.core.graph.HeapGraph g) throws SQLException {
+        long t0 = System.currentTimeMillis();
+        int n = g.objectCount();
+        int[] scratch = new int[HUGE_LIST + 1];
+        int[][] holder = {null};
+        writeEdgeChunks(n, K_OUT, K_OUT_HUGE, id -> {
+            int deg = g.outDegree(id);
+            if (deg > scratch.length) {
+                holder[0] = new int[deg];
+                g.copyOutEdges(id, holder[0]);
+                return holder[0];
+            }
+            g.copyOutEdges(id, scratch);
+            holder[0] = null;
+            return scratch;
+        }, g::outDegree);
+        log.info("Persisted {} outbound references ({} ms)", g.edgeCount(), System.currentTimeMillis() - t0);
+    }
+
+    @Override
+    public synchronized void saveInboundEdges(int[] head, int[] to, int n, int ignored) throws SQLException {
+        long t0 = System.currentTimeMillis();
+        int[][] holder = {new int[256]};
+        writeEdgeChunks(n, K_IN, K_IN_HUGE, id -> {
+            int s = head[id], e = head[id + 1];
+            int[] buf = holder[0];
+            if (buf.length < e - s) buf = holder[0] = new int[Math.max(e - s, buf.length * 2)];
+            int len = 0;
+            for (int i = s; i < e; i++) {
+                if (to[i] != ignored) buf[len++] = to[i];
+            }
+            return buf;
+        }, id -> {
+            int len = 0;
+            for (int i = head[id], e = head[id + 1]; i < e; i++) {
+                if (to[i] != ignored) len++;
+            }
+            return len;
+        });
+        log.info("Persisted inbound references ({} ms)", System.currentTimeMillis() - t0);
+    }
+
+    private interface IntSource {
+        int[] get(int id);
+    }
+
+    private interface IntFn {
+        int apply(int id);
+    }
+
+    /** Edge chunk layout: [huge-mask int][EC+1 cumulative offsets][targets...]; huge lists live in their own row. */
+    private void writeEdgeChunks(int n, int kind, int hugeKind, IntSource source, IntFn degree) throws SQLException {
+        int chunks = (n + EC - 1) / EC;
+        int[] lens = new int[EC];
+        for (int c = 0; c < chunks; c++) {
+            int from = c * EC;
+            int cnt = Math.min(EC, n - from);
+            int mask = 0;
+            int total = 0;
+            for (int i = 0; i < cnt; i++) {
+                int len = degree.apply(from + i);
+                lens[i] = len;
+                if (len > HUGE_LIST) {
+                    mask |= 1 << i;
+                } else {
+                    total += len;
+                }
+            }
+            byte[] blob = new byte[4 * (1 + EC + 1 + total)];
+            INT_LE.set(blob, 0, mask);
+            int off = 0;
+            int p = 4 * (1 + EC + 1);
+            for (int i = 0; i < EC; i++) {
+                INT_LE.set(blob, 4 + 4 * i, off);
+                if (i >= cnt) {
+                    continue;
+                }
+                int len = lens[i];
+                if (len > HUGE_LIST) {
+                    putChunk(hugeKind, from + i, toBytes(source.get(from + i), 0, len));
+                } else if (len > 0) {
+                    int[] list = source.get(from + i);
+                    for (int k = 0; k < len; k++) {
+                        INT_LE.set(blob, p, list[k]);
+                        p += 4;
+                    }
+                    off += len;
+                }
+            }
+            INT_LE.set(blob, 4 + 4 * EC, off);
+            putChunk(kind, c, blob);
+        }
+        flushPuts();
+    }
+
+    private int[] readEdgeList(int kind, int hugeKind, int id) throws SQLException {
+        if (id < 0) return new int[0];
+        byte[] b = chunk(kind, id / EC);
+        if (b == null) return new int[0];
+        int i = id % EC;
+        int mask = (int) INT_LE.get(b, 0);
+        if ((mask & (1 << i)) != 0) {
+            byte[] h = chunk(hugeKind, id);
+            return h == null ? new int[0] : toInts(h, 0, h.length / 4);
+        }
+        int start = (int) INT_LE.get(b, 4 + 4 * i);
+        int end = (int) INT_LE.get(b, 4 + 4 * (i + 1));
+        return toInts(b, 4 * (1 + EC + 1) + 4 * start, end - start);
+    }
+
+    @Override
+    public synchronized void saveDominators(int[] idom, long[] retained, int n) throws SQLException {
+        long t0 = System.currentTimeMillis();
+        int chunks = (n + SC - 1) / SC;
+        for (int c = 0; c < chunks; c++) {
+            int from = c * SC;
+            int len = Math.min(SC, n - from);
+            byte[] d = new byte[len * 4];
+            byte[] r = new byte[len * 8];
+            for (int i = 0; i < len; i++) {
+                INT_LE.set(d, i * 4, idom[from + i]);
+                LONG_LE.set(r, i * 8, retained[from + i]);
+            }
+            putChunk(K_DOM, c, d);
+            putChunk(K_RET, c, r);
+        }
+        flushPuts();
+        long t1 = System.currentTimeMillis();
+
+        // Dominated lists: counting sort by dominator, each list ordered by retained size (desc), then ID
+        int[] start = new int[n + 2];   // index p + 1 (so that the -1 "super root" list sits at slot 0)
+        for (int i = 0; i < n; i++) start[idom[i] + 1 + 1]++;
+        for (int i = 0; i < n + 1; i++) start[i + 1] += start[i];
+        int[] fill = java.util.Arrays.copyOf(start, n + 1);
+        int[] children = new int[n];
+        for (int i = 0; i < n; i++) children[fill[idom[i] + 1]++] = i;
+        fill = null;
+        it.unimi.dsi.fastutil.ints.IntComparator cmp = (a, b) -> {
+            int c = Long.compare(retained[b], retained[a]);
+            return c != 0 ? c : Integer.compare(a, b);
+        };
+        // Lists are independent: sort blocks of parents in parallel; very long lists use the parallel sort
+        final int[] startF = start;
+        final int[] childF = children;
+        java.util.stream.IntStream.range(0, (n + 1 + 8191) / 8192).parallel().forEach(blk -> {
+            int pEnd = Math.min(n + 1, (blk + 1) * 8192);
+            for (int p = blk * 8192; p < pEnd; p++) {
+                int s0 = startF[p], e0 = startF[p + 1];
+                if (e0 - s0 > 1 && e0 - s0 <= 1_000_000) {
+                    it.unimi.dsi.fastutil.ints.IntArrays.quickSort(childF, s0, e0, cmp);
+                }
+            }
+        });
+        for (int p = 0; p <= n; p++) {
+            int s0 = start[p], e0 = start[p + 1];
+            if (e0 - s0 > 1_000_000) {
+                it.unimi.dsi.fastutil.ints.IntArrays.parallelQuickSort(children, s0, e0, cmp);
             }
         }
-        connection.commit();
-        log.info("Dominator Tree bulk indexes created in {} ms.", System.currentTimeMillis() - start);
+        // root list (dominator -1)
+        putChunk(K_ROOT_CHILDREN, 0, toBytes(children, start[0], start[1] - start[0]));
+        int parents = n;
+        int[] holder = new int[0];
+        writeEdgeChunks(parents, K_CHILD, K_CHILD_HUGE, id -> {
+            int s = start[id + 1], e = start[id + 2];
+            return java.util.Arrays.copyOfRange(children, s, e);
+        }, id -> start[id + 2] - start[id + 1]);
+        saveClassInstances(n);
+        if (isSqlite) {
+            setJournalPragmas("WAL", "NORMAL");
+        } else if (isPostgres) {
+            // The tables were UNLOGGED for fast loading; they would be emptied by a server crash, so make them durable
+            long tl = System.currentTimeMillis();
+            try (Statement stmt = connection.createStatement()) {
+                for (String table : new String[]{"dhp_snapshot_info", "dhp_classes", "dhp_class_stats", "dhp_gc_roots", "dhp_chunks"}) {
+                    stmt.execute("ALTER TABLE " + table + " SET LOGGED");
+                }
+                connection.commit();
+            }
+            log.info("PostgreSQL tables converted to LOGGED in {} ms", System.currentTimeMillis() - tl);
+        }
+        // the completion marker comes last: only a fully durable, complete snapshot counts as ingested
+        saveSnapshotInfo("numberOfObjects", String.valueOf(n));
+        cachedObjectCount = n;
+        log.info("Persisted dominator tree: columns {} ms, children {} ms", t1 - t0, System.currentTimeMillis() - t1);
+    }
+
+    // ---------------------------------------------------------------------------- reads
+
+    private long readLongAt(int kind, int id, int perChunk) throws SQLException {
+        if (id < 0) return 0L;
+        byte[] b = chunk(kind, id / perChunk);
+        if (b == null) return 0L;
+        int i = id % perChunk;
+        return i * 8 + 8 <= b.length ? (long) LONG_LE.get(b, i * 8) : 0L;
+    }
+
+    private int readIntAt(int kind, int id, int perChunk, int dflt) throws SQLException {
+        if (id < 0) return dflt;
+        byte[] b = chunk(kind, id / perChunk);
+        if (b == null) return dflt;
+        int i = id % perChunk;
+        return i * 4 + 4 <= b.length ? (int) INT_LE.get(b, i * 4) : dflt;
     }
 
     @Override
     public int getObjectCount() throws SQLException {
+        int c = cachedObjectCount;
+        return c >= 0 ? c : loadObjectCount();
+    }
+
+    private synchronized int loadObjectCount() throws SQLException {
+        if (cachedObjectCount >= 0) return cachedObjectCount;
         String cached = getSnapshotInfo("numberOfObjects");
         if (cached != null && !cached.isBlank()) {
             try {
-                return Integer.parseInt(cached.trim());
+                return cachedObjectCount = Integer.parseInt(cached.trim());
             } catch (NumberFormatException ignored) {}
-        }
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_objects")) {
-            if (rs.next()) {
-                int count = rs.getInt(1);
-                saveSnapshotInfo("numberOfObjects", String.valueOf(count));
-                return count;
-            }
         }
         return 0;
     }
 
     @Override
     public long getObjectAddress(int objectId) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT object_address FROM dhp_objects WHERE object_id = ?")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getLong(1);
-            }
-        }
-        return 0L;
+        return readLongAt(K_ADDR, objectId, SC);
     }
 
     @Override
     public int getObjectIdByAddress(long address) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT object_id FROM dhp_objects WHERE object_address = ?")) {
-            ps.setLong(1, address);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getInt(1);
-            }
+        // Object IDs are the ranks of the addresses, so a binary search over the chunk index, then the chunk, finds it
+        int n = getObjectCount();
+        if (n <= 0) return -1;
+        long[] idx = addrIndex;
+        if (idx == null) {
+            byte[] b = chunk(K_ADDR_INDEX, 0);
+            if (b == null) return -1;
+            idx = new long[b.length / 8];
+            for (int i = 0; i < idx.length; i++) idx[i] = (long) LONG_LE.get(b, i * 8);
+            addrIndex = idx;
+        }
+        int lo = 0, hi = idx.length - 1, c = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (idx[mid] <= address) { c = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        if (c < 0) return -1;
+        byte[] b = chunk(K_ADDR, c);
+        if (b == null) return -1;
+        int l = 0, hh = b.length / 8 - 1;
+        while (l <= hh) {
+            int mid = (l + hh) >>> 1;
+            long v = (long) LONG_LE.get(b, mid * 8);
+            if (v < address) l = mid + 1; else if (v > address) hh = mid - 1; else return c * SC + mid;
         }
         return -1;
     }
 
     @Override
     public long getObjectClassId(int objectId) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT class_id FROM dhp_objects WHERE object_id = ?")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getLong(1);
-            }
-        }
-        return 0L;
+        return readIntAt(K_CLASS, objectId, SC, 0);
     }
 
     @Override
     public long getObjectUsedSize(int objectId) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT used_size FROM dhp_objects WHERE object_id = ?")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getLong(1);
-            }
-        }
-        return 0L;
+        return readLongAt(K_SIZE, objectId, SC);
     }
 
     @Override
@@ -893,56 +1031,121 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                 return Long.parseLong(val.trim());
             } catch (NumberFormatException ignored) {}
         }
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT coalesce(sum(used_size), 0) FROM dhp_objects")) {
-            if (rs.next()) {
-                long total = rs.getLong(1);
-                saveSnapshotInfo("totalHeapSize", String.valueOf(total));
-                return total;
-            }
-        }
-        return 0L;
+        long total = 0;
+        for (ClassStats s : getClassStats().values()) total += s.totalSize();
+        return total;
     }
 
     @Override
     public long getObjectFilePosition(int objectId) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT file_position FROM dhp_objects WHERE object_id = ?")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getLong(1);
-            }
-        }
-        return 0L;
+        return readLongAt(K_POS, objectId, SC);
     }
 
     @Override
     public int[] getOutboundReferences(int objectId) throws SQLException {
-        List<Integer> list = new ArrayList<>();
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT to_object_id FROM dhp_outbound_references WHERE from_object_id = ? ORDER BY seq ASC")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    list.add(rs.getInt(1));
-                }
-            }
-        }
-        return list.stream().mapToInt(Integer::intValue).toArray();
+        return readEdgeList(K_OUT, K_OUT_HUGE, objectId);
     }
 
     @Override
     public int[] getInboundReferences(int objectId) throws SQLException {
-        List<Integer> list = new ArrayList<>();
+        return readEdgeList(K_IN, K_IN_HUGE, objectId);
+    }
+
+    @Override
+    public int getDominatorId(int objectId) throws SQLException {
+        return readIntAt(K_DOM, objectId, SC, -1);
+    }
+
+    @Override
+    public long getRetainedSize(int objectId) throws SQLException {
+        return readLongAt(K_RET, objectId, SC);
+    }
+
+    @Override
+    public int getObjectIdByRetainedSize(long retainedSize) throws SQLException {
+        int n = getObjectCount();
+        for (int c = 0; c * SC < n; c++) {
+            byte[] b = chunk(K_RET, c);
+            if (b == null) continue;
+            for (int i = 0; i * 8 < b.length; i++) {
+                if ((long) LONG_LE.get(b, i * 8) == retainedSize) return c * SC + i;
+            }
+        }
+        return -1;
+    }
+
+    @Override
+    public int[] getImmediateDominatedIds(int objectId) throws SQLException {
+        if (objectId < 0) {
+            byte[] b = chunk(K_ROOT_CHILDREN, 0);
+            return b == null ? new int[0] : toInts(b, 0, b.length / 4);
+        }
+        return readEdgeList(K_CHILD, K_CHILD_HUGE, objectId);
+    }
+
+    @Override
+    public boolean isArray(int objectId) throws SQLException {
+        if (objectId < 0) return false;
+        byte[] b = chunk(K_FLAGS, objectId / SC);
+        if (b == null) return false;
+        int i = objectId % SC;
+        return (i >> 3) < b.length && (b[i >> 3] & (1 << (i & 7))) != 0;
+    }
+
+    @Override
+    public synchronized boolean[] getAllArrayFlags(int objectCount) throws SQLException {
+        boolean[] flags = new boolean[objectCount];
+        populateArrayBitField(id -> {
+            if (id < objectCount) flags[id] = true;
+        });
+        return flags;
+    }
+
+    @Override
+    public synchronized void populateArrayBitField(java.util.function.IntConsumer setBit) throws SQLException {
+        scanKind(K_FLAGS, (c, b) -> {
+            for (int i = 0; i < b.length * 8; i++) {
+                if ((b[i >> 3] & (1 << (i & 7))) != 0) setBit.accept(c * SC + i);
+            }
+        });
+    }
+
+    private interface ChunkVisitor {
+        void visit(int chunkNo, byte[] data);
+    }
+
+    /** Sequentially visits all chunks of a kind in order, bypassing the point-lookup cache. */
+    private void scanKind(int kind, ChunkVisitor visitor) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT from_object_id FROM dhp_inbound_references WHERE to_object_id = ?")) {
-            ps.setInt(1, objectId);
+                "SELECT chunk_key, data FROM dhp_chunks WHERE chunk_key >= ? AND chunk_key < ? ORDER BY chunk_key")) {
+            ps.setLong(1, key(kind, 0));
+            ps.setLong(2, key(kind + 1, 0));
+            ps.setFetchSize(1000);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    list.add(rs.getInt(1));
+                    visitor.visit((int) (rs.getLong(1) & 0xFFFFFFFFL), rs.getBytes(2));
                 }
             }
         }
-        return list.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    @Override
+    public synchronized long[] loadAllObjectUsedSizes(int objectCount) throws SQLException {
+        long[] sizes = new long[objectCount];
+        scanKind(K_SIZE, (c, b) -> {
+            for (int i = 0; i * 8 < b.length; i++) {
+                int id = c * SC + i;
+                if (id < objectCount) sizes[id] = (long) LONG_LE.get(b, i * 8);
+            }
+        });
+        return sizes;
+    }
+
+    @Override
+    public int[] getObjectsByClassId(int classObjId) throws SQLException {
+        if (classObjId < 0) return new int[0];
+        byte[] b = chunk(K_CLASS_INSTANCES, classObjId);
+        return b == null ? new int[0] : toInts(b, 0, b.length / 4);
     }
 
     @Override
@@ -980,193 +1183,10 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     @Override
-    public void saveDominatorTreeBatch(List<DominatorNode> dominators) throws SQLException {
-        String sql = "INSERT INTO dhp_dominator_tree(object_id, dominator_id, retained_size) VALUES(?, ?, ?)";
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            for (DominatorNode node : dominators) {
-                ps.setInt(1, node.objectId());
-                ps.setInt(2, node.dominatorId());
-                ps.setLong(3, node.retainedSize());
-                ps.addBatch();
-            }
-            ps.executeBatch();
-        }
-        connection.commit();
-    }
-
-    @Override
-    public int getDominatorId(int objectId) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT dominator_id FROM dhp_dominator_tree WHERE object_id = ?")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getInt(1);
-            }
-        }
-        return -1;
-    }
-
-    @Override
-    public long getRetainedSize(int objectId) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT retained_size FROM dhp_dominator_tree WHERE object_id = ?")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getLong(1);
-            }
-        }
-        return 0L;
-    }
-
-    @Override
-    public int getObjectIdByRetainedSize(long retainedSize) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT object_id FROM dhp_dominator_tree WHERE retained_size = ? LIMIT 1")) {
-            ps.setLong(1, retainedSize);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getInt(1);
-            }
-        }
-        return -1;
-    }
-
-    @Override
-    public int[] getImmediateDominatedIds(int objectId) throws SQLException {
-        List<Integer> list = new ArrayList<>();
-        try (PreparedStatement ps = connection.prepareStatement("SELECT object_id FROM dhp_dominator_tree WHERE dominator_id = ? ORDER BY retained_size DESC")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    list.add(rs.getInt(1));
-                }
-            }
-        }
-        return list.stream().mapToInt(Integer::intValue).toArray();
-    }
-
-    @Override
-    public boolean isArray(int objectId) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT is_array FROM dhp_objects WHERE object_id = ?")) {
-            ps.setInt(1, objectId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getInt(1) == 1;
-            }
-        }
-        return false;
-    }
-
-    @Override
-    public boolean[] getAllArrayFlags(int objectCount) throws SQLException {
-        boolean[] flags = new boolean[objectCount];
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT object_id FROM dhp_objects WHERE is_array = 1")) {
-            while (rs.next()) {
-                int id = rs.getInt(1);
-                if (id >= 0 && id < objectCount) {
-                    flags[id] = true;
-                }
-            }
-        }
-        return flags;
-    }
-
-    @Override
-    public void populateArrayBitField(java.util.function.IntConsumer setBit) throws SQLException {
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT object_id FROM dhp_objects WHERE is_array = 1")) {
-            while (rs.next()) {
-                setBit.accept(rs.getInt(1));
-            }
-        }
-    }
-
-    @Override
-    public CsrGraph loadOutboundCsr(int objectCount) throws SQLException {
-        log.info("Loading outbound CSR graph for {} objects from database...", objectCount);
-        long start = System.currentTimeMillis();
-        String cached = getSnapshotInfo("numberOfOutboundReferences");
-        long edgeCountLong = -1;
-        if (cached != null && !cached.isBlank()) {
-            try {
-                edgeCountLong = Long.parseLong(cached.trim());
-            } catch (NumberFormatException ignored) {}
-        }
-        if (edgeCountLong < 0) {
-            try (Statement stmt = connection.createStatement();
-                 ResultSet rs = stmt.executeQuery("SELECT count(*) FROM dhp_outbound_references")) {
-                if (rs.next()) edgeCountLong = rs.getLong(1);
-            }
-        }
-        if (edgeCountLong > Integer.MAX_VALUE) {
-            throw new IllegalStateException("Edge count exceeds Integer.MAX_VALUE: " + edgeCountLong);
-        }
-        int edgeCount = (int) edgeCountLong;
-        int[] head = new int[objectCount + 1];
-        int[] to = new int[edgeCount];
-
-        try (Statement stmt = connection.createStatement()) {
-            stmt.setFetchSize(50000);
-            try (ResultSet rs = stmt.executeQuery(
-                    "SELECT from_object_id, to_object_id FROM dhp_outbound_references ORDER BY from_object_id, seq")) {
-                int edgeIdx = 0;
-                while (rs.next()) {
-                    int from = rs.getInt(1);
-                    int target = rs.getInt(2);
-                    if (from >= 0 && from < objectCount) {
-                        if (edgeIdx < edgeCount) {
-                            to[edgeIdx++] = target;
-                        }
-                        head[from + 1]++;
-                    }
-                }
-                if (edgeIdx < edgeCount) {
-                    to = java.util.Arrays.copyOf(to, edgeIdx);
-                }
-            }
-        }
-        for (int i = 0; i < objectCount; i++) {
-            head[i + 1] += head[i];
-        }
-        log.info("Outbound CSR graph loaded: {} vertices, {} edges in {} ms.",
-                objectCount, to.length, System.currentTimeMillis() - start);
-        return new CsrGraph(head, to);
-    }
-
-    @Override
-    public long[] loadAllObjectUsedSizes(int objectCount) throws SQLException {
-        long[] sizes = new long[objectCount];
-        try (Statement stmt = connection.createStatement()) {
-            stmt.setFetchSize(50000);
-            try (ResultSet rs = stmt.executeQuery("SELECT object_id, used_size FROM dhp_objects ORDER BY object_id")) {
-                while (rs.next()) {
-                    int id = rs.getInt(1);
-                    if (id >= 0 && id < objectCount) {
-                        sizes[id] = rs.getLong(2);
-                    }
-                }
-            }
-        }
-        return sizes;
-    }
-
-    @Override
-    public int[] getObjectsByClassId(int classObjId) throws SQLException {
-        List<Integer> list = new ArrayList<>();
-        try (PreparedStatement ps = connection.prepareStatement("SELECT object_id FROM dhp_objects WHERE class_id = ? ORDER BY object_id")) {
-            ps.setInt(1, classObjId);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    list.add(rs.getInt(1));
-                }
-            }
-        }
-        return list.stream().mapToInt(Integer::intValue).toArray();
-    }
-
-    @Override
     public Map<Integer, ClassStats> getClassStats() throws SQLException {
         Map<Integer, ClassStats> map = new HashMap<>();
         try (Statement stmt = connection.createStatement()) {
-            boolean hasStatsTable = false;
             try (ResultSet rs = stmt.executeQuery("SELECT class_id, instance_count, total_size FROM dhp_class_stats")) {
-                hasStatsTable = true;
                 while (rs.next()) {
                     int classId = rs.getInt(1);
                     int count = rs.getInt(2);
@@ -1174,16 +1194,6 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                     map.put(classId, new ClassStats(classId, count, total));
                 }
             } catch (SQLException ignored) {}
-            if (!hasStatsTable || map.isEmpty()) {
-                try (ResultSet rs = stmt.executeQuery("SELECT class_id, count(*), coalesce(sum(used_size), 0) FROM dhp_objects GROUP BY class_id")) {
-                    while (rs.next()) {
-                        int classId = rs.getInt(1);
-                        int count = rs.getInt(2);
-                        long total = rs.getLong(3);
-                        map.put(classId, new ClassStats(classId, count, total));
-                    }
-                }
-            }
         }
         return map;
     }
@@ -1191,7 +1201,14 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     @Override
     public void close() throws IOException {
         try {
+            for (ReadHandle h : readHandles) {
+                if (!h.shared) {
+                    try { h.conn.close(); } catch (SQLException ignored) {}
+                }
+            }
+            readHandles.clear();
             if (connection != null && !connection.isClosed()) {
+                flushPuts();
                 connection.close();
             }
         } catch (SQLException e) {

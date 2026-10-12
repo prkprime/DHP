@@ -23,6 +23,9 @@ public final class HprofConstants {
         public static final int CONTROL_SETTINGS = 0x0e;
     }
 
+    /** Pseudo root tag (not an HPROF sub-record): artificial root chosen for an unreachable object, like MAT does. */
+    public static final int ROOT_UNREACHABLE = 0x1000;
+
     public static final class DumpSegment {
         public static final int ROOT_UNKNOWN = 0xff;
         public static final int ROOT_JNI_GLOBAL = 0x01;

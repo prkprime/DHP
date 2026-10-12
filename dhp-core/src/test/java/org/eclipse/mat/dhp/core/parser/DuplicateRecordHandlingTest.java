@@ -20,6 +20,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 public class DuplicateRecordHandlingTest {
 
+    // These tests build tiny dumps without GC roots; they exercise record parsing, not MAT's removal of unreachable objects.
+    @org.junit.jupiter.api.BeforeEach
+    void keepUnreachableObjects() {
+        System.setProperty("dhp.keep.unreachable", "true");
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void restoreUnreachableDefault() {
+        System.clearProperty("dhp.keep.unreachable");
+    }
+
+
     @Test
     void testDuplicateInstanceDumpAndDuplicateClassDumpHandling(@TempDir Path tempDir) throws Exception {
         byte[] hprofBytes = buildHprofWithDuplicates();
@@ -48,7 +60,7 @@ public class DuplicateRecordHandlingTest {
         assertThat(objId).isNotEqualTo(-1);
 
         // Outbound edges from objId should not be duplicated
-        List<HeapStorageEngine.ReferenceEdge> edges = storage.outboundEdges.stream()
+        List<MockHeapStorageEngine.ReferenceEdge> edges = storage.outboundEdges.stream()
                 .filter(e -> e.fromObjectId() == objId)
                 .toList();
         // 1 to class (100) + 1 to field (0x9000) = 2 edges
@@ -159,6 +171,22 @@ public class DuplicateRecordHandlingTest {
     }
 
     private static class MockHeapStorageEngine implements HeapStorageEngine {
+
+        record RawObjectRecord(int objectId, long objectAddress, long classId, long usedSize, long filePosition, boolean isArray) {}
+        record ReferenceEdge(int fromObjectId, int seq, int toObjectId) {}
+
+        @Override public void saveObjects(org.eclipse.mat.dhp.core.graph.HeapGraph g) {
+            for (int id = 0; id < g.objectCount(); id++) {
+                objects.add(new RawObjectRecord(id, g.addressOf(id), g.classObjId(id), g.usedSize(id), g.filePosition(id), g.isArray(id)));
+            }
+        }
+        @Override public void saveOutboundEdges(org.eclipse.mat.dhp.core.graph.HeapGraph g) {
+            for (int id = 0; id < g.objectCount(); id++) {
+                for (int k = 0; k < g.outDegree(id); k++) outboundEdges.add(new ReferenceEdge(id, k, g.outEdge(id, k)));
+            }
+        }
+        @Override public void saveInboundEdges(int[] head, int[] to, int n, int ignored) {}
+        @Override public void saveDominators(int[] idom, long[] retained, int n) {}
         final List<RawObjectRecord> objects = new ArrayList<>();
         final List<ReferenceEdge> outboundEdges = new ArrayList<>();
 
@@ -170,10 +198,7 @@ public class DuplicateRecordHandlingTest {
         @Override public void saveClasses(java.util.Collection<HeapRecords.ClassRecord> classes) {}
         @Override public List<HeapRecords.ClassRecord> getAllClasses() { return List.of(); }
         @Override public HeapRecords.ClassRecord getClassById(long classId) { return null; }
-        @Override public void insertObjectsBatch(List<RawObjectRecord> objs) { objects.addAll(objs); }
-        @Override public void insertOutboundReferencesBatch(List<ReferenceEdge> edges) { outboundEdges.addAll(edges); }
         @Override public void insertGcRootsBatch(List<HeapRecords.GcRootRecord> gcRoots) {}
-        @Override public void saveDominatorTreeBatch(List<DominatorNode> dominatorNodes) {}
         @Override public void finishIngestion() {}
         @Override public int getObjectCount() { return objects.size(); }
         @Override public long getObjectAddress(int objectId) { return 0; }
