@@ -31,6 +31,7 @@ $archive = "MemoryAnalyzer-$version-win32.win32.x86_64.zip"
 $destZip = Join-Path $parentDir $archive
 
 $urls = @(
+    "https://ftp.fau.de/eclipse/mat/$baseVersion/rcp/$archive",
     "https://download.eclipse.org/mat/$baseVersion/rcp/$archive",
     "https://mirror.umd.edu/eclipse/mat/$baseVersion/rcp/$archive"
 )
@@ -56,5 +57,11 @@ if (-not $downloaded) {
 Write-Host "Extracting $destZip to $parentDir..."
 Expand-Archive -Path $destZip -DestinationPath $parentDir -Force
 Remove-Item -Path $destZip -Force
+
+# The archive unpacks into a top-level "mat" folder; honour a custom MAT_HOME / target directory name
+$extracted = Join-Path $parentDir "mat"
+if (-not (Test-Path $matDir) -and (Test-Path $extracted)) {
+    Move-Item -Path $extracted -Destination $matDir
+}
 
 Write-Host "Eclipse MAT successfully installed at $matDir"

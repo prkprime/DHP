@@ -99,11 +99,13 @@ public class StreamingHeapDumpGenerator {
             java.io.ByteArrayOutputStream seg1Buf = new java.io.ByteArrayOutputStream(1024 * 1024);
             DataOutputStream seg1Out = new DataOutputStream(seg1Buf);
 
-            // GC roots (2,000 roots)
+            // GC roots (2,000 roots) spread across the whole address range so that most of
+            // the heap is reachable (like a real heap) while a share stays unreachable garbage.
             long baseRootAddr = 0x10000000L;
+            long rootSpan = Math.max(1L, (long) (targetObjects * 0.97) / 2000L);
             for (int r = 0; r < 2000; r++) {
                 seg1Out.writeByte(0xff); // ROOT_UNKNOWN
-                seg1Out.writeLong(baseRootAddr + r * 16L);
+                seg1Out.writeLong(baseRootAddr + (r + 1) * rootSpan * 24L);
             }
 
             // java.lang.Object Class Dump
@@ -176,7 +178,7 @@ public class StreamingHeapDumpGenerator {
                         long classId = classIds[(int) (writtenObjects % numClasses)];
                         sOut.writeLong(classId);
                         sOut.writeInt(16); // bytes following: 8 bytes ref + 8 bytes long
-                        long refAddr = (writtenObjects > 1) ? (objAddr - 24L) : 0L; // reference previous object
+                        long refAddr = backRef(objAddr, writtenObjects, 0x9E3779B1L);
                         sOut.writeLong(refAddr);
                         sOut.writeLong(writtenObjects);
                     } else if (kind < 9) {
@@ -188,7 +190,7 @@ public class StreamingHeapDumpGenerator {
                         sOut.writeInt(arrayLen);
                         sOut.writeLong(javaLangObjectClassId);
                         for (int k = 0; k < arrayLen; k++) {
-                            sOut.writeLong(objAddr - (k + 1) * 24L);
+                            sOut.writeLong(backRef(objAddr, writtenObjects + k, 0x85EBCA6BL * (k + 1)));
                         }
                     } else {
                         // 10% PRIMITIVE_ARRAY_DUMP (byte[] filling payload buffer to reach target GB quickly)
@@ -231,6 +233,15 @@ public class StreamingHeapDumpGenerator {
         System.out.println(String.format("SUCCESS: Generated %.2f GB heap dump in %.1f seconds!", totalGb, elapsed / 1000.0));
         System.out.println("File: " + outputFile.getAbsolutePath());
         System.out.println("================================================================================");
+    }
+
+    /** Deterministic pseudo-random reference to one of the previous 4096 objects (0 if none). */
+    private static long backRef(long objAddr, long n, long salt) {
+        long h = (n * salt) & 0xFFFFFFFFL;
+        h ^= h >>> 15;
+        long dist = 1 + (h % 4096L);
+        long target = objAddr - dist * 24L;
+        return target >= 0x10000000L ? target : 0L;
     }
 
     private static void writeString(DataOutputStream out, long stringId, String str) throws IOException {

@@ -1,0 +1,8 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: DHP parity dump tool
+Bundle-SymbolicName: org.eclipse.mat.dhp.parity;singleton:=true
+Bundle-Version: 1.0.0
+Bundle-RequiredExecutionEnvironment: JavaSE-21
+Require-Bundle: org.eclipse.mat.api,org.eclipse.mat.report,org.eclipse.equinox.app,org.eclipse.core.runtime
+Bundle-ActivationPolicy: lazy

@@ -11,7 +11,7 @@ if exist "%MAT_DIR%\MemoryAnalyzer.exe" (
   exit /b 0
 )
 
-set "PARENT_DIR=%ROOT_DIR%\tools\mat"
+for %%I in ("%MAT_DIR%\..") do set "PARENT_DIR=%%~fI"
 if not exist "%PARENT_DIR%" mkdir "%PARENT_DIR%"
 
 set "BASE_VERSION=1.17.0"
@@ -21,9 +21,10 @@ set "ARCHIVE=MemoryAnalyzer-%VERSION%-win32.win32.x86_64.zip"
 set "DEST_ZIP=%PARENT_DIR%\%ARCHIVE%"
 
 echo Downloading Eclipse MAT %VERSION% for Windows x86_64...
-curl -L --fail --output "%DEST_ZIP%" "https://download.eclipse.org/mat/%BASE_VERSION%/rcp/%ARCHIVE%"
+curl -L --fail --output "%DEST_ZIP%" "https://ftp.fau.de/eclipse/mat/%BASE_VERSION%/rcp/%ARCHIVE%"
+if errorlevel 1 curl -L --fail --output "%DEST_ZIP%" "https://download.eclipse.org/mat/%BASE_VERSION%/rcp/%ARCHIVE%"
 if errorlevel 1 (
-  echo Failed download from primary mirror, trying fallback...
+  echo Failed download from the first mirrors, trying fallback...
   curl -L --fail --output "%DEST_ZIP%" "https://mirror.umd.edu/eclipse/mat/%BASE_VERSION%/rcp/%ARCHIVE%"
 )
 if errorlevel 1 (
@@ -34,5 +35,7 @@ if errorlevel 1 (
 echo Extracting %DEST_ZIP% to %PARENT_DIR%...
 powershell -Command "Expand-Archive -Path '%DEST_ZIP%' -DestinationPath '%PARENT_DIR%' -Force"
 del /f /q "%DEST_ZIP%"
+rem The archive unpacks into a top-level "mat" folder; honour a custom MAT_HOME / target directory name
+if not exist "%MAT_DIR%" if exist "%PARENT_DIR%\mat" move "%PARENT_DIR%\mat" "%MAT_DIR%" >nul
 
 echo Eclipse MAT successfully installed at %MAT_DIR%

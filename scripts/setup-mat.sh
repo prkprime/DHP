@@ -79,6 +79,7 @@ ARCHIVE="MemoryAnalyzer-${VERSION}-${CLASSIFIER}.zip"
 DEST_ZIP="${PARENT_DIR}/${ARCHIVE}"
 
 URLS=(
+  "https://ftp.fau.de/eclipse/mat/${BASE_VERSION}/rcp/${ARCHIVE}"
   "https://download.eclipse.org/mat/${BASE_VERSION}/rcp/${ARCHIVE}"
   "https://www.eclipse.org/downloads/download.php?file=/mat/${BASE_VERSION}/rcp/${ARCHIVE}&r=1"
   "https://mirror.umd.edu/eclipse/mat/${BASE_VERSION}/rcp/${ARCHIVE}"
@@ -104,6 +105,11 @@ fi
 echo "Extracting ${DEST_ZIP} to ${PARENT_DIR}..."
 unzip -q -o "${DEST_ZIP}" -d "${PARENT_DIR}"
 rm -f "${DEST_ZIP}"
+
+# The archive unpacks into a top-level "mat" folder; honour a custom MAT_HOME / target directory name
+if [[ ! -d "${MAT_DIR}" && -d "${PARENT_DIR}/mat" ]]; then
+  mv "${PARENT_DIR}/mat" "${MAT_DIR}"
+fi
 
 if [[ -f "${MAT_DIR}/MemoryAnalyzer" ]]; then
   chmod +x "${MAT_DIR}/MemoryAnalyzer"
