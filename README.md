@@ -4,7 +4,7 @@
 [![License: EPL-2.0](https://img.shields.io/badge/License-EPL%202.0-blue.svg)](https://opensource.org/licenses/EPL-2.0)
 [![Java: 21](https://img.shields.io/badge/Java-21-orange.svg)](https://adoptium.net/)
 
-> **High-throughput, constant-memory HPROF heap dump ingestion and graph engine for Eclipse Memory Analyzer (MAT)**.
+> **High-throughput, low-memory HPROF heap dump ingestion and graph engine for Eclipse Memory Analyzer (MAT)**.
 
 DHP parses massive Java heap dumps (100GB+) without requiring hundreds of gigabytes of RAM. By replacing memory-bound custom indices with an adaptive multi-tiered engine (SQLite WAL with memory budget governor or PostgreSQL) and bulk B-tree index generation, DHP offers high ingestion speeds while keeping memory usage under configurable budgets.
 
@@ -29,11 +29,11 @@ DHP parses massive Java heap dumps (100GB+) without requiring hundreds of gigaby
                                           │
                                           ▼
                       ┌────────────────────────────────────────┐
-                      │           Raw Bulk Tables              │
-                      │    (No PKs or Indexes during ingest)   │
+                      │      In-memory HeapGraph (columns)     │
+                      │   persisted as chunked blobs (SQLite)  │
                       └───────────────────┬────────────────────┘
                                           │
-                          [Bulk B-Tree Index Generation]
+                          [Chunked Bulk Persist]
                                           │
                                           ▼
                       ┌────────────────────────────────────────┐
@@ -59,7 +59,8 @@ DHP parses massive Java heap dumps (100GB+) without requiring hundreds of gigaby
 
 ## Features
 
-- **Constant-Memory Architecture**: Configurable RAM budget (e.g. 1GB–4GB) regardless of whether the heap dump is 2GB or 150GB.
+- **Low-Memory Architecture**: heap use depends on the number of *objects*, not on the size of the dump file (primitive-array payloads are never loaded). Measured: about 55 bytes of heap per object, so a 10.7 GB real HotSpot dump with 51.9M objects ingests in about 70 s at `-Xmx3g`/`-Xmx4g`, and a dump with 100M objects needs roughly 5.5 GB. `dhp-cli --estimate` prints the heap and disk a given dump needs before it is parsed.
+- **Matches Eclipse MAT**: object IDs, shallow and retained sizes, dominators, outbound references, GC roots, thread stacks, class-loader labels and the standard reports (leak suspects, overview, top components) are identical to MAT's own parser on real HotSpot dumps (verified with `tools/parity-check`, see AGENTS.md section 9b). MAT's default of removing unreachable objects is the default here too (`--keep-unreachable` keeps them).
 - **Dynamic Memory Governor**: Self-tunes batch sizes, thread pools, and SQLite page cache sizes based on available system memory.
 - **Zero-Auxiliary In-Place Address Sorting**: Multi-threaded in-place Quicksort (`InPlaceLongSort`) with strictly 0 bytes of auxiliary array allocation, eliminating the `DualPivotQuicksort.tryMergeRuns` OOM spikes on multi-gigabyte dumps with 100M+ objects.
 - **Dynamic String Pruning & Zero-Copy Dedup**: Automatically prunes non-class strings right after class hierarchy resolution and indexes sorted address subranges without duplicate array copies, saving up to 2.5 GB of heap headroom.
@@ -334,8 +335,8 @@ Previous versions suffered from a 10–15 second latency when opening snapshots 
    - `dhp_classes` directly stores pre-resolved `class_obj_id`, `super_class_obj_id`, `class_loader_obj_id`, and `used_size`.
    - `dhp_gc_roots` stores pre-resolved `object_id` and `thread_object_id`.
    - Eliminates over 30,000 JDBC round-trips during snapshot loading.
-3. **Partial B-Tree Indexing & Streaming BitField**:
-   - Partial index `idx_dhp_objects_arrays` on `dhp_objects(object_id) WHERE is_array = 1`.
+3. **Chunked Blob Store & Streaming BitField**:
+   - Per-object data lives in `dhp_chunks` (one row per 512 objects / 32 edge lists) with a byte-bounded LRU chunk cache; array flags are a dedicated bit column.
    - Replaced multi-megabyte `boolean[]` allocations with streaming `populateArrayBitField(IntConsumer)` directly into MAT's `BitField`.
 4. **Schema Initialization Bypass**:
    - `DhpIndexBuilder` and `DhpSnapshotFactory` detect existing tables and skip redundant DDL checks when opening pre-indexed dumps.
@@ -344,7 +345,7 @@ Previous versions suffered from a 10–15 second latency when opening snapshots 
 
 ## Memory-Bounded Ingestion Architecture & Bitmap Analysis
 
-DHP strictly enforces the user-configured memory budget (`--memory-budget` / `-m`) by replacing open-addressing hash maps and hash sets with memory-bounded, zero-rehashing structures:
+DHP keeps the per-object structures compact (primitive arrays instead of hash maps and hash sets, no rehashing spikes). The `--memory-budget` / `-m` option steers batch sizes and the address-map strategy; it does not cap the heap, so run with an `-Xmx` that fits the `--estimate` output:
 
 ### 1. Address-to-ID Map: Sorted Primitive Array vs Open Hash Map
 

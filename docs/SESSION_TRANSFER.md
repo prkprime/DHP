@@ -1,5 +1,7 @@
 # DHP Session Transfer Document
 
+> **Update (2026-10-12, laptop session): the performance work described below is done. Read `## 10. Status after the laptop session` at the end first; sections 1-9 are the original Pi-era handover and parts (the per-row schema, the bottleneck list) are obsolete.**
+
 Written 2026-10-12 on the Raspberry Pi 5 (4 cores, 8 GB RAM, eMMC disk, SSH-only), for continuing on a laptop (16 GB RAM, NVMe, GUI).
 Read this together with `AGENTS.md` and `README.md`. It records what was learned, measured, and decided so work can resume without redoing it.
 
@@ -86,3 +88,23 @@ I did not get a thread dump of Pass 2 (the user stopped that command), so where 
 - Only change relative to HEAD: the untested `HprofBinaryReader.java` rewrite (uncommitted, not included in this commit).
 - Generated, untracked, ignored: `target/` directories, `tools/mat/` (incomplete download), `dump_11g.dhp.db*` (partial), `/tmp/dhp/`, `/tmp/parse11.log`, `/tmp/gc11.log`, `/tmp/setup-all.log`.
 - The 11 GB parse and the MAT download may still be running or may have been killed when the session ended. Check with `pgrep -af 'dhp-cli|curl'`.
+
+
+## 10. Status after the laptop session (2026-10-12)
+
+Result: a real HotSpot 10.7 GB dump (51.9M objects) ingests in about 70 s at `-Xmx4g` (68 s at 3g; the synthetic 11.8 GB / 47.9M-object dump took 57-68 s), database 5.1 GB (was 17 GB for the synthetic dump). Native MAT needs 142 s and a 14 GB heap to index the same dump. DHP is identical to native MAT in object ids, sizes, dominators, edges, roots, thread stacks and all three standard reports. MAT-side report time through DHP is 638 s at a 4 GB heap versus 271 s native.
+
+What changed (see `AGENTS.md` sections 3 and 9b for the current design):
+1. `HprofBinaryReader`: own 1 MB buffer, VarHandle decoding, real seeks for large skips (Pass 1: 4.6 s -> 1 s per 5M objects).
+2. Pass 2 builds an in-memory `HeapGraph` (columns + chunked edge log), single-lookup bucketed address map, per-class precomputed reference offsets; storage is a chunked blob store (`dhp_chunks`) instead of ~29M rows per 5M objects.
+3. `DominatorTreeEngine` works on the graph with staged memory release, persists inbound lists and dominator results; children lists sorted in parallel.
+4. Plugin read path is lock-free per thread (MAT calls the index adapters from many threads; the old global lock serialised them).
+5. MAT parity fixed against the real MAT parser (compressed oops, alignment, class sizes, thread-local roots, system loader, unreachable roots, root types); verified with `tools/parity-check`.
+
+Open items / ideas:
+- Segment-parallel Pass 1/2 (real HotSpot dumps have many HEAP_DUMP_SEGMENTs) was not attempted; Pass 1 (~8 s) and Pass 2 parse (~14 s) would shrink.
+- MAT-side queries are ~2.4x slower than native (638 s vs 271 s for the three standard reports on the 10.7 GB dump): per-object lookups still go through chunk blobs; preloading hot columns (O2CLASS, outbound) into memory/mmap would help.
+- No known parity gaps on real HotSpot dumps. Not handled: `.gz` dumps (rejected), IBM/DTFJ-style class instance records, truncated instance data in the object reader.
+- Pre-existing issues left alone: MAT's "Top Consumers" query throws an NPE on synthetic dumps (also with the old code); a dump truncated at a subrecord boundary is accepted as complete; gzip dumps record decompressed positions that the plugin cannot seek.
+- Interrupted ingestion is detectable (`numberOfObjects` is persisted last) and re-runnable.
+- Code review was done with codex in four rounds (the last one of the whole repository); all valid findings were fixed, see AGENTS.md section 9b for what is verified and what is untested (PostgreSQL, Windows scripts).

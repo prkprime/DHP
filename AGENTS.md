@@ -6,7 +6,7 @@ Welcome to the **Dynamic Heap Parser (DHP)** repository. This document serves as
 
 ## 1. Project Mission & Core Architecture
 
-DHP is a high-throughput, constant-memory HPROF heap dump ingestion and graph engine designed as a drop-in storage and index provider for **Eclipse Memory Analyzer (MAT)**.
+DHP is a high-throughput, low-memory HPROF heap dump ingestion and graph engine designed as a drop-in storage and index provider for **Eclipse Memory Analyzer (MAT)**.
 
 Standard Eclipse MAT relies on custom in-memory and disk-paged index files (`.idx`, `.o2c`, `.inbound`, `.outbound`, `.dom`) that consume significant RAM during generation. DHP solves this bottleneck by streaming HPROF records into an optimized relational database engine (SQLite WAL with memory budget governance or PostgreSQL) and computing dominator trees and retained sizes before exposing standard MAT preliminary indexes.
 
@@ -36,7 +36,7 @@ Standard Eclipse MAT relies on custom in-memory and disk-paged index files (`.id
                                          │
                                          ▼
                      ┌────────────────────────────────────────┐
-                     │      Bulk B-Tree Index Generation      │
+                     │   In-memory HeapGraph + chunked store   │
                      │  - Unique PKs on object_id & address   │
                      │  - Composite indexes on references     │
                      └───────────────────┬────────────────────┘
@@ -64,7 +64,7 @@ The project is structured as a Maven multi-module reactor under Java 21:
 | Module | Artifact ID | Description |
 | :--- | :--- | :--- |
 | **`dhp-core`** | `org.eclipse.mat.dhp:dhp-core` | Core parsing and graph logic: `HprofBinaryReader`, `Pass1ScanParser`, `Pass2ObjectIngester`, `DominatorTreeEngine`, `MemoryGovernor`, `HeapRecords`, and memory-bounded data structures (`IAddressToIdMap`, `SortedAddressToIdMap`, `ChunkedAddressToIdMap`, `MmapAddressToIdMap`, `BitSetMembershipSet`, `RoaringMembershipSet`). Contains zero JDBC code. |
-| **`dhp-storage-jdbc`** | `org.eclipse.mat.dhp:dhp-storage-jdbc` | JDBC storage abstraction and engine: `HeapStorageEngine` interface and `JdbcHeapStorageEngine` implementation supporting SQLite WAL and PostgreSQL with HikariCP connection pooling and bulk indexing. |
+| **`dhp-storage-jdbc`** | `org.eclipse.mat.dhp:dhp-storage-jdbc` | JDBC storage abstraction and engine: `HeapStorageEngine` interface and `JdbcHeapStorageEngine` implementation supporting SQLite WAL and PostgreSQL with one write connection plus a lock-free per-thread read connection (plain `DriverManager`, no pool) and bulk chunk writes. |
 | **`dhp-cli`** | `org.eclipse.mat.dhp:dhp-cli` | Command-line interface (`DhpMain`) using Picocli to parse dumps directly from the shell or execute headless database staging. Packaged as a fat JAR with `maven-shade-plugin`. |
 | **`dhp-mat-plugin`** | `org.eclipse.mat.dhp:dhp-mat-plugin` | Eclipse MAT plugin implementing `IIndexBuilder` (`DhpIndexBuilder`) and `IObjectReader` (`DhpHeapObjectReader`), database-backed index adapters (`DbOne2LongIndex`, `DbOne2OneIndex`, `DbOne2ManyIndex`, `DbOne2SizeIndex`), packaged as an OSGi bundle with `plugin.xml` and shaded runtime dependencies. |
 
@@ -72,23 +72,20 @@ The project is structured as a Maven multi-module reactor under Java 21:
 
 ## 3. Database Schema & Indexing Strategy
 
-To achieve constant memory usage and avoid intermediate lock contention during ingestion:
-1. **Raw Ingestion Phase**: Tables are created without secondary indexes or primary key constraints. Records are inserted in large batches (`INSERT INTO dhp_objects...`, `INSERT INTO dhp_outbound_references...`).
-2. **Bulk Index Phase**: Once Pass 2 finishes, indexes and constraints are created in parallel via `CREATE UNIQUE INDEX` and `CREATE INDEX`.
+To keep ingestion fast and its memory proportional to the object count (about 55 bytes per object; a 10.7 GB / 51.9M-object real dump ingests in ~70 s at -Xmx3g-4g):
+1. **In-memory graph**: Pass 2 fills a `HeapGraph` (primitive per-object columns plus a compact edge log) instead of inserting rows. SQLite inserts cost ~1.3 us per row regardless of journal mode, so per-object/per-edge rows dominated ingestion (29M rows per 5M objects).
+2. **Chunked bulk persist**: the finished graph is written in a few bulk calls (`saveObjects`, `saveOutboundEdges`, `saveInboundEdges`, `saveDominators`) as blobs in a single `dhp_chunks` table, one row per chunk of 512 objects (scalar columns) or 32 objects (edge lists). Bulk ingestion runs with `journal_mode=OFF`, `synchronous=OFF`; WAL is restored when the dominator tree has been written.
 
 ### Tables
 
 - **`dhp_snapshot_info`**: Key-value pairs for snapshot metadata (`idSize`, `creationDate`, `totalHeapSize`, `numberOfObjects`). Precomputes aggregates in `finishIngestion()` to achieve sub-millisecond retrieval.
 - **`dhp_classes`**: Stores `class_id`, `super_class_id`, `class_loader_id`, `class_name`, `instance_size`, `fields_data`, `static_fields_data`, and pre-resolved `class_obj_id`, `super_class_obj_id`, `class_loader_obj_id`, and `used_size`. Supports full Class Hierarchy navigation and Static Fields in MAT's Inspector view.
 - **`dhp_class_stats`**: Stores pre-aggregated `class_id`, `instance_count`, and `total_size` populated in `finishIngestion()`, eliminating costly full-table `GROUP BY` aggregations during snapshot open.
-- **`dhp_objects`**: Primary entity table storing `object_id` (0-indexed integer), `object_address` (JVM 64-bit pointer), `class_id`, `used_size` (shallow size), `file_position` (byte offset in `.hprof`), and `is_array`. Indexed by `idx_dhp_objects_arrays` partial index (`WHERE is_array = 1`).
-- **`dhp_outbound_references`**: Directed edges `(from_object_id, seq, to_object_id)` representing object references.
-- **`dhp_inbound_references`**: Reverse edges `(to_object_id, from_object_id)` for incoming references.
+- **`dhp_chunks`**: `chunk_key = (kind << 32) | chunk` -> `data` BLOB (little-endian). Kinds: address, class object ID, shallow size, file position and array-flag columns (512 objects per chunk); outbound, inbound and dominated-children lists (32 objects per chunk: `[huge-list mask][33 offsets][targets]`, lists above 16K entries are stored out of line); dominator ID and retained size columns; objects grouped by class; first-address-per-chunk index used for address lookups (instances are ID-ordered by address, so lookup is a binary search over chunks).
 - **`dhp_gc_roots`**: Root pointers `(object_id, object_address, referrer_address, root_type, thread_address, thread_object_id)` with pre-resolved `object_id` and `thread_object_id`.
-- **`dhp_dominator_tree`**: Dominator computation results: `object_id`, `dominator_id`, and `retained_size`.
 
 ### Storage Model & File Size Disparity (Why 58MB SQLite for a 2.2GB Dump)
-In HPROF format, 85-95% of file size comprises primitive array payload buffers (`byte[]`, `char[]`, `int[]`). DHP stores the object graph topology, relationships, metadata, and dominator trees in SQLite (~58 MB), while recording the exact byte offset (`file_position`) in `dhp_objects`. `DhpHeapObjectReader` performs zero-memory-overhead random seeks into `.hprof` only when array contents or instance field values are inspected, matching Eclipse MAT's native architecture where index files are similarly 15-30 MB.
+In HPROF format, 85-95% of file size comprises primitive array payload buffers (`byte[]`, `char[]`, `int[]`). DHP stores the object graph topology, relationships, metadata, and dominator trees in SQLite (~58 MB for a 2.2 GB dump; ~5.4 GB for the 11 GB / 47.9M-object synthetic dump), while recording the exact byte offset (`file_position`) in the object position column. `DhpHeapObjectReader` performs zero-memory-overhead random seeks into `.hprof` only when array contents or instance field values are inspected, matching Eclipse MAT's native architecture where index files are similarly 15-30 MB.
 
 ---
 
@@ -266,6 +263,31 @@ java -jar dhp-cli/target/dhp-cli-1.0.0-SNAPSHOT.jar \
 ```
 
 ---
+
+## 9b. Verifying Parity Against Native MAT
+
+Comparing DHP with an earlier DHP build only proves nothing regressed. To prove it matches Eclipse MAT, use `tools/parity-check`:
+
+1. Make a real dump (`java -Xmx13g -XX:+UseParallelGC tools/dump-generator/RealHeapDumpGenerator.java out.hprof [liveGB] [seed] [payloadBytes]`, which asks HotSpot itself for the dump).
+2. `tools/parity-check/build.sh` builds and registers the OSGi application `org.eclipse.mat.dhp.parity.dump` in `tools/mat/mat`.
+3. Dump a canonical per-object view through MAT's API for the native dump and for the DHP descriptor: `MemoryAnalyzer -consolelog -nosplash -application org.eclipse.mat.dhp.parity.dump <dump.hprof|x.dhp> out.tsv [sampleMod]` (`sampleMod` keeps only objects with `(address/8) % mod == 0`; use it on huge dumps).
+4. `LC_ALL=C sort -t$'\t' -k1,1` both files and run `python3 tools/parity-check/compare.py native.s.tsv dhp.s.tsv`.
+
+Measured result (MAT 1.17, default settings): DHP is identical to the native MAT parser. On a 9.4M-object real HotSpot dump (full comparison) and on a 10.7 GB real dump with 51.9M objects (1/64 and 1/61 samples keyed by address, about 0.8M objects each) there are zero differences in object ids, class, shallow size, retained size, immediate dominator, outbound references and GC roots (type and context); the `.threads` stack files are identical; and every page of the leak suspects, system overview and top components reports is identical (`tools/parity-check/compare_reports.py`, which ignores only the dump path).
+
+Timings on the 10.7 GB dump (this laptop, 12 cores, NVMe):
+
+| | native MAT | DHP |
+|---|---|---|
+| index / ingest | 142 s at `-Xmx14g` | 70 s at `-Xmx4g` (68 s at `-Xmx3g`, fails at 2.5g) |
+| disk | 3.1 GB of index files | 5.1 GB database |
+| three standard reports | 271 s at 14 GB | 638 s at a 4 GB MAT heap |
+
+DHP is faster to ingest and uses far less memory; reports through MAT are about 2.4x slower because every index lookup goes through chunk blobs in SQLite instead of memory-mapped files.
+
+Known limitations: compressed (`.gz`) dumps are rejected (recorded positions would refer to the decompressed stream); dumps that encode class objects as `INSTANCE_DUMP` records (IBM/DTFJ style) are not handled; PostgreSQL support and the Windows scripts are untested in this environment; the object reader fails with a clear error when the original dump file is missing instead of returning default values.
+
+MAT semantics DHP replicates (all found by this comparison): `refSize` is 4 when compressed oops are detected (an object array starting inside the span the previous array would cover with 8-byte refs), objects are aligned to the GCD of address gaps (min 8), class-object shallow size is the aligned statics only, stack-local roots of a known thread are not GC roots (the thread object references them), the artificial system class loader has only a class edge and is not a root, classes of the system loader become roots only if the dump has no sticky-class roots, and unreachable objects are promoted to `UNREACHABLE` roots by MAT's multi-pass heuristic (`UnreachableRoots`).
 
 ## 10. Developer & Coding Guidelines
 
