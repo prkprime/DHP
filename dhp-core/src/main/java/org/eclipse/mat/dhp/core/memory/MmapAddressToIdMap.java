@@ -27,6 +27,7 @@ public class MmapAddressToIdMap implements IAddressToIdMap {
     private final int instanceCount;
     private final int baseInstanceId;
     private final int totalSize;
+    private final ClassAddressIndex classAddresses;
 
     // 1GB per mapped buffer chunk (must be multiple of 8 bytes for longs)
     private static final long CHUNK_BYTES = 1024L * 1024 * 1024;
@@ -41,6 +42,7 @@ public class MmapAddressToIdMap implements IAddressToIdMap {
         this.instanceCount = instanceCount;
         this.baseInstanceId = baseInstanceId;
         this.totalSize = this.classAddressToId.size() + instanceCount;
+        this.classAddresses = new ClassAddressIndex(this.classAddressToId, baseInstanceId);
 
         File dir = (tempDir != null && tempDir.isDirectory()) ? tempDir : null;
         this.tempFile = File.createTempFile("dhp_addr_mmap_", ".tmp", dir);
@@ -108,6 +110,16 @@ public class MmapAddressToIdMap implements IAddressToIdMap {
     @Override
     public int size() {
         return totalSize;
+    }
+
+    @Override
+    public long addressOf(int objectId) {
+        if (objectId >= baseInstanceId) {
+            int idx = objectId - baseInstanceId;
+            if (idx >= instanceCount) return 0L;
+            return buffers[idx / LONGS_PER_CHUNK].getLong((idx % LONGS_PER_CHUNK) * 8);
+        }
+        return classAddresses.get(objectId);
     }
 
     @Override

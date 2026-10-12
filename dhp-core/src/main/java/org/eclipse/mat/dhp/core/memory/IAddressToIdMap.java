@@ -24,6 +24,13 @@ public interface IAddressToIdMap extends AutoCloseable {
      */
     int size();
 
+    /**
+     * Reverse lookup: the 64-bit JVM address of the object with the given 32-bit ID.
+     * Class objects (and the synthetic system class loader at address 0) occupy the low ID range,
+     * instances follow in ascending address order.
+     */
+    long addressOf(int objectId);
+
     @Override
     default void close() {
         // Default no-op for purely in-memory maps

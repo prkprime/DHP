@@ -16,6 +16,7 @@ public class ChunkedAddressToIdMap implements IAddressToIdMap {
     private final int instanceCount;
     private final int baseInstanceId;
     private final int totalSize;
+    private final ClassAddressIndex classAddresses;
 
     public ChunkedAddressToIdMap(Long2IntOpenHashMap classAddressToId, long[] sortedAddresses, int baseInstanceId) {
         this(classAddressToId, sortedAddresses, sortedAddresses != null ? sortedAddresses.length : 0, baseInstanceId);
@@ -26,6 +27,7 @@ public class ChunkedAddressToIdMap implements IAddressToIdMap {
         this.instanceCount = instanceCount;
         this.baseInstanceId = baseInstanceId;
         this.totalSize = this.classAddressToId.size() + instanceCount;
+        this.classAddresses = new ClassAddressIndex(this.classAddressToId, baseInstanceId);
 
         if (instanceCount > 0) {
             int numChunks = (instanceCount + CHUNK_SIZE - 1) >>> CHUNK_SHIFT;
@@ -72,5 +74,14 @@ public class ChunkedAddressToIdMap implements IAddressToIdMap {
     @Override
     public int size() {
         return totalSize;
+    }
+
+    @Override
+    public long addressOf(int objectId) {
+        if (objectId >= baseInstanceId) {
+            int idx = objectId - baseInstanceId;
+            return idx < instanceCount ? chunks[idx >>> CHUNK_SHIFT][idx & CHUNK_MASK] : 0L;
+        }
+        return classAddresses.get(objectId);
     }
 }

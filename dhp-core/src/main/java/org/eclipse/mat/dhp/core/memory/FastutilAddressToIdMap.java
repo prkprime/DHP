@@ -27,4 +27,21 @@ public class FastutilAddressToIdMap implements IAddressToIdMap {
     public int size() {
         return map.size();
     }
+
+    private long[] reverse;
+
+    @Override
+    public synchronized long addressOf(int objectId) {
+        if (reverse == null) {
+            int max = -1;
+            for (int id : map.values()) {
+                max = Math.max(max, id);
+            }
+            reverse = new long[max + 1];
+            for (it.unimi.dsi.fastutil.longs.Long2IntMap.Entry e : map.long2IntEntrySet()) {
+                reverse[e.getIntValue()] = e.getLongKey();
+            }
+        }
+        return objectId >= 0 && objectId < reverse.length ? reverse[objectId] : 0L;
+    }
 }
