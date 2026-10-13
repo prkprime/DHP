@@ -199,11 +199,31 @@ public class DhpHeapObjectReader implements IObjectReader {
         List<Field> instanceFields = new ArrayList<>(layout.length);
         if (raf != null && filePos > 0) {
             // INSTANCE_DUMP: [tag: 1][id: idSize][serial: 4][classId: idSize][bytesFollowing: 4][field values]
-            long pos = filePos + 1 + idSize + 4 + idSize + 4;
+            long pos = filePos + 1 + idSize + 4 + idSize;
+            int bytes = raf.getInt(pos);
+            byte[] data = new byte[bytes];
+            raf.copy(pos + 4, data, 0, bytes);
+            int off = 0;
             for (FieldDescriptor fd : layout) {
                 int type = fd.getType();
-                instanceFields.add(new Field(fd.getName(), type, readBinaryValue(type, pos, snapshot)));
-                pos += type == IObject.Type.OBJECT ? idSize : IPrimitiveArray.ELEMENT_SIZE[type];
+                Object val;
+                switch (type) {
+                    case IObject.Type.OBJECT -> {
+                        long id = idSize == 4 ? be(data, off, 4) & 0xFFFFFFFFL : be(data, off, 8);
+                        val = id == 0 ? null : new ObjectReference(snapshot, id);
+                        off += idSize;
+                    }
+                    case IObject.Type.BOOLEAN -> { val = data[off] != 0; off += 1; }
+                    case IObject.Type.BYTE -> { val = data[off]; off += 1; }
+                    case IObject.Type.CHAR -> { val = (char) be(data, off, 2); off += 2; }
+                    case IObject.Type.SHORT -> { val = (short) be(data, off, 2); off += 2; }
+                    case IObject.Type.INT -> { val = (int) be(data, off, 4); off += 4; }
+                    case IObject.Type.LONG -> { val = be(data, off, 8); off += 8; }
+                    case IObject.Type.FLOAT -> { val = Float.intBitsToFloat((int) be(data, off, 4)); off += 4; }
+                    case IObject.Type.DOUBLE -> { val = Double.longBitsToDouble(be(data, off, 8)); off += 8; }
+                    default -> val = null;
+                }
+                instanceFields.add(new Field(fd.getName(), type, val));
             }
         } else {
             for (FieldDescriptor fd : layout) {
@@ -220,22 +240,12 @@ public class DhpHeapObjectReader implements IObjectReader {
         }
     }
 
-    private Object readBinaryValue(int type, long pos, ISnapshot snapshot) throws IOException {
-        return switch (type) {
-            case IObject.Type.OBJECT -> {
-                long id = (idSize == 4) ? (raf.getInt(pos) & 0xFFFFFFFFL) : raf.getLong(pos);
-                yield id == 0 ? null : new ObjectReference(snapshot, id);
-            }
-            case IObject.Type.BOOLEAN -> raf.getByte(pos) != 0;
-            case IObject.Type.BYTE -> raf.getByte(pos);
-            case IObject.Type.CHAR -> raf.getChar(pos);
-            case IObject.Type.SHORT -> raf.getShort(pos);
-            case IObject.Type.INT -> raf.getInt(pos);
-            case IObject.Type.LONG -> raf.getLong(pos);
-            case IObject.Type.FLOAT -> Float.intBitsToFloat(raf.getInt(pos));
-            case IObject.Type.DOUBLE -> Double.longBitsToDouble(raf.getLong(pos));
-            default -> null;
-        };
+    private static long be(byte[] d, int off, int n) {
+        long v = 0;
+        for (int i = 0; i < n; i++) {
+            v = (v << 8) | (d[off + i] & 0xFFL);
+        }
+        return v;
     }
 
     @FunctionalInterface

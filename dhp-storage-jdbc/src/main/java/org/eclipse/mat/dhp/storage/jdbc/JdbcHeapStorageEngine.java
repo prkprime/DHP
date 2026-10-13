@@ -5,6 +5,7 @@ import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
@@ -42,6 +43,8 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     private final boolean isPostgres;
 
     private Connection connection;
+    /** Memory-mapped chunk store next to a file-backed SQLite database; null when chunks live in the dhp_chunks table. */
+    private volatile ChunkFile chunkFile;
 
     public JdbcHeapStorageEngine(String jdbcUrl, String user, String password, long memoryBudgetBytes) throws SQLException {
         this.jdbcUrl = jdbcUrl;
@@ -59,6 +62,51 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         }
 
         this.connection.setAutoCommit(false);
+        if (isSqlite) {
+            openChunkFileIfPresent();
+        }
+    }
+
+    private static final int[] SPARSE_KINDS = {11, 12, 13, 15}; // K_OUT_HUGE, K_IN_HUGE, K_CHILD_HUGE, K_CLASS_INSTANCES
+
+    /** The chunk file that belongs to this database, or null for in-memory and non-SQLite databases. */
+    private File chunkFilePath() {
+        if (!isSqlite || jdbcUrl.contains(":memory:") || jdbcUrl.contains("mode=memory")) {
+            return null;
+        }
+        String path = jdbcUrl.substring("jdbc:sqlite:".length());
+        int q = path.indexOf('?');
+        if (q >= 0) {
+            path = path.substring(0, q);
+        }
+        if (path.startsWith("file:")) {
+            path = path.substring(5);
+        }
+        return path.isEmpty() ? null : new File(path + ".chunks");
+    }
+
+    private void openChunkFileIfPresent() throws SQLException {
+        File f = chunkFilePath();
+        if (f == null) {
+            return;
+        }
+        String flag = null;
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery("SELECT property_value FROM dhp_snapshot_info WHERE property_key = 'chunkFile'")) {
+            if (rs.next()) {
+                flag = rs.getString(1);
+            }
+        } catch (SQLException noTable) {
+            return; // not ingested yet
+        }
+        if (!"1".equals(flag)) {
+            return;
+        }
+        try {
+            chunkFile = ChunkFile.open(f, SPARSE_KINDS);
+        } catch (IOException e) {
+            throw new SQLException("The database " + jdbcUrl + " keeps its data in " + f + ", which cannot be read: " + e.getMessage(), e);
+        }
     }
 
     private void configureSqlite(long memoryBudgetBytes) throws SQLException {
@@ -127,11 +175,41 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             }
         }
         connection.commit();
+        if (isSqlite) {
+            // dropping tables only frees pages inside the file: give the space back (VACUUM cannot run in a transaction)
+            connection.setAutoCommit(true);
+            try (Statement stmt = connection.createStatement()) {
+                stmt.execute("VACUUM");
+            } finally {
+                connection.setAutoCommit(false);
+            }
+        }
+        ChunkFile old = chunkFile;
+        chunkFile = null;
+        File cf = chunkFilePath();
+        try {
+            if (old != null) {
+                old.closeAndUnmap();
+            }
+            if (cf != null) {
+                java.nio.file.Files.deleteIfExists(cf.toPath());
+            }
+        } catch (IOException e) {
+            throw new SQLException("Cannot delete " + cf + ": " + e.getMessage(), e);
+        }
         log.info("Existing DHP tables successfully dropped.");
     }
 
     @Override
     public void initializeSchema() throws SQLException {
+        File cf = chunkFilePath();
+        if (cf != null && chunkFile == null) {
+            try {
+                chunkFile = ChunkFile.create(cf, SPARSE_KINDS);
+            } catch (IOException e) {
+                throw new SQLException("Cannot create " + cf + ": " + e.getMessage(), e);
+            }
+        }
         String unlogged = isPostgres ? "UNLOGGED " : "";
         if (isSqlite) {
             // Bulk load: a crashed ingestion is simply redone, so skip the journal and fsyncs (every page is
@@ -627,7 +705,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         ReadHandle(Connection conn, boolean shared) throws SQLException {
             this.conn = conn;
             this.shared = shared;
-            this.psChunk = conn.prepareStatement("SELECT data FROM dhp_chunks WHERE chunk_key = ?");
+            this.psChunk = conn == null ? null : conn.prepareStatement("SELECT data FROM dhp_chunks WHERE chunk_key = ?");
             java.util.Arrays.fill(keys, -1L);
         }
     }
@@ -637,7 +715,11 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     private ReadHandle handle() throws SQLException {
         ReadHandle h = readHandle.get();
-        if (h == null) {
+        if (h == null && chunkFile != null) {
+            h = new ReadHandle(null, false); // chunks come from the mapped file: no connection needed
+            readHandles.add(h);
+            readHandle.set(h);
+        } else if (h == null) {
             boolean sharedOnly = isSqlite && (jdbcUrl.contains(":memory:") || jdbcUrl.contains("mode=memory"));
             if (sharedOnly) {
                 synchronized (connection) {
@@ -648,7 +730,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
                 if (isSqlite) {
                     try (Statement st = c.createStatement()) {
                         st.execute("PRAGMA cache_size = -32768;");
-                        st.execute("PRAGMA mmap_size = 2147483648;");
+                        st.execute("PRAGMA mmap_size = 137438953472;"); // 128 GB of address space: the database is read through the page cache, never copied
                     }
                 }
                 h = new ReadHandle(c, false);
@@ -667,7 +749,14 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             return h.vals[slot];
         }
         byte[] b;
-        if (h.shared) {
+        ChunkFile cf = chunkFile;
+        if (cf != null) {
+            try {
+                b = cf.read(kind, chunkNo);
+            } catch (java.io.IOException e) {
+                throw new SQLException("Cannot read " + cf + ": " + e.getMessage(), e);
+            }
+        } else if (h.shared) {
             synchronized (connection) {
                 b = fetch(h, k);
             }
@@ -689,6 +778,15 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     }
 
     private void putChunk(int kind, long chunkNo, byte[] data) throws SQLException {
+        ChunkFile cf = chunkFile;
+        if (cf != null) {
+            try {
+                cf.put(kind, chunkNo, data);
+            } catch (java.io.IOException e) {
+                throw new SQLException("Cannot write " + cf + ": " + e.getMessage(), e);
+            }
+            return;
+        }
         if (psChunkPut == null) {
             psChunkPut = connection.prepareStatement(
                     isPostgres ? "INSERT INTO dhp_chunks(chunk_key, data) VALUES(?, ?) ON CONFLICT (chunk_key) DO UPDATE SET data = EXCLUDED.data"
@@ -1000,6 +1098,15 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             }
             log.info("PostgreSQL tables converted to LOGGED in {} ms", System.currentTimeMillis() - tl);
         }
+        ChunkFile cf = chunkFile;
+        if (cf != null && !cf.isReadOnly()) {
+            try {
+                cf.finish();
+            } catch (java.io.IOException e) {
+                throw new SQLException("Cannot finish " + cf + ": " + e.getMessage(), e);
+            }
+            saveSnapshotInfo("chunkFile", "1");
+        }
         // the completion marker comes last: only a fully durable, complete snapshot counts as ingested
         saveSnapshotInfo("numberOfObjects", String.valueOf(n));
         cachedObjectCount = n;
@@ -1179,6 +1286,21 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     /** Sequentially visits all chunks of a kind in order, bypassing the point-lookup cache. */
     private void scanKind(int kind, ChunkVisitor visitor) throws SQLException {
+        ChunkFile cf = chunkFile;
+        if (cf != null) {
+            try {
+                int n = cf.chunkCount(kind);
+                for (int c = 0; c < n; c++) {
+                    byte[] b = cf.read(kind, c);
+                    if (b != null) {
+                        visitor.visit(c, b);
+                    }
+                }
+            } catch (java.io.IOException e) {
+                throw new SQLException("Cannot read " + cf + ": " + e.getMessage(), e);
+            }
+            return;
+        }
         try (PreparedStatement ps = connection.prepareStatement(
                 "SELECT chunk_key, data FROM dhp_chunks WHERE chunk_key >= ? AND chunk_key < ? ORDER BY chunk_key")) {
             ps.setLong(1, key(kind, 0));
@@ -1245,11 +1367,15 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     public void close() throws IOException {
         try {
             for (ReadHandle h : readHandles) {
-                if (!h.shared) {
+                if (!h.shared && h.conn != null) {
                     try { h.conn.close(); } catch (SQLException ignored) {}
                 }
             }
             readHandles.clear();
+            ChunkFile cf = chunkFile;
+            if (cf != null) {
+                cf.close();
+            }
             if (connection != null && !connection.isClosed()) {
                 flushPuts();
                 connection.close();

@@ -73,6 +73,7 @@ public class DumpApp implements IApplication {
                 case "objects" -> dumpObjects(snapshot, w);
                 case "loaders" -> dumpLoaders(snapshot, w);
                 case "classes" -> dumpClasses(snapshot, w);
+                case "bench" -> bench(snapshot, w);
                 case "inspect" -> {
                     long mod = args.length > 3 ? Long.parseLong(args[3]) : 1000L;
                     inspect(snapshot, w, mod);
@@ -137,6 +138,38 @@ public class DumpApp implements IApplication {
             w.println(sb);
         }
         System.out.println("PARITY written objects");
+    }
+
+    /** Per-operation cost of the snapshot primitives that every query is built from (ns per object). */
+    private void bench(ISnapshot s, PrintWriter w) throws Exception {
+        int n = s.getSnapshotInfo().getNumberOfObjects();
+        int step = Math.max(1, n / 2_000_000);
+        if (System.getenv("BENCH_OUTBOUND") != null) {
+            long sink = 0;
+            for (int r = 0; r < 12; r++) for (int i = 0; i < n; i += step) sink += s.getOutboundReferentIds(new int[]{i}, null).length;
+            w.println(sink);
+            return;
+        }
+        for (int round = 0; round < 2; round++) {
+            long t = System.nanoTime(); long sink = 0; int c = 0;
+            for (int i = 0; i < n; i += step, c++) sink += s.mapIdToAddress(i);
+            long t1 = System.nanoTime();
+            for (int i = 0; i < n; i += step) sink += s.getClassOf(i).getObjectId();
+            long t2 = System.nanoTime();
+            for (int i = 0; i < n; i += step) sink += s.getHeapSize(i);
+            long t3 = System.nanoTime();
+            for (int i = 0; i < n; i += step) sink += s.getRetainedHeapSize(i);
+            long t4 = System.nanoTime();
+            for (int i = 0; i < n; i += step) sink += s.getOutboundReferentIds(new int[]{i}, null).length;
+            long t5 = System.nanoTime();
+            for (int i = 0; i < n; i += step) sink += s.getObject(i).getObjectId();
+            long t6 = System.nanoTime();
+            for (int i = 0; i < n; i += step) { var o = s.getObject(i); if (o instanceof org.eclipse.mat.snapshot.model.IInstance in) sink += in.getFields().size(); }
+            long t7 = System.nanoTime();
+            w.printf("round %d, %d objects: mapIdToAddress %d ns, getClassOf %d ns, getHeapSize %d ns, getRetained %d ns, outbound %d ns, getObject %d ns, getObject+fields %d ns (%d)%n",
+                    round, c, (t1 - t) / c, (t2 - t1) / c, (t3 - t2) / c, (t4 - t3) / c, (t5 - t4) / c, (t6 - t5) / c, (t7 - t6) / c, sink & 1);
+            w.flush();
+        }
     }
 
     /** All classes in the order MAT enumerates them (hash map order), with their ids. */
