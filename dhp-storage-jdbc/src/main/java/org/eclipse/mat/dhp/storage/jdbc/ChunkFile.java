@@ -78,7 +78,12 @@ final class ChunkFile implements AutoCloseable {
         ChunkFile f = new ChunkFile(file, sparseKinds);
         f.raf = new RandomAccessFile(file, "r");
         f.channel = f.raf.getChannel();
-        f.mapForReading();
+        try {
+            f.mapForReading();
+        } catch (IOException | RuntimeException e) {
+            f.closeAndUnmap(); // do not leak the handle of a file that is not usable (Windows could not delete it)
+            throw e;
+        }
         return f;
     }
 
