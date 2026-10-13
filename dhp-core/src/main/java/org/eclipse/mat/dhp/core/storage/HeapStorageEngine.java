@@ -101,6 +101,12 @@ public interface HeapStorageEngine extends Closeable {
     default void saveClassOrder(java.util.List<long[]> rows) throws SQLException {}
 
     /** Rows saved by {@link #saveClassOrder}, ordered by dump sequence; empty if the database predates them. */
+    /**
+     * MAT's minimum retained size per class (class object id -> bytes): the summed retained sizes of the class object and
+     * its instances that no other member dominates. MAT shows it in the histogram without a calculation.
+     */
+    default java.util.Map<Integer, Long> getClassMinRetainedSizes() throws SQLException { return java.util.Collections.emptyMap(); }
+
     default java.util.List<long[]> getClassOrder() throws SQLException { return java.util.List.of(); }
 
     record ClassStats(

@@ -109,4 +109,31 @@ class JdbcHeapStorageEngineTest {
         assertThat(updated.classObjId()).isEqualTo(5);
         assertThat(updated.usedSize()).isEqualTo(16L);
     }
+
+    @Test
+    void aFinishedSnapshotSurvivesReopeningAndKeepsDominatorData() throws Exception {
+        // objects 0..3 are all of class 0 (object 0 is the class object); dominator tree: 0 -> 1 -> 2, 3 under the root
+        var map = new org.eclipse.mat.dhp.core.memory.SortedAddressToIdMap(
+                new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap(), new long[]{0x10L, 0x20L, 0x30L, 0x40L}, 0);
+        var graph = new org.eclipse.mat.dhp.core.graph.HeapGraph(4, 0, map);
+        for (int i = 0; i < 4; i++) {
+            graph.setObject(i, 0, 8L, 100L + i, false);
+        }
+        storage.saveObjects(graph);
+        storage.saveDominators(new int[]{-1, 0, 1, -1}, new long[]{100, 60, 20, 7}, 4);
+        storage.close();
+
+        try (JdbcHeapStorageEngine reopened = new JdbcHeapStorageEngine("jdbc:sqlite:" + dbFile.getAbsolutePath(), "", "", 64L << 20)) {
+            assertThat(reopened.getObjectCount()).isEqualTo(4);
+            assertThat(reopened.getDominatorId(2)).isEqualTo(1);
+            assertThat(reopened.getRetainedSize(1)).isEqualTo(60);
+            assertThat(reopened.getImmediateDominatedIds(0)).containsExactly(1);
+            assertThat(reopened.getImmediateDominatedIds(-1)).containsExactly(0, 3);
+            // the set of class 0 is {0, 1, 2, 3} plus the class object again (object 0 is an instance of its own class, as
+            // java.lang.Class is): only members no other member dominates count: 0 twice (100 each) and 3 (7)
+            assertThat(reopened.getClassMinRetainedSizes()).containsExactly(java.util.Map.entry(0, 207L));
+            assertThat(reopened.getObjectsByClassId(0)).containsExactly(0, 1, 2, 3);
+        }
+        storage = null; // already closed
+    }
 }

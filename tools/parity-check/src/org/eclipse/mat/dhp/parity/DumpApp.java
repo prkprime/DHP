@@ -74,6 +74,7 @@ public class DumpApp implements IApplication {
                 case "loaders" -> dumpLoaders(snapshot, w);
                 case "classes" -> dumpClasses(snapshot, w);
                 case "bench" -> bench(snapshot, w);
+                case "classretained" -> dumpClassRetained(snapshot, w);
                 case "inspect" -> {
                     long mod = args.length > 3 ? Long.parseLong(args[3]) : 1000L;
                     inspect(snapshot, w, mod);
@@ -138,6 +139,14 @@ public class DumpApp implements IApplication {
             w.println(sb);
         }
         System.out.println("PARITY written objects");
+    }
+
+    /** The retained size MAT already has for each class (what the histogram shows without a calculation), then the computed one. */
+    private void dumpClassRetained(ISnapshot s, PrintWriter w) throws Exception {
+        for (IClass c : s.getClasses()) {
+            long cached = c.getRetainedHeapSizeOfObjects(false, false, new VoidProgressListener());
+            w.println(c.getObjectId() + "\t" + c.getName() + "\t" + c.getNumberOfObjects() + "\t" + cached);
+        }
     }
 
     /** Per-operation cost of the snapshot primitives that every query is built from (ns per object). */

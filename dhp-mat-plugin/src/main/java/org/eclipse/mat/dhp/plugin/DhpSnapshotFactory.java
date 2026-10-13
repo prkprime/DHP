@@ -170,6 +170,11 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 File rscFile = new File("/dev/null").exists() ? new File("/dev/null") : File.createTempFile("dhp_rsc", ".tmp");
                 rscFile.deleteOnExit();
                 Object rsc = rscCtor.newInstance(rscFile);
+                // the histogram's Retained Heap column: MAT's parser leaves the minimum retained size of every class in this cache
+                java.lang.reflect.Method put = rscClass.getMethod("put", int.class, long.class);
+                for (var e : storage.getClassMinRetainedSizes().entrySet()) {
+                    put.invoke(rsc, e.getKey(), -e.getValue()); // negative = approximation, as MAT stores it
+                }
                 indexManager.setReader(IndexManager.Index.I2RETAINED, (IIndexReader) rsc);
             } catch (Throwable t) {
                 log.warn("Could not instantiate RetainedSizeCache: {}", t.getMessage());

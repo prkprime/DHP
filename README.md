@@ -322,7 +322,8 @@ rm -rf /path/to/mat/configuration/org.eclipse.osgi
 
 **What matches native MAT:** object ids, shallow and retained sizes, dominators and their order, outbound/inbound
 references, GC roots and the `<Java Local>` references of threads, thread stacks, class-loader labels, class and
-histogram order, OQL results and row order, inspector contents, and the standard reports. By default unreachable
+histogram order, the histogram's **Retained Heap** column (MAT's minimum retained size per class, precomputed during
+ingestion), OQL results and row order, inspector contents, and the standard reports. By default unreachable
 objects are removed (as in MAT); `--keep-unreachable` keeps them as `UNREACHABLE` roots exactly like MAT's
 `keep_unreachable_objects`.
 
@@ -376,7 +377,7 @@ REUSE_NATIVE=1 tools/parity-check/run-parity.sh heap.hprof work/ --no-reports   
 DHP_XMX=4g MAT_XMX=14g MODES="objects inspect dominator queries" tools/parity-check/run-parity.sh heap.hprof work/
 ```
 
-Modes: `objects` (per-object class/size/retained/dominator/references/roots), `loaders`, `inspect` (the inspector view of
+Modes: `objects` (per-object class/size/retained/dominator/references/roots), `loaders`, `classretained` (the per-class retained size the histogram shows), `inspect` (the inspector view of
 sampled objects: fields, statics, class hierarchy), `dominator` (the tree with child order), `queries`
 (98 MAT commands and OQL queries from `tools/parity-check/queries.txt`, compared per query with identity hash codes
 and stack traces normalized by `query_diff.py`), plus the three standard report archives.
@@ -426,7 +427,7 @@ What makes it fast:
   0.1 us) rather than a JDBC statement and B-tree seek (about 1 us). Per-object SQL rows also dominated
   ingestion time (about 1.3 us per row), which is why the graph is built in memory and written in bulk.
 - **Precomputed everything MAT would otherwise compute**: dominator tree with MAT's child order, retained sizes,
-  per-class instance lists, class statistics, resolved class hierarchy and GC-root ids, array flags.
+  minimum retained size of every class (the histogram's Retained Heap column), per-class instance lists, class statistics, resolved class hierarchy and GC-root ids, array flags.
 - **Memory-mapped dump reads** (`HprofMap`): instance and array reads are memory loads, and field layouts are cached per class.
 - **MAT's own collections and order**: classes, roots and unreachable-object histograms are rebuilt through MAT's
   hash maps so they enumerate in MAT's order (a precondition for identical UI results).

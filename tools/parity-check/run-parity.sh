@@ -16,7 +16,7 @@ DUMP="$(realpath "$1")"; WORK="$2"; REPORTS=1; [[ "${3:-}" == "--no-reports" ]] 
 MAT_HOME="${MAT_HOME:-$ROOT/tools/mat/mat}"
 DHP_JAR="${DHP_JAR:-$(ls "$ROOT"/dhp-cli/target/dhp-cli-*-SNAPSHOT.jar | grep -v original | head -1)}"
 SAMPLE="${SAMPLE:-64}"; INSPECT="${INSPECT:-500}"; QUERIES="${QUERIES:-$HERE/queries.txt}"
-DHP_XMX="${DHP_XMX:-4g}"; MAT_XMX="${MAT_XMX:-4g}"; MODES="${MODES:-objects loaders inspect dominator queries}"
+DHP_XMX="${DHP_XMX:-4g}"; MAT_XMX="${MAT_XMX:-4g}"; MODES="${MODES:-objects loaders inspect dominator classretained queries}"
 NAME="$(basename "$DUMP" .hprof)"
 mkdir -p "$WORK/native" "$WORK/dhp"
 for d in native dhp; do [[ -e "$WORK/$d/$NAME.hprof" ]] || ln "$DUMP" "$WORK/$d/$NAME.hprof" 2>/dev/null || cp "$DUMP" "$WORK/$d/$NAME.hprof"; done
@@ -39,6 +39,7 @@ for side in native dhp; do
       loaders) out="$WORK/$side.loaders.txt"; extra=(loaders) ;;
       inspect) out="$WORK/$side.inspect.txt"; extra=(inspect "$INSPECT") ;;
       dominator) out="$WORK/$side.dominator.txt"; extra=(dominator) ;;
+      classretained) out="$WORK/$side.classretained.txt"; extra=(classretained) ;;
       queries) out="$WORK/$side.queries.txt"; extra=(queries "$QUERIES") ;;
     esac
     if [[ $side == native && "${REUSE_NATIVE:-0}" == 1 && -s "$out" ]]; then continue; fi

@@ -48,7 +48,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     /** Why the chunk file of an ingested database cannot be used; reads fail with it, --clean can still replace the file. */
     private volatile String chunkFileProblem;
     /** Ties the database to its chunk file, so that a copied or mismatched pair is detected instead of read. */
-    private final long snapshotId = new java.util.Random().nextLong() | 1L;
+    private final long snapshotId = new java.util.Random().nextLong() & Long.MAX_VALUE | 1L;
 
     public JdbcHeapStorageEngine(String jdbcUrl, String user, String password, long memoryBudgetBytes) throws SQLException {
         this.jdbcUrl = jdbcUrl;
@@ -121,7 +121,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             return;
         }
         try {
-            chunkFile = ChunkFile.open(f, SPARSE_KINDS, Long.parseLong(flag, 16));
+            chunkFile = ChunkFile.open(f, SPARSE_KINDS, Long.parseUnsignedLong(flag, 16));
         } catch (IOException | NumberFormatException e) {
             // reported by the first read; --clean (dropExistingTables) must still be able to replace the broken file
             chunkFileProblem = "The database " + jdbcUrl + " keeps its data in " + f + ", which cannot be used: " + e.getMessage()
@@ -690,7 +690,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
 
     static final int K_ADDR = 1, K_CLASS = 2, K_SIZE = 3, K_POS = 4, K_FLAGS = 5, K_OUT = 6, K_IN = 7,
             K_DOM = 8, K_RET = 9, K_CHILD = 10, K_OUT_HUGE = 11, K_IN_HUGE = 12, K_CHILD_HUGE = 13,
-            K_ROOT_CHILDREN = 14, K_CLASS_INSTANCES = 15, K_ADDR_INDEX = 16;
+            K_ROOT_CHILDREN = 14, K_CLASS_INSTANCES = 15, K_ADDR_INDEX = 16, K_CLASS_MINRET = 17;
     static final int SC = 512;           // objects per scalar chunk (long chunks = 4 KB, three fit a 16 KB page)
     static final int EC = 32;            // objects per edge chunk (fits the 32-bit "huge list" mask)
     static final int HUGE_LIST = 16384;  // lists longer than this are stored out of line
@@ -1108,6 +1108,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             System.arraycopy(idsF, from, buf, 0, len);
             return buf;
         }, id -> startF[id + 2] - startF[id + 1]);
+        saveClassMinRetained(idsF, startF, retained, n);
         saveClassInstances(n);
         if (isSqlite) {
             setJournalPragmas("WAL", "NORMAL");
@@ -1135,6 +1136,143 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         saveSnapshotInfo("numberOfObjects", String.valueOf(n));
         cachedObjectCount = n;
         log.info("Persisted dominator tree: columns {} ms, children {} ms", t1 - t0, System.currentTimeMillis() - t1);
+    }
+
+    /**
+     * Minimum retained size of every class as MAT defines it (SnapshotImpl.getMinRetainedSize on the class object plus its
+     * instances): the sum of the retained sizes of the members that are not dominated by another member. One walk over the
+     * dominator tree does it for all classes: an object counts for a set when no ancestor on its path belongs to it.
+     * MAT keeps these numbers in its retained-size cache, which is what the histogram's "Retained Heap" column shows.
+     */
+    private void saveClassMinRetained(int[] ids, int[] start, long[] retained, int n) throws SQLException {
+        long t0 = System.currentTimeMillis();
+        // dense index of every class (by its class object id); cls[o] becomes the set index of o's class
+        int[] cls = new int[n];
+        java.util.Arrays.fill(cls, -1);
+        scanKind(K_CLASS, (c, b) -> {
+            for (int i = 0; i * 4 < b.length; i++) {
+                cls[c * SC + i] = (int) INT_LE.get(b, i * 4);
+            }
+        });
+        it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap setOf = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
+        setOf.defaultReturnValue(-1);
+        java.util.BitSet classObjects = new java.util.BitSet(n);
+        int sets = 0;
+        for (int o = 0; o < n; o++) {
+            int k = cls[o];
+            if (k >= 0 && !setOf.containsKey(k)) {
+                setOf.put(k, sets++);
+            }
+        }
+        // every class has a set, also a class without instances: its class object is always a member
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery("SELECT class_obj_id FROM dhp_classes WHERE class_obj_id >= 0")) {
+            while (rs.next()) {
+                int k = rs.getInt(1);
+                if (k < n && !setOf.containsKey(k)) {
+                    setOf.put(k, sets++);
+                }
+            }
+        }
+        for (int o = 0; o < n; o++) {
+            if (setOf.containsKey(o)) {
+                classObjects.set(o);
+            }
+        }
+        for (int o = 0; o < n; o++) {
+            int k = cls[o];
+            cls[o] = k >= 0 ? setOf.get(k) : -1;
+        }
+        long[] minRet = new long[sets];
+        int[] active = new int[sets];
+        // iterative walk of the dominator tree from the virtual root; stack holds (node, next child index)
+        it.unimi.dsi.fastutil.ints.IntArrayList nodes = new it.unimi.dsi.fastutil.ints.IntArrayList();
+        it.unimi.dsi.fastutil.ints.IntArrayList next = new it.unimi.dsi.fastutil.ints.IntArrayList();
+        int rootFrom = 2 + start[0], rootLen = start[1] - start[0];
+        for (int r = 0; r < rootLen; r++) {
+            int root = ids[rootFrom + r];
+            enterSets(root, cls, classObjects, setOf, retained, active, minRet);
+            nodes.add(root);
+            next.add(0);
+            while (!nodes.isEmpty()) {
+                int top = nodes.size() - 1;
+                int node = nodes.getInt(top);
+                int idx = next.getInt(top);
+                int len = start[node + 2] - start[node + 1];
+                if (idx < len) {
+                    next.set(top, idx + 1);
+                    int child = ids[2 + start[node + 1] + idx];
+                    enterSets(child, cls, classObjects, setOf, retained, active, minRet);
+                    nodes.add(child);
+                    next.add(0);
+                } else {
+                    leaveSets(node, cls, classObjects, setOf, active);
+                    nodes.removeInt(top);
+                    next.removeInt(top);
+                }
+            }
+        }
+        // persist as [count][(class object id, minimum retained size)...]; classes whose value is 0 are left out
+        int[] classObjIds = setOf.keySet().toIntArray();
+        java.util.Arrays.sort(classObjIds);
+        int count = 0;
+        for (int k : classObjIds) {
+            if (minRet[setOf.get(k)] != 0) count++;
+        }
+        byte[] blob = new byte[4 + count * 12];
+        INT_LE.set(blob, 0, count);
+        int p = 4;
+        for (int k : classObjIds) {
+            long v = minRet[setOf.get(k)];
+            if (v != 0) {
+                INT_LE.set(blob, p, k);
+                LONG_LE.set(blob, p + 4, v);
+                p += 12;
+            }
+        }
+        putChunk(K_CLASS_MINRET, 0, blob);
+        flushPuts();
+        log.info("Minimum retained sizes of {} classes computed in {} ms", count, System.currentTimeMillis() - t0);
+    }
+
+    // A class object is a member of its own set. If it is also an instance of that class (java.lang.Class) MAT's list of
+    // ids contains it twice and counts it twice, so the same happens here.
+    private static void enterSets(int o, int[] cls, java.util.BitSet classObjects,
+                                  it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap setOf, long[] retained, int[] active, long[] minRet) {
+        int s = cls[o];
+        int own = classObjects.get(o) ? setOf.get(o) : -1;
+        if (s >= 0 && active[s]++ == 0) {
+            minRet[s] += own == s ? 2 * retained[o] : retained[o];
+        }
+        if (own >= 0 && own != s && active[own]++ == 0) {
+            minRet[own] += retained[o];
+        }
+    }
+
+    private static void leaveSets(int o, int[] cls, java.util.BitSet classObjects,
+                                  it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap setOf, int[] active) {
+        int s = cls[o];
+        int own = classObjects.get(o) ? setOf.get(o) : -1;
+        if (s >= 0) {
+            active[s]--;
+        }
+        if (own >= 0 && own != s) {
+            active[own]--;
+        }
+    }
+
+    @Override
+    public Map<Integer, Long> getClassMinRetainedSizes() throws SQLException {
+        Map<Integer, Long> map = new HashMap<>();
+        byte[] b = chunk(K_CLASS_MINRET, 0);
+        if (b == null || b.length < 4) {
+            return map;
+        }
+        int count = (int) INT_LE.get(b, 0);
+        for (int i = 0, p = 4; i < count && p + 12 <= b.length; i++, p += 12) {
+            map.put((int) INT_LE.get(b, p), (long) LONG_LE.get(b, p + 4));
+        }
+        return map;
     }
 
     // ---------------------------------------------------------------------------- reads
