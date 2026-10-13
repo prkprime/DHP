@@ -16,7 +16,9 @@ Write-Host ""
 Write-Host "[Step 2/4] Building full DHP reactor modules..."
 Push-Location $rootDir
 mvn clean install -DskipTests
+$mvnExit = $LASTEXITCODE
 Pop-Location
+if ($mvnExit -ne 0) { throw "Maven build failed (exit code $mvnExit)" }
 
 Write-Host ""
 Write-Host "[Step 3/4] Setting up Eclipse MAT standalone tooling..."

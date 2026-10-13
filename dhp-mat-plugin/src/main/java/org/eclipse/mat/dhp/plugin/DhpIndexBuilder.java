@@ -1,39 +1,22 @@
 package org.eclipse.mat.dhp.plugin;
 
 import org.eclipse.mat.SnapshotException;
-import org.eclipse.mat.collect.BitField;
 import org.eclipse.mat.collect.HashMapIntObject;
-import org.eclipse.mat.dhp.core.graph.DominatorTreeEngine;
-import org.eclipse.mat.dhp.core.memory.MemoryGovernor;
-import org.eclipse.mat.dhp.core.model.HeapRecords;
-import org.eclipse.mat.dhp.core.parser.Pass1ScanParser;
-import org.eclipse.mat.dhp.core.parser.Pass2ObjectIngester;
-import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
-import org.eclipse.mat.dhp.plugin.index.DbOne2LongIndex;
-import org.eclipse.mat.dhp.plugin.index.DbOne2ManyIndex;
-import org.eclipse.mat.dhp.plugin.index.DbOne2OneIndex;
-import org.eclipse.mat.dhp.plugin.index.DbOne2SizeIndex;
 import org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine;
 import org.eclipse.mat.parser.IIndexBuilder;
 import org.eclipse.mat.parser.IPreliminaryIndex;
-import org.eclipse.mat.parser.model.ClassImpl;
 import org.eclipse.mat.parser.model.XGCRootInfo;
 import org.eclipse.mat.parser.model.XSnapshotInfo;
-import org.eclipse.mat.snapshot.model.Field;
-import org.eclipse.mat.snapshot.model.FieldDescriptor;
-import org.eclipse.mat.snapshot.model.GCRootInfo;
 import org.eclipse.mat.util.IProgressListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Properties;
 
 /**
  * Eclipse MAT IIndexBuilder implementation backed by DHP database storage.
@@ -45,7 +28,7 @@ public class DhpIndexBuilder implements IIndexBuilder {
 
     private File dumpOrConfigFile;
     private String prefix;
-    private HeapStorageEngine storage;
+    private JdbcHeapStorageEngine storage;
 
     @Override
     public void init(File file, String prefix) throws SnapshotException, IOException {
@@ -57,313 +40,70 @@ public class DhpIndexBuilder implements IIndexBuilder {
     @Override
     public void fill(IPreliminaryIndex preliminaryIndex, IProgressListener listener) throws SnapshotException, IOException {
         try {
-            boolean isConfigFile = dumpOrConfigFile.getName().toLowerCase().endsWith(".dhp");
-
-            String jdbcUrl;
-            String user = "";
-            String password = "";
-            File hprofFile = null;
-            long memoryBudget = 1024 * 1024 * 1024L;
-
-            File absDumpOrConfig = dumpOrConfigFile.getAbsoluteFile();
-            File parentDir = absDumpOrConfig.getParentFile();
-
-            if (isConfigFile) {
-                Properties props = new Properties();
-                try (FileInputStream fis = new FileInputStream(dumpOrConfigFile)) {
-                    props.load(fis);
-                }
-                String baseName = absDumpOrConfig.getName();
-                int idx = baseName.lastIndexOf('.');
-                String pfx = idx > 0 ? baseName.substring(0, idx) : baseName;
-                String defaultDb = new File(parentDir, pfx + ".dhp.db").getAbsolutePath().replace('\\', '/');
-
-                jdbcUrl = props.getProperty("db.url", "jdbc:sqlite:" + defaultDb);
-                if (jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
-                    String sub = jdbcUrl.substring("jdbc:sqlite:".length());
-                    File dbFile = new File(sub);
-                    if (!dbFile.isAbsolute() && parentDir != null) {
-                        jdbcUrl = "jdbc:sqlite:" + new File(parentDir, sub).getAbsolutePath().replace('\\', '/');
-                    } else if (dbFile.isAbsolute()) {
-                        jdbcUrl = "jdbc:sqlite:" + dbFile.getAbsolutePath().replace('\\', '/');
-                    }
-                }
-                user = props.getProperty("db.user", "");
-                password = props.getProperty("db.password", "");
-                String hprofPath = props.getProperty("dump.file");
-                if (hprofPath != null && !hprofPath.isBlank()) {
-                    File candidate = new File(hprofPath);
-                    if (!candidate.isAbsolute() && parentDir != null) {
-                        candidate = new File(parentDir, hprofPath);
-                    }
-                    hprofFile = candidate;
-                }
-                String memStr = props.getProperty("memory.budget");
-                if (memStr != null && !memStr.isBlank()) {
-                    try {
-                        memoryBudget = MemoryGovernor.parseSize(memStr.trim());
-                    } catch (Exception ignored) {}
-                }
-            } else {
-                hprofFile = dumpOrConfigFile;
-                String baseName = absDumpOrConfig.getName();
-                int idx = baseName.lastIndexOf('.');
-                String pfx = idx > 0 ? baseName.substring(0, idx) : baseName;
-                File dbFile = new File(parentDir, pfx + ".dhp.db");
-                jdbcUrl = "jdbc:sqlite:" + dbFile.getAbsolutePath().replace('\\', '/');
-            }
-
-            MemoryGovernor governor = new MemoryGovernor(memoryBudget, 4);
-            this.storage = new JdbcHeapStorageEngine(jdbcUrl, user, password, governor.getTotalAllocatedBytes());
-            if (!this.storage.hasExistingTables()) {
-                this.storage.initializeSchema();
-            }
-
-            if (hprofFile != null && hprofFile.getName().toLowerCase().endsWith(".gz") && storage.getObjectCount() == 0) {
-                throw new SnapshotException("Compressed heap dumps are not supported (recorded positions refer to the decompressed "
-                        + "stream): decompress " + hprofFile.getName() + " first");
-            }
-
-            // If starting from fresh hprof file, run ingestion pipeline
-            if (hprofFile != null && hprofFile.exists() && storage.getObjectCount() == 0) {
-                log.info("Parsing HPROF dump into database with DHP: {}", hprofFile.getAbsolutePath());
-                Pass1ScanParser pass1 = new Pass1ScanParser();
-                pass1.scan(hprofFile);
-
-                org.eclipse.mat.dhp.core.graph.HeapGraph graph;
-
-                try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
-
-                    graph = ingester.ingest(hprofFile);
-
-                }
-
-                DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
-                domEngine.computeAndStore(graph);
-            }
-
-            // Expose database-backed MAT preliminary indexes
+            DhpDescriptor descriptor = DhpDescriptor.read(dumpOrConfigFile);
+            File hprofFile = descriptor.hprofFile();
+            this.storage = DhpIngestion.openOrIngest(descriptor);
             int objectCount = storage.getObjectCount();
 
-            // 1. Classes
-            HashMapIntObject<ClassImpl> classesById = new HashMapIntObject<>();
-            var allClasses = storage.getAllClasses();
-            var classStats = storage.getClassStats();
+            ClassModel model = ClassModel.build(storage);
+            model.link();
+            log.info("Classes in the database: {}", model.classes().size());
+            preliminaryIndex.setClassesById(model.classes());
 
-            java.lang.reflect.Field countField = null;
-            java.lang.reflect.Field totalSizeField = null;
-            try {
-                countField = ClassImpl.class.getDeclaredField("instanceCount");
-                countField.setAccessible(true);
-                totalSizeField = ClassImpl.class.getDeclaredField("totalSize");
-                totalSizeField.setAccessible(true);
-            } catch (Exception ignored) {}
-
-            int sysLoaderObjId = storage.getObjectIdByAddress(0L);
-            it.unimi.dsi.fastutil.ints.IntArrayList bootstrapClassIds = new it.unimi.dsi.fastutil.ints.IntArrayList();
-            int finalJavaLangClassObjId = -1;
-
-            for (HeapRecords.ClassRecord cls : allClasses) {
-                int classObjId = cls.classObjId() >= 0 ? cls.classObjId() : storage.getObjectIdByAddress(cls.classId());
-                if (classObjId < 0) continue;
-                int superClassObjId = cls.superClassObjId() >= 0 ? cls.superClassObjId() : (cls.superClassId() != 0 ? storage.getObjectIdByAddress(cls.superClassId()) : -1);
-                int classLoaderObjId = cls.classLoaderObjId() >= 0 ? cls.classLoaderObjId() : (cls.classLoaderId() != 0 ? storage.getObjectIdByAddress(cls.classLoaderId()) : sysLoaderObjId);
-                if (classLoaderObjId < 0) classLoaderObjId = sysLoaderObjId >= 0 ? sysLoaderObjId : 0;
-
-                if (cls.classLoaderId() == 0L) {
-                    bootstrapClassIds.add(classObjId);
-                }
-                if (finalJavaLangClassObjId < 0 && "java.lang.Class".equals(cls.name())) {
-                    finalJavaLangClassObjId = classObjId;
-                }
-
-                FieldDescriptor[] fields = new FieldDescriptor[cls.fields().size()];
-                for (int i = 0; i < fields.length; i++) {
-                    var f = cls.fields().get(i);
-                    fields[i] = new FieldDescriptor(f.name(), f.type());
-                }
-
-                long superClassAddr = superClassObjId >= 0 ? cls.superClassId() : 0L;
-                long classLoaderAddr = cls.classLoaderId() != 0 ? cls.classLoaderId() : 0L;
-
-                List<Field> staticFields = new ArrayList<>();
-                for (var sf : cls.staticFields()) {
-                    Object val = sf.value();
-                    if (sf.type() == 2 && val instanceof Number n) {
-                        // a null reference static is a plain null in MAT, not a reference to address 0
-                        val = n.longValue() == 0 ? null : new org.eclipse.mat.snapshot.model.ObjectReference(null, n.longValue());
-                    }
-                    staticFields.add(new Field(sf.name(), sf.type(), val));
-                }
-
-                ClassImpl classImpl = new ClassImpl(
-                        cls.classId(),
-                        cls.name(),
-                        superClassAddr,
-                        classLoaderAddr,
-                        staticFields.toArray(new Field[0]),
-                        fields
-                );
-                classImpl.setObjectId(classObjId);
-                classImpl.setCacheEntry(Integer.valueOf(classObjId)); // key of the class -> objects lookup (c2objects)
-                classImpl.setCacheEntry(classObjId);
-                classImpl.setHeapSizePerInstance(cls.instanceSize());
-                long usedSize = cls.usedSize() > 0 ? cls.usedSize() : storage.getObjectUsedSize(classObjId);
-                classImpl.setUsedHeapSize(usedSize);
-                if (superClassObjId >= 0) {
-                    classImpl.setSuperClassIndex(superClassObjId);
-                } else {
-                    classImpl.setSuperClassIndex(-1);
-                }
-                classImpl.setClassLoaderIndex(classLoaderObjId);
-
-                var stat = classStats.get(classObjId);
-                if (stat != null && countField != null && totalSizeField != null) {
-                    try {
-                        countField.setInt(classImpl, stat.instanceCount());
-                        totalSizeField.setLong(classImpl, stat.totalSize());
-                    } catch (Exception ignored) {}
-                }
-                classesById.put(classObjId, classImpl);
-            }
-
-            // Find java.lang.Class ClassImpl
-            ClassImpl javaLangClass = null;
-            for (java.util.Iterator<ClassImpl> it = classesById.values(); it.hasNext(); ) {
-                ClassImpl c = it.next();
-                if ("java.lang.Class".equals(c.getName())) {
-                    javaLangClass = c;
-                    break;
-                }
-            }
-
-            for (java.util.Iterator<ClassImpl> it = classesById.values(); it.hasNext(); ) {
-                ClassImpl c = it.next();
-                if (javaLangClass != null && c.getClazz() == null) {
-                    c.setClassInstance(javaLangClass);
-                }
-                if (c.getSuperClassId() >= 0) {
-                    ClassImpl superC = classesById.get(c.getSuperClassId());
-                    if (superC != null) {
-                        superC.addSubClass(c);
-                    }
-                }
-            }
-
-            log.info("Total classes in storage: {}, populated: {}", allClasses.size(), classesById.size());
-            preliminaryIndex.setClassesById(classesById);
-
-            // 2. GC Roots & Thread Locals
+            // GC roots and the locals of threads (MAT's cleaner re-maps them when it removes unreachable objects)
             HashMapIntObject<List<XGCRootInfo>> gcRootsMap = new HashMapIntObject<>();
             HashMapIntObject<HashMapIntObject<List<XGCRootInfo>>> thread2objects2roots = new HashMapIntObject<>();
-
             for (var root : storage.getGcRoots()) {
                 int objId = root.objectId() >= 0 ? root.objectId() : storage.getObjectIdByAddress(root.objectAddress());
-                if (objId >= 0) {
-                    if (root.threadAddress() != 0) {
-                        int threadObjId = root.threadObjectId() >= 0 ? root.threadObjectId() : storage.getObjectIdByAddress(root.threadAddress());
-                        if (threadObjId >= 0) {
-                            var localsMap = thread2objects2roots.get(threadObjId);
-                            if (localsMap == null) {
-                                localsMap = new HashMapIntObject<>();
-                                thread2objects2roots.put(threadObjId, localsMap);
-                            }
-                            var list = localsMap.get(objId);
-                            if (list == null) {
-                                list = new ArrayList<>();
-                                localsMap.put(objId, list);
-                            }
-                            // like MAT: the referrer of a stack local is its thread object
-                            var xgc = new XGCRootInfo(root.objectAddress(), root.threadAddress(), RootTypes.toMat(root.rootType()));
-                            xgc.setObjectId(objId);
-                            xgc.setContextId(threadObjId);
-                            list.add(xgc);
-                        }
-                    } else {
-                        List<XGCRootInfo> list = gcRootsMap.get(objId);
-                        if (list == null) {
-                            list = new ArrayList<>();
-                            gcRootsMap.put(objId, list);
-                        }
-                        var xgc = new XGCRootInfo(root.objectAddress(), root.referrerAddress(), RootTypes.toMat(root.rootType()));
+                if (objId < 0) {
+                    continue;
+                }
+                if (root.threadAddress() != 0) {
+                    int threadObjId = root.threadObjectId() >= 0 ? root.threadObjectId() : storage.getObjectIdByAddress(root.threadAddress());
+                    if (threadObjId >= 0) {
+                        // like MAT: the referrer of a stack local is its thread object
+                        var xgc = new XGCRootInfo(root.objectAddress(), root.threadAddress(), RootTypes.toMat(root.rootType()));
                         xgc.setObjectId(objId);
+                        xgc.setContextId(threadObjId);
+                        var locals = thread2objects2roots.get(threadObjId);
+                        if (locals == null) {
+                            thread2objects2roots.put(threadObjId, locals = new HashMapIntObject<>());
+                        }
+                        var list = locals.get(objId);
+                        if (list == null) {
+                            locals.put(objId, list = new ArrayList<>());
+                        }
                         list.add(xgc);
                     }
+                } else {
+                    var xgc = new XGCRootInfo(root.objectAddress(), root.referrerAddress(), RootTypes.toMat(root.rootType()));
+                    xgc.setObjectId(objId);
+                    var list = gcRootsMap.get(objId);
+                    if (list == null) {
+                        gcRootsMap.put(objId, list = new ArrayList<>());
+                    }
+                    list.add(xgc);
                 }
             }
-
-            // Ensure system classloader (address 0L) is in gcRootsMap
             preliminaryIndex.setGcRoots(gcRootsMap);
             preliminaryIndex.setThread2objects2roots(thread2objects2roots);
 
-            // 3. Object-to-Address index (IOne2LongIndex)
-            preliminaryIndex.setIdentifiers(new DbOne2LongIndex(
-                    objectCount,
-                    storage::getObjectAddress,
-                    storage::getObjectIdByAddress
-            ));
+            preliminaryIndex.setIdentifiers(DhpIndexes.identifiers(storage, objectCount));
+            preliminaryIndex.setObject2classId(DhpIndexes.objectToClass(storage, objectCount, model));
+            preliminaryIndex.setOutbound(DhpIndexes.outbound(storage, objectCount, model.systemLoaderId()));
+            preliminaryIndex.setArray2size(DhpIndexes.arraySizes(storage, objectCount, DhpIndexes.arrayObjects(storage, objectCount)));
 
-            int defaultClassId = finalJavaLangClassObjId >= 0 ? finalJavaLangClassObjId : (classesById.size() > 0 ? classesById.keys().next() : 0);
-
-            // 4. Object-to-Class index (IOne2OneIndex)
-            preliminaryIndex.setObject2classId(new DbOne2OneIndex(
-                    objectCount,
-                    id -> {
-                        int cid = (int) storage.getObjectClassId(id);
-                        if (cid < 0 || !classesById.containsKey(cid)) {
-                            return defaultClassId;
-                        }
-                        return cid;
-                    }
-            ));
-
-            int[] bootstrapClassIdsArray = bootstrapClassIds.toIntArray();
-
-            // 5. Outbound references index (IOne2ManyIndex)
-            preliminaryIndex.setOutbound(new DbOne2ManyIndex(
-                    objectCount,
-                    id -> {
-                        int classId = (int) storage.getObjectClassId(id);
-                        if (id == sysLoaderObjId) {
-                            int[] orig = storage.getOutboundReferences(id);
-                            it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet set = new it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet();
-                            if (classId >= 0) set.add(classId);
-                            for (int x : orig) set.add(x);
-                            return set.toIntArray();
-                        }
-                        int[] refs = storage.getOutboundReferences(id);
-                        if (classId >= 0) {
-                            if (refs.length == 0 || refs[0] != classId) {
-                                int[] newRefs = new int[refs.length + 1];
-                                newRefs[0] = classId;
-                                System.arraycopy(refs, 0, newRefs, 1, refs.length);
-                                return newRefs;
-                            }
-                        }
-                        return refs;
-                    }
-            ));
-
-            // 6. Array sizes index (IOne2SizeIndex) - only populated for array objects!
-            BitField arrayObjects = new BitField(objectCount);
-            storage.populateArrayBitField(arrayObjects::set);
-            preliminaryIndex.setArray2size(new DbOne2SizeIndex(
-                    objectCount,
-                    id -> (id >= 0 && id < objectCount && arrayObjects.get(id)) ? storage.getObjectUsedSize(id) : 0L
-            ));
-
-            // 7. Update SnapshotInfo metadata
             XSnapshotInfo info = preliminaryIndex.getSnapshotInfo();
             if (info != null) {
                 if (hprofFile != null) {
                     info.setPath(hprofFile.getAbsolutePath());
                     info.setProperty("dhp.hprofPath", hprofFile.getAbsolutePath());
                 }
-                info.setProperty("dhp.db.url", jdbcUrl);
-                info.setProperty("dhp.db.user", user);
-                info.setProperty("dhp.db.password", password);
+                info.setProperty("dhp.db.url", descriptor.jdbcUrl());
+                info.setProperty("dhp.db.user", descriptor.user());
+                info.setProperty("dhp.db.password", descriptor.password());
                 info.setNumberOfObjects(objectCount);
-                info.setNumberOfClasses(classesById.size());
+                info.setNumberOfClasses(model.classes().size());
                 info.setNumberOfGCRoots(gcRootsMap.size());
                 try {
                     String idSizeStr = storage.getSnapshotInfo("idSize");
@@ -372,10 +112,11 @@ public class DhpIndexBuilder implements IIndexBuilder {
                     }
                     info.setUsedHeapSize(storage.getTotalHeapSize());
                     SnapshotProps.apply(info, storage);
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                    // optional metadata
+                }
             }
-
-            log.info("DHP Preliminary Indexes successfully populated for Eclipse MAT.");
+            log.info("DHP preliminary indexes populated for Eclipse MAT.");
         } catch (SQLException e) {
             throw new SnapshotException("Database error populating preliminary indexes", e);
         }
@@ -386,7 +127,7 @@ public class DhpIndexBuilder implements IIndexBuilder {
         log.info("GarbageCleaner cleaned reachable object set.");
     }
 
-    public HeapStorageEngine getStorage() {
+    public JdbcHeapStorageEngine getStorage() {
         return storage;
     }
 

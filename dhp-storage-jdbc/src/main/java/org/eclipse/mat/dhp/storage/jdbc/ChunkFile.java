@@ -1,6 +1,7 @@
 package org.eclipse.mat.dhp.storage.jdbc;
 
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import org.eclipse.mat.dhp.core.memory.MappedBuffers;
 
 import java.io.File;
 import java.io.IOException;
@@ -18,7 +19,7 @@ import java.util.Arrays;
  * (about 1 us); here it is a directory lookup and a memory copy from a mapped window (about 0.1 us), which is what
  * every index lookup of the MAT UI boils down to.
  *
- * <p>Layout: {@code [records][trailer][trailerStart: long][magic: int]}. A record is {@code [length: int][bytes]}.
+ * <p>Layout: {@code [records][trailer][trailerStart: long][id: long][magic: int]}, the id ties the file to the database that references it. A record is {@code [length: int][bytes]}.
  * The trailer holds one directory per chunk kind: dense kinds map {@code chunk number -> record offset} (-1 when
  * absent), sparse kinds (out-of-line lists, class instance lists) a sorted key/offset list. All numbers are little
  * endian.</p>
@@ -33,6 +34,7 @@ final class ChunkFile implements AutoCloseable {
     private static final long WINDOW = 1L << WINDOW_SHIFT;
     private static final int WRITE_BUFFER = 8 << 20;
     private static final int MAX_KIND = 32;
+    private static final int FOOTER = 20;
 
     private final File file;
     private RandomAccessFile raf;
@@ -49,6 +51,7 @@ final class ChunkFile implements AutoCloseable {
     // read phase
     private volatile boolean readOnly;
     private long dataEnd;
+    private long id;
     private MappedByteBuffer[] windows;
     private LongBuffer[] denseView = new LongBuffer[MAX_KIND];
     private long[] sparseKeys = new long[0];
@@ -74,12 +77,16 @@ final class ChunkFile implements AutoCloseable {
     }
 
     /** Opens a finished chunk file for reading. */
-    static ChunkFile open(File file, int[] sparseKinds) throws IOException {
+    static ChunkFile open(File file, int[] sparseKinds, long expectedId) throws IOException {
         ChunkFile f = new ChunkFile(file, sparseKinds);
         f.raf = new RandomAccessFile(file, "r");
         f.channel = f.raf.getChannel();
         try {
             f.mapForReading();
+            if (f.id != expectedId) {
+                throw new IOException("chunk file " + file + " belongs to a different snapshot (id " + Long.toHexString(f.id)
+                        + ", the database expects " + Long.toHexString(expectedId) + "): copy the .db and .chunks files together");
+            }
         } catch (IOException | RuntimeException e) {
             f.closeAndUnmap(); // do not leak the handle of a file that is not usable (Windows could not delete it)
             throw e;
@@ -136,7 +143,7 @@ final class ChunkFile implements AutoCloseable {
     }
 
     /** Writes the directories, makes the file durable and switches to the memory-mapped read path. */
-    synchronized void finish() throws IOException {
+    synchronized void finish(long id) throws IOException {
         if (readOnly) {
             return;
         }
@@ -173,8 +180,8 @@ final class ChunkFile implements AutoCloseable {
         while (b.hasRemaining()) {
             p += channel.write(b, p);
         }
-        ByteBuffer foot = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-        foot.putLong(trailerStart).putInt(MAGIC).flip();
+        ByteBuffer foot = ByteBuffer.allocate(FOOTER).order(ByteOrder.LITTLE_ENDIAN);
+        foot.putLong(trailerStart).putLong(id).putInt(MAGIC).flip();
         while (foot.hasRemaining()) {
             p += channel.write(foot, p);
         }
@@ -198,22 +205,23 @@ final class ChunkFile implements AutoCloseable {
 
     private void mapForReading() throws IOException {
         long size = channel.size();
-        if (size < 12) {
+        if (size < FOOTER) {
             throw new IOException("chunk file " + file + " is truncated");
         }
-        ByteBuffer foot = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer foot = ByteBuffer.allocate(FOOTER).order(ByteOrder.LITTLE_ENDIAN);
         while (foot.hasRemaining()) {
-            if (channel.read(foot, size - 12 + foot.position()) < 0) {
+            if (channel.read(foot, size - FOOTER + foot.position()) < 0) {
                 throw new IOException("chunk file " + file + " is truncated");
             }
         }
         foot.flip();
         long trailerStart = foot.getLong();
-        if (foot.getInt() != MAGIC || trailerStart < 0 || trailerStart > size - 12) {
+        this.id = foot.getLong();
+        if (foot.getInt() != MAGIC || trailerStart < 0 || trailerStart > size - FOOTER) {
             throw new IOException("chunk file " + file + " is incomplete (ingestion did not finish?)");
         }
         dataEnd = trailerStart;
-        long tlen = size - 12 - trailerStart;
+        long tlen = size - FOOTER - trailerStart;
         if (tlen >= Integer.MAX_VALUE) {
             throw new IOException("chunk file directory too large");
         }
@@ -277,6 +285,9 @@ final class ChunkFile implements AutoCloseable {
         byte[] len4 = new byte[4];
         copy(off, len4, 4);
         int len = (len4[0] & 0xFF) | (len4[1] & 0xFF) << 8 | (len4[2] & 0xFF) << 16 | (len4[3] & 0xFF) << 24;
+        if (len < 0 || off + 4 + len > dataEnd) {
+            throw new IOException("chunk file " + file + " is corrupt (record at " + off + " claims " + len + " bytes)");
+        }
         byte[] b = new byte[len];
         copy(off + 4, b, len);
         return b;
@@ -344,7 +355,7 @@ final class ChunkFile implements AutoCloseable {
     /** Releases the file handle. Mappings stay valid for readers that are still running; the GC releases them. */
     @Override
     public synchronized void close() throws IOException {
-        if (System.getProperty("os.name", "").toLowerCase().contains("win")) {
+        if (MappedBuffers.mustUnmapOnClose()) {
             closeAndUnmap(); // Windows refuses to delete (or truncate) a file that is still mapped
             return;
         }
@@ -374,15 +385,6 @@ final class ChunkFile implements AutoCloseable {
     }
 
     private static void unmap(MappedByteBuffer b) {
-        if (b == null) {
-            return;
-        }
-        try {
-            java.lang.reflect.Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            ((sun.misc.Unsafe) f.get(null)).invokeCleaner(b);
-        } catch (Throwable ignored) {
-            // the mapping is released when the buffer is garbage collected
-        }
+        MappedBuffers.unmap(b);
     }
 }

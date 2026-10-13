@@ -8,6 +8,8 @@ if not "%MAT_HOME%"=="" set "MAT_DIR=%MAT_HOME%"
 set "PLUGINS_DIR=%MAT_DIR%\plugins"
 set "LIB_DIR=%ROOT_DIR%\lib"
 set "MAT_VERSION=1.17.0"
+rem the pom is the single source of the MAT version
+for /f "tokens=3 delims=<>" %%v in ('findstr /c:"<mat.version>" "%ROOT_DIR%\pom.xml" 2^>nul') do set "MAT_VERSION=%%v"
 
 echo === Dynamic Heap Parser: Resolving Eclipse MAT %MAT_VERSION% Dependencies ===
 

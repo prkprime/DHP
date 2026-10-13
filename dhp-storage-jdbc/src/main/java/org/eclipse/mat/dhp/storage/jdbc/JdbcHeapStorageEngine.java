@@ -45,6 +45,10 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
     private Connection connection;
     /** Memory-mapped chunk store next to a file-backed SQLite database; null when chunks live in the dhp_chunks table. */
     private volatile ChunkFile chunkFile;
+    /** Why the chunk file of an ingested database cannot be used; reads fail with it, --clean can still replace the file. */
+    private volatile String chunkFileProblem;
+    /** Ties the database to its chunk file, so that a copied or mismatched pair is detected instead of read. */
+    private final long snapshotId = new java.util.Random().nextLong() | 1L;
 
     public JdbcHeapStorageEngine(String jdbcUrl, String user, String password, long memoryBudgetBytes) throws SQLException {
         this.jdbcUrl = jdbcUrl;
@@ -54,16 +58,23 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         this.isPostgres = jdbcUrl.startsWith("jdbc:postgresql:");
 
         this.connection = DriverManager.getConnection(jdbcUrl, user, password);
-
-        if (isSqlite) {
-            configureSqlite(memoryBudgetBytes);
-        } else if (isPostgres) {
-            configurePostgres();
-        }
-
-        this.connection.setAutoCommit(false);
-        if (isSqlite) {
-            openChunkFileIfPresent();
+        try {
+            if (isSqlite) {
+                configureSqlite(memoryBudgetBytes);
+            } else if (isPostgres) {
+                configurePostgres();
+            }
+            this.connection.setAutoCommit(false);
+            if (isSqlite) {
+                openChunkFileIfPresent();
+            }
+        } catch (SQLException | RuntimeException e) {
+            try {
+                connection.close(); // do not leak the connection of an engine that never became usable
+            } catch (SQLException ignored) {
+                // the original failure is the interesting one
+            }
+            throw e;
         }
     }
 
@@ -91,21 +102,30 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             return;
         }
         String flag = null;
+        String marker = null;
         try (Statement st = connection.createStatement();
-             ResultSet rs = st.executeQuery("SELECT property_value FROM dhp_snapshot_info WHERE property_key = 'chunkFile'")) {
-            if (rs.next()) {
-                flag = rs.getString(1);
+             ResultSet rs = st.executeQuery("SELECT property_key, property_value FROM dhp_snapshot_info WHERE property_key IN ('chunkFile', 'numberOfObjects')")) {
+            while (rs.next()) {
+                if ("chunkFile".equals(rs.getString(1))) {
+                    flag = rs.getString(2);
+                } else {
+                    marker = rs.getString(2);
+                }
             }
         } catch (SQLException noTable) {
             return; // not ingested yet
         }
-        if (!"1".equals(flag)) {
+        // a chunk file without the completion marker belongs to an ingestion that did not finish: ignore it, the
+        // next ingestion starts over
+        if (flag == null || marker == null) {
             return;
         }
         try {
-            chunkFile = ChunkFile.open(f, SPARSE_KINDS);
-        } catch (IOException e) {
-            throw new SQLException("The database " + jdbcUrl + " keeps its data in " + f + ", which cannot be read: " + e.getMessage(), e);
+            chunkFile = ChunkFile.open(f, SPARSE_KINDS, Long.parseLong(flag, 16));
+        } catch (IOException | NumberFormatException e) {
+            // reported by the first read; --clean (dropExistingTables) must still be able to replace the broken file
+            chunkFileProblem = "The database " + jdbcUrl + " keeps its data in " + f + ", which cannot be used: " + e.getMessage()
+                    + " (re-ingest the dump with --clean)";
         }
     }
 
@@ -186,6 +206,7 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         }
         ChunkFile old = chunkFile;
         chunkFile = null;
+        chunkFileProblem = null;
         File cf = chunkFilePath();
         try {
             if (old != null) {
@@ -750,6 +771,9 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         }
         byte[] b;
         ChunkFile cf = chunkFile;
+        if (cf == null && chunkFileProblem != null) {
+            throw new SQLException(chunkFileProblem);
+        }
         if (cf != null) {
             try {
                 b = cf.read(kind, chunkNo);
@@ -1101,11 +1125,11 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         ChunkFile cf = chunkFile;
         if (cf != null && !cf.isReadOnly()) {
             try {
-                cf.finish();
+                cf.finish(snapshotId);
             } catch (java.io.IOException e) {
                 throw new SQLException("Cannot finish " + cf + ": " + e.getMessage(), e);
             }
-            saveSnapshotInfo("chunkFile", "1");
+            saveSnapshotInfo("chunkFile", Long.toHexString(snapshotId));
         }
         // the completion marker comes last: only a fully durable, complete snapshot counts as ingested
         saveSnapshotInfo("numberOfObjects", String.valueOf(n));

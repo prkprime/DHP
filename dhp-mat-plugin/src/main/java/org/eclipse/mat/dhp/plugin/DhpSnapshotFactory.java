@@ -3,15 +3,6 @@ package org.eclipse.mat.dhp.plugin;
 import org.eclipse.mat.SnapshotException;
 import org.eclipse.mat.collect.BitField;
 import org.eclipse.mat.collect.HashMapIntObject;
-import org.eclipse.mat.dhp.core.graph.DominatorTreeEngine;
-import org.eclipse.mat.dhp.core.memory.MemoryGovernor;
-import org.eclipse.mat.dhp.core.model.HeapRecords;
-import org.eclipse.mat.dhp.core.parser.Pass1ScanParser;
-import org.eclipse.mat.dhp.core.parser.Pass2ObjectIngester;
-import org.eclipse.mat.dhp.plugin.index.DbOne2LongIndex;
-import org.eclipse.mat.dhp.plugin.index.DbOne2ManyIndex;
-import org.eclipse.mat.dhp.plugin.index.DbOne2OneIndex;
-import org.eclipse.mat.dhp.plugin.index.DbOne2SizeIndex;
 import org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine;
 import org.eclipse.mat.parser.IObjectReader;
 import org.eclipse.mat.parser.index.IndexManager;
@@ -19,8 +10,6 @@ import org.eclipse.mat.parser.index.IIndexReader;
 import org.eclipse.mat.parser.model.ClassImpl;
 import org.eclipse.mat.parser.model.XGCRootInfo;
 import org.eclipse.mat.parser.model.XSnapshotInfo;
-import org.eclipse.mat.snapshot.model.Field;
-import org.eclipse.mat.snapshot.model.FieldDescriptor;
 import org.eclipse.mat.snapshot.IOQLQuery;
 import org.eclipse.mat.snapshot.ISnapshot;
 import org.eclipse.mat.snapshot.OQLParseException;
@@ -31,7 +20,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.lang.reflect.Constructor;
 import java.util.*;
 
@@ -97,14 +85,9 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
         return installedInstance;
     }
 
-    private boolean isDhpFile(File file) {
-        if (file == null) return false;
-        return file.getName().toLowerCase().endsWith(".dhp");
-    }
-
     @Override
     public ISnapshot openSnapshot(File file, Map<String, String> arguments, IProgressListener listener) throws SnapshotException {
-        if (!isDhpFile(file)) {
+        if (!DhpDescriptor.isDescriptor(file)) {
             if (delegate != null) {
                 return delegate.openSnapshot(file, arguments, listener);
             }
@@ -112,231 +95,46 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
         }
 
         log.info("Opening DHP heap dump descriptor: {}", file.getAbsolutePath());
-        JdbcHeapStorageEngine openedStorage = null;   // for cleanup if opening fails half way
+        JdbcHeapStorageEngine storage = null;   // for cleanup if opening fails half way
         DhpHeapObjectReader reader = null;
         try {
-            Properties props = new Properties();
-            try (FileInputStream fis = new FileInputStream(file)) {
-                props.load(fis);
-            }
-
-            File absFile = file.getAbsoluteFile();
-            File parentDir = absFile.getParentFile();
-            String baseName = absFile.getName();
-            int p = baseName.lastIndexOf('.');
-            String prefixName = p >= 0 ? baseName.substring(0, p) : baseName;
-            String prefix = new File(parentDir, prefixName + ".").getAbsolutePath().replace('\\', '/');
-            String defaultDb = new File(parentDir, prefixName + ".dhp.db").getAbsolutePath().replace('\\', '/');
-
-            String jdbcUrl = props.getProperty("db.url", "jdbc:sqlite:" + defaultDb);
-            if (jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
-                String sub = jdbcUrl.substring("jdbc:sqlite:".length());
-                File dbFile = new File(sub);
-                if (!dbFile.isAbsolute() && parentDir != null) {
-                    jdbcUrl = "jdbc:sqlite:" + new File(parentDir, sub).getAbsolutePath().replace('\\', '/');
-                } else if (dbFile.isAbsolute()) {
-                    jdbcUrl = "jdbc:sqlite:" + dbFile.getAbsolutePath().replace('\\', '/');
-                }
-            }
-            String user = props.getProperty("db.user", "");
-            String password = props.getProperty("db.password", "");
-            String hprofPath = props.getProperty("dump.file");
-            File hprofFile = null;
-            if (hprofPath != null && !hprofPath.isBlank()) {
-                File candidate = new File(hprofPath);
-                if (!candidate.isAbsolute() && parentDir != null) {
-                    candidate = new File(parentDir, hprofPath);
-                }
-                hprofFile = candidate;
-            }
-            long memoryBudget = 1024 * 1024 * 1024L;
-            String memStr = props.getProperty("memory.budget");
-            if (memStr != null) {
-                try {
-                    memoryBudget = MemoryGovernor.parseSize(memStr);
-                } catch (Exception ignored) {}
-            }
-
-            // MAT reads <prefix>threads for thread stacks; the CLI writes it next to the dump, so follow the dump when
-            // the descriptor lives elsewhere or has another name
-            if (hprofFile != null && !new File(prefix + "threads").exists()) {
-                String dumpName = hprofFile.getName();
-                int dot = dumpName.lastIndexOf('.');
-                File dumpDir = hprofFile.getAbsoluteFile().getParentFile();
-                File dumpThreads = new File(dumpDir, (dot > 0 ? dumpName.substring(0, dot) : dumpName) + ".threads");
-                if (dumpThreads.exists()) {
-                    prefix = new File(dumpDir, (dot > 0 ? dumpName.substring(0, dot) : dumpName) + ".").getAbsolutePath().replace('\\', '/');
-                }
-            }
-
-            MemoryGovernor governor = new MemoryGovernor(memoryBudget, 4);
-            JdbcHeapStorageEngine storage = new JdbcHeapStorageEngine(jdbcUrl, user, password, governor.getTotalAllocatedBytes());
-            openedStorage = storage;
-            if (!storage.hasExistingTables()) {
-                storage.initializeSchema();
-            }
-
-            if (hprofFile != null && hprofFile.getName().toLowerCase().endsWith(".gz") && storage.getObjectCount() == 0) {
-                throw new SnapshotException("Compressed heap dumps are not supported (recorded positions refer to the decompressed "
-                        + "stream): decompress " + hprofFile.getName() + " first");
-            }
-
-            // Ingest on the fly if tables are empty
-            if (storage.getObjectCount() == 0 && hprofFile != null && hprofFile.exists()) {
-                log.info("Target database is empty. Streaming HPROF dump into database with DHP: {}", hprofFile.getAbsolutePath());
-                Pass1ScanParser pass1 = new Pass1ScanParser();
-                pass1.scan(hprofFile);
-
-                org.eclipse.mat.dhp.core.graph.HeapGraph graph;
-
-                try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
-
-                    graph = ingester.ingest(hprofFile);
-
-                }
-
-                DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
-                domEngine.computeAndStore(graph);
-            }
+            DhpDescriptor descriptor = DhpDescriptor.read(file);
+            File hprofFile = descriptor.hprofFile();
+            storage = DhpIngestion.openOrIngest(descriptor);
 
             int objectCount = storage.getObjectCount();
-            List<HeapRecords.ClassRecord> allClasses = storage.getAllClasses();
-            long totalHeapSize = storage.getTotalHeapSize();
+            ClassModel model = ClassModel.build(storage);
+            model.link();
+            final HashMapIntObject<ClassImpl> classesById = model.classes();
 
             XSnapshotInfo info = new XSnapshotInfo();
             info.setPath(hprofFile != null ? hprofFile.getAbsolutePath() : file.getAbsolutePath());
-            info.setPrefix(prefix);
+            info.setPrefix(descriptor.prefix());
             info.setProperty("$heapFormat", "hprof"); // what MAT reports for an HPROF dump (DHP specifics live in the dhp.* properties)
             info.setProperty("dhp.hprofPath", hprofFile != null ? hprofFile.getAbsolutePath() : "");
-            info.setProperty("dhp.db.url", jdbcUrl);
-            info.setProperty("dhp.db.user", user);
-            info.setProperty("dhp.db.password", password);
+            info.setProperty("dhp.db.url", descriptor.jdbcUrl());
+            info.setProperty("dhp.db.user", descriptor.user());
+            info.setProperty("dhp.db.password", descriptor.password());
             info.setNumberOfObjects(objectCount);
-            info.setNumberOfClasses(allClasses.size());
-            info.setUsedHeapSize(totalHeapSize);
+            info.setNumberOfClasses(classesById.size());
+            info.setUsedHeapSize(storage.getTotalHeapSize());
             SnapshotProps.apply(info, storage);
             try {
                 String idSizeStr = storage.getSnapshotInfo("idSize");
                 if (idSizeStr != null) {
                     info.setIdentifierSize(Integer.parseInt(idSizeStr));
                 }
-            } catch (Exception ignored) {}
-
-            // Populate class cache
-            HashMapIntObject<ClassImpl> rawClasses = new HashMapIntObject<>();
-            ClassImpl javaLangClass = null;
-            var classStats = storage.getClassStats();
-            java.lang.reflect.Field countField = null;
-            java.lang.reflect.Field totalSizeField = null;
-            try {
-                countField = ClassImpl.class.getDeclaredField("instanceCount");
-                countField.setAccessible(true);
-                totalSizeField = ClassImpl.class.getDeclaredField("totalSize");
-                totalSizeField.setAccessible(true);
-            } catch (Exception ignored) {}
-
-            int sysLoaderObjId = storage.getObjectIdByAddress(0L);
-            it.unimi.dsi.fastutil.ints.IntArrayList bootstrapClassIds = new it.unimi.dsi.fastutil.ints.IntArrayList();
-            int finalJavaLangClassObjId = -1;
-
-            for (HeapRecords.ClassRecord cls : allClasses) {
-                int classObjId = cls.classObjId() >= 0 ? cls.classObjId() : storage.getObjectIdByAddress(cls.classId());
-                if (classObjId < 0) continue;
-                int superClassObjId = cls.superClassObjId() >= 0 ? cls.superClassObjId() : ((cls.superClassId() != 0) ? storage.getObjectIdByAddress(cls.superClassId()) : -1);
-                int classLoaderObjId = cls.classLoaderObjId() >= 0 ? cls.classLoaderObjId() : ((cls.classLoaderId() != 0) ? storage.getObjectIdByAddress(cls.classLoaderId()) : sysLoaderObjId);
-                if (classLoaderObjId < 0) classLoaderObjId = sysLoaderObjId >= 0 ? sysLoaderObjId : 0;
-
-                if (cls.classLoaderId() == 0L) {
-                    bootstrapClassIds.add(classObjId);
-                }
-                if (finalJavaLangClassObjId < 0 && "java.lang.Class".equals(cls.name())) {
-                    finalJavaLangClassObjId = classObjId;
-                }
-
-                List<FieldDescriptor> fds = new ArrayList<>();
-                for (var f : cls.fields()) {
-                    fds.add(new FieldDescriptor(f.name(), f.type()));
-                }
-
-                List<Field> staticFields = new ArrayList<>();
-                for (var sf : cls.staticFields()) {
-                    // a null reference static is a plain null in MAT, not a reference to address 0
-                    Object val = (sf.type() == 2 && sf.value() instanceof Number n)
-                            ? (n.longValue() == 0 ? null : new org.eclipse.mat.snapshot.model.ObjectReference(null, n.longValue()))
-                            : sf.value();
-                    staticFields.add(new Field(sf.name(), sf.type(), val));
-                }
-
-                long superClassAddr = superClassObjId >= 0 ? cls.superClassId() : 0L;
-                long classLoaderAddr = cls.classLoaderId() != 0 ? cls.classLoaderId() : 0L;
-
-                ClassImpl c = new ClassImpl(
-                        cls.classId(),
-                        cls.name(),
-                        superClassAddr,
-                        classLoaderAddr,
-                        staticFields.toArray(new Field[0]),
-                        fds.toArray(new FieldDescriptor[0])
-                );
-                c.setObjectId(classObjId);
-                c.setCacheEntry(Integer.valueOf(classObjId)); // key of the class -> objects lookup (c2objects)
-                c.setCacheEntry(classObjId);
-                if (superClassObjId >= 0) {
-                    c.setSuperClassIndex(superClassObjId);
-                } else {
-                    c.setSuperClassIndex(-1);
-                }
-                c.setClassLoaderIndex(classLoaderObjId);
-                c.setHeapSizePerInstance(cls.instanceSize());
-                long usedSize = cls.usedSize() > 0 ? cls.usedSize() : storage.getObjectUsedSize(classObjId);
-                c.setUsedHeapSize(usedSize);
-
-                var stat = classStats.get(classObjId);
-                if (stat != null && countField != null && totalSizeField != null) {
-                    try {
-                        countField.setInt(c, stat.instanceCount());
-                        totalSizeField.setLong(c, stat.totalSize());
-                    } catch (Exception ignored) {}
-                }
-
-                rawClasses.put(classObjId, c);
-
-                if ("java.lang.Class".equals(cls.name())) {
-                    javaLangClass = c;
-                }
-            }
-
-            ClassOrder.Result ordered = ClassOrder.rebuild(rawClasses, storage.getClassOrder());
-            final HashMapIntObject<ClassImpl> classesById = ordered.classes();
-            if (javaLangClass != null) {
-                javaLangClass = classesById.get(javaLangClass.getObjectId());
-            }
-
-            if (javaLangClass != null) {
-                for (int key : classesById.getAllKeys()) {
-                    classesById.get(key).setClassInstance(javaLangClass);
-                }
-            }
-
-            // subclasses are linked in MAT's order (its by-address map), which is what instanceof queries enumerate
-            int[] linkKeys = ordered.linkOrder() != null ? ordered.linkOrder() : classesById.getAllKeys();
-            for (int key : linkKeys) {
-                ClassImpl c = classesById.get(key);
-                if (c.getSuperClassId() >= 0) {
-                    ClassImpl superC = classesById.get(c.getSuperClassId());
-                    if (superC != null) {
-                        superC.addSubClass(c);
-                    }
-                }
+            } catch (Exception ignored) {
+                // MAT falls back to 8-byte identifiers
             }
 
             // GC roots and the {@code <Java Local>} references of threads, built like MAT builds them (also its map order)
             RootMaps rootMaps = RootMaps.build(storage.getGcRoots());
             HashMapIntObject<XGCRootInfo[]> roots = rootMaps.roots;
             HashMapIntObject<HashMapIntObject<XGCRootInfo[]>> rootsPerThread = rootMaps.rootsPerThread;
-
             info.setNumberOfGCRoots(roots.size());
 
+            final int sysLoaderObjId = model.systemLoaderId();
             // Build loader labels
             HashMapIntObject<String> loaderLabels = new HashMapIntObject<>();
             loaderLabels.put(sysLoaderObjId >= 0 ? sysLoaderObjId : 0, "<system class loader>");
@@ -353,89 +151,17 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             }
             info.setNumberOfClassLoaders(loaderLabels.size());
 
-            // BitField array objects
-            BitField arrayObjects = new BitField(objectCount);
-            storage.populateArrayBitField(arrayObjects::set);
-
-            int defaultClassId = finalJavaLangClassObjId >= 0 ? finalJavaLangClassObjId : (classesById.size() > 0 ? classesById.keys().next() : 0);
-            int[] bootstrapClassIdsArray = bootstrapClassIds.toIntArray();
+            BitField arrayObjects = DhpIndexes.arrayObjects(storage, objectCount);
 
             IndexManager indexManager = new IndexManager();
-            indexManager.setReader(IndexManager.Index.IDENTIFIER, new DbOne2LongIndex(
-                    objectCount,
-                    storage::getObjectAddress,
-                    storage::getObjectIdByAddress
-            ));
-
-            indexManager.setReader(IndexManager.Index.O2CLASS, new DbOne2OneIndex(
-                    objectCount,
-                    id -> {
-                        int cid = (int) storage.getObjectClassId(id);
-                        if (cid < 0 || !classesById.containsKey(cid)) {
-                            return defaultClassId;
-                        }
-                        return cid;
-                    }
-            ));
-
-            indexManager.setReader(IndexManager.Index.INBOUND, new DbOne2ManyIndex(
-                    objectCount,
-                    storage::getInboundReferences,
-                    key -> {
-                        if (key instanceof Number num) {
-                            return storage.getObjectsByClassId(num.intValue());
-                        }
-                        if (key instanceof org.eclipse.mat.snapshot.model.IClass clsKey) {
-                            return storage.getObjectsByClassId(clsKey.getObjectId());
-                        }
-                        return new int[0];
-                    }
-            ));
-
-            indexManager.setReader(IndexManager.Index.OUTBOUND, new DbOne2ManyIndex(
-                    objectCount,
-                    id -> {
-                        int classId = (int) storage.getObjectClassId(id);
-                        if (id == sysLoaderObjId) {
-                            int[] orig = storage.getOutboundReferences(id);
-                            it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet set = new it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet();
-                            if (classId >= 0) set.add(classId);
-                            for (int x : orig) set.add(x);
-                            return set.toIntArray();
-                        }
-                        int[] refs = storage.getOutboundReferences(id);
-                        if (classId >= 0) {
-                            if (refs.length == 0 || refs[0] != classId) {
-                                int[] newRefs = new int[refs.length + 1];
-                                newRefs[0] = classId;
-                                System.arraycopy(refs, 0, newRefs, 1, refs.length);
-                                return newRefs;
-                            }
-                        }
-                        return refs;
-                    }
-            ));
-
-            indexManager.setReader(IndexManager.Index.A2SIZE, new DbOne2SizeIndex(
-                    objectCount,
-                    id -> (id >= 0 && id < objectCount && arrayObjects.get(id)) ? storage.getObjectUsedSize(id) : 0L
-            ));
-
-            indexManager.setReader(IndexManager.Index.DOMINATOR, new DbOne2OneIndex(
-                    objectCount,
-                    id -> storage.getDominatorId(id) + 2
-            ));
-
-            indexManager.setReader(IndexManager.Index.DOMINATED, new DbOne2ManyIndex(
-                    objectCount + 1,
-                    id -> storage.getImmediateDominatedIds(id - 1)
-            ));
-
-            indexManager.setReader(IndexManager.Index.O2RETAINED, new DbOne2LongIndex(
-                    objectCount,
-                    storage::getRetainedSize,
-                    storage::getObjectIdByRetainedSize
-            ));
+            indexManager.setReader(IndexManager.Index.IDENTIFIER, DhpIndexes.identifiers(storage, objectCount));
+            indexManager.setReader(IndexManager.Index.O2CLASS, DhpIndexes.objectToClass(storage, objectCount, model));
+            indexManager.setReader(IndexManager.Index.INBOUND, DhpIndexes.inbound(storage, objectCount));
+            indexManager.setReader(IndexManager.Index.OUTBOUND, DhpIndexes.outbound(storage, objectCount, sysLoaderObjId));
+            indexManager.setReader(IndexManager.Index.A2SIZE, DhpIndexes.arraySizes(storage, objectCount, arrayObjects));
+            indexManager.setReader(IndexManager.Index.DOMINATOR, DhpIndexes.dominator(storage, objectCount));
+            indexManager.setReader(IndexManager.Index.DOMINATED, DhpIndexes.dominated(storage, objectCount));
+            indexManager.setReader(IndexManager.Index.O2RETAINED, DhpIndexes.retained(storage, objectCount));
 
             // Prevent writing i2sv2.index by providing RetainedSizeCache with /dev/null or safe temp backed storage
             try {
@@ -493,7 +219,8 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
                 cause.printStackTrace();
             }
 
-            openSnapshots.put(snapshot, new DhpSnapshotContext(snapshot, reader, storage));
+            final JdbcHeapStorageEngine opened = storage;
+            openSnapshots.put(snapshot, new DhpSnapshotContext(reader, opened));
             log.info("DHP Snapshot successfully opened with ZERO index files on disk for {}", file.getName());
             return snapshot;
 
@@ -503,8 +230,8 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
             if (reader != null) {
                 try { reader.close(); } catch (Exception ignored) {}
             }
-            if (openedStorage != null) {
-                try { openedStorage.close(); } catch (Exception ignored) {}
+            if (storage != null) {
+                try { storage.close(); } catch (Exception ignored) {}
             }
             throw new SnapshotException("Failed to open DHP snapshot", e);
         }
@@ -545,11 +272,15 @@ public class DhpSnapshotFactory implements SnapshotFactory.Implementation {
         return list;
     }
 
-    record DhpSnapshotContext(ISnapshot snapshot, DhpHeapObjectReader reader, JdbcHeapStorageEngine storage) implements AutoCloseable {
+    /** What must be released with a snapshot. It must not reference the snapshot: it is the value of a weak map keyed by it. */
+    record DhpSnapshotContext(DhpHeapObjectReader reader, JdbcHeapStorageEngine storage) implements AutoCloseable {
         @Override
         public void close() throws Exception {
-            reader.close();
-            storage.close();
+            try {
+                reader.close();
+            } finally {
+                storage.close(); // also when closing the reader failed
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ if (-not (Test-Path $sourceJar)) {
     Write-Host "Plugin JAR not found. Building dhp-mat-plugin..."
     Push-Location $rootDir
     mvn package -pl dhp-mat-plugin -am -DskipTests
+    if ($LASTEXITCODE -ne 0) { throw "Maven build failed (exit code $LASTEXITCODE)" }
     Pop-Location
 }
 

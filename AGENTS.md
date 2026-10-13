@@ -36,9 +36,9 @@ Standard Eclipse MAT relies on custom in-memory and disk-paged index files (`.id
                                          │
                                          ▼
                      ┌────────────────────────────────────────┐
-                     │   In-memory HeapGraph + chunked store   │
-                     │  - Unique PKs on object_id & address   │
-                     │  - Composite indexes on references     │
+                     │  In-memory HeapGraph, then chunk file   │
+                     │  - Columns per object + compact edges  │
+                     │  - Unreachable objects removed (MAT)   │
                      └───────────────────┬────────────────────┘
                                          │
                         [Dominator Tree & Retained Engine]
@@ -49,6 +49,7 @@ Standard Eclipse MAT relies on custom in-memory and disk-paged index files (`.id
                                          ▼
                      ┌────────────────────────────────────────┐
                      │     Eclipse MAT DHP Plugin Layer       │
+                     │  - DhpSnapshotFactory (opens .dhp)     │
                      │  - DhpIndexBuilder (IIndexBuilder)     │
                      │  - DhpHeapObjectReader (IObjectReader) │
                      │  - Database-backed IIndexReader adapters│
@@ -66,7 +67,7 @@ The project is structured as a Maven multi-module reactor under Java 21:
 | **`dhp-core`** | `org.eclipse.mat.dhp:dhp-core` | Core parsing and graph logic: `HprofBinaryReader`, `Pass1ScanParser`, `Pass2ObjectIngester`, `DominatorTreeEngine`, `MemoryGovernor`, `HeapRecords`, and memory-bounded data structures (`IAddressToIdMap`, `SortedAddressToIdMap`, `ChunkedAddressToIdMap`, `MmapAddressToIdMap`, `BitSetMembershipSet`, `RoaringMembershipSet`). Contains zero JDBC code. |
 | **`dhp-storage-jdbc`** | `org.eclipse.mat.dhp:dhp-storage-jdbc` | JDBC storage abstraction and engine: `HeapStorageEngine` interface and `JdbcHeapStorageEngine` implementation supporting SQLite WAL and PostgreSQL with one write connection plus a lock-free per-thread read connection (plain `DriverManager`, no pool) and bulk chunk writes. |
 | **`dhp-cli`** | `org.eclipse.mat.dhp:dhp-cli` | Command-line interface (`DhpMain`) using Picocli to parse dumps directly from the shell or execute headless database staging. Packaged as a fat JAR with `maven-shade-plugin`. |
-| **`dhp-mat-plugin`** | `org.eclipse.mat.dhp:dhp-mat-plugin` | Eclipse MAT plugin implementing `IIndexBuilder` (`DhpIndexBuilder`) and `IObjectReader` (`DhpHeapObjectReader`), database-backed index adapters (`DbOne2LongIndex`, `DbOne2OneIndex`, `DbOne2ManyIndex`, `DbOne2SizeIndex`), packaged as an OSGi bundle with `plugin.xml` and shaded runtime dependencies. |
+| **`dhp-mat-plugin`** | `org.eclipse.mat.dhp:dhp-mat-plugin` | Eclipse MAT plugin. `DhpSnapshotFactory` opens `.dhp` descriptors (the main path); `DhpIndexBuilder` (`IIndexBuilder`) is the registered fallback for MAT's own open flow. Both share `DhpDescriptor` (descriptor parsing), `DhpIngestion` (open or ingest on the fly), `ClassModel`/`ClassOrder` (MAT's classes in MAT's order), `RootMaps`/`RootTypes` and `DhpIndexes` (the `DbOne2LongIndex`/`DbOne2OneIndex`/`DbOne2ManyIndex`/`DbOne2SizeIndex` wiring). `DhpHeapObjectReader` (`IObjectReader`) reads object contents from the dump through `HprofMap`. Packaged as an OSGi bundle with `plugin.xml` and shaded runtime dependencies. |
 
 ---
 
@@ -137,7 +138,7 @@ The plugin binds **strictly to `.dhp` files**:
   dump.file=/path/to/heapdump.hprof
   memory.budget=4G
   ```
-- If the database is not yet ingested, `DhpIndexBuilder` will ingest the `.hprof` into the database on the fly. If already ingested (via `dhp-cli`), it reuses the precomputed tables and dominator tree immediately without generating legacy MAT index files.
+- If the database is not yet ingested, `DhpIngestion.openOrIngest` ingests the `.hprof` into it on the fly (an unfinished earlier ingestion, i.e. tables without the `numberOfObjects` marker, is discarded; a missing dump is an error). If already ingested (via `dhp-cli`), the precomputed tables, chunk file and dominator tree are used immediately without generating legacy MAT index files.
 
 ### Automation & Tooling Scripts (`scripts/`)
 Cross-platform scripts (Linux, macOS, Windows) streamline installation, testing, and headless execution with full Bash (`.sh`), Batch (`.bat`), and PowerShell (`.ps1`) parity:
@@ -149,7 +150,7 @@ Cross-platform scripts (Linux, macOS, Windows) streamline installation, testing,
 - **`scripts/run-mat-headless.sh` / `run-mat-headless.bat` / `run-mat-headless.ps1`**: Headless report generation using `ParseHeapDump` against `.dhp` descriptor files. Emits `Task: Writing HTML files` progress logs during Equinox report rendering.
 
 ### Object & Array Payload Reading
-`DhpHeapObjectReader` utilizes `RandomAccessFile` and indexed `file_position` from the database:
+`DhpHeapObjectReader` reads through `HprofMap` (read-only memory-mapped 1 GiB windows, lock-free, bulk decoding) at the `file_position` stored in the database:
 - Reads primitive arrays directly from binary offsets into typed Java arrays (`boolean[]`, `byte[]`, `char[]`, `int[]`, `long[]`, etc.).
 - Reads object arrays and resolves reference pointers.
 - Reconstructs instance field values with exact type and multi-level class hierarchy resolution.
@@ -284,7 +285,7 @@ Timings on the 10.7 GB dump (this laptop, 12 cores, NVMe):
 | disk | 3.1 GB of index files | 5.1 GB database |
 | three standard reports | 271 s at 14 GB | 638 s at a 4 GB MAT heap |
 
-DHP is faster to ingest and uses far less memory; reports through MAT are about 2.4x slower because every index lookup goes through chunk blobs in SQLite instead of memory-mapped files.
+DHP is faster to ingest and uses far less memory; that 2.4x report slowdown was caused by every index lookup going through a JDBC statement and a B-tree seek; with the memory-mapped chunk file (`<db>.chunks`) MAT queries on a 4 GB dump run on par with native MAT or faster (see the UI query speed paragraph above). The report timings in this table predate the chunk file.
 
 UI query speed (4 GB complex dump, 98 MAT commands/OQL queries incl. leak suspects, histogram, dominator, string OQL): 221 s total for DHP at a 4 GB ingest vs 285 s for native MAT, with identical results (`query_diff.py`, `DHP_TIMES=<file>` records per-query timings, `bench` mode times the index primitives). Object inspection reads the dump through mapped windows (`HprofMap`).
 

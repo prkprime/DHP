@@ -140,23 +140,6 @@ public class MmapAddressToIdMap implements IAddressToIdMap {
     }
 
     private static void unmap(MappedByteBuffer buffer) {
-        if (buffer == null) return;
-        try {
-            java.lang.reflect.Field unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-            unsafeField.setAccessible(true);
-            sun.misc.Unsafe unsafe = (sun.misc.Unsafe) unsafeField.get(null);
-            unsafe.invokeCleaner(buffer);
-        } catch (Throwable t) {
-            try {
-                java.lang.reflect.Method cleanerMethod = buffer.getClass().getMethod("cleaner");
-                cleanerMethod.setAccessible(true);
-                Object cleaner = cleanerMethod.invoke(buffer);
-                if (cleaner != null) {
-                    java.lang.reflect.Method cleanMethod = cleaner.getClass().getMethod("clean");
-                    cleanMethod.setAccessible(true);
-                    cleanMethod.invoke(cleaner);
-                }
-            } catch (Throwable ignored) {}
-        }
+        MappedBuffers.unmap(buffer);
     }
 }

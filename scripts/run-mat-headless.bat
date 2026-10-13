@@ -38,14 +38,25 @@ if not exist "%DHP_FILE%" (
   exit /b 1
 )
 
-set "REPORTS=%~1"
-if "%REPORTS%"=="" set "REPORTS=org.eclipse.mat.api:suspects"
+rem every remaining argument is a report id
+set "REPORTS="
+:collect_reports
+if "%~1"=="" goto reports_done
+set "REPORTS=!REPORTS! %~1"
+shift
+goto collect_reports
+:reports_done
+if "!REPORTS!"=="" set "REPORTS=org.eclipse.mat.api:suspects"
 
 echo === Running Eclipse MAT Headless Parse ===
 echo DHP Descriptor: %DHP_FILE%
 echo Reports:        %REPORTS%
 echo MAT Home:       %MAT_DIR%
 
-call "%PARSE_SCRIPT%" "%DHP_FILE%" %REPORTS%
+call "%PARSE_SCRIPT%" "%DHP_FILE%" !REPORTS!
+if errorlevel 1 (
+  echo Headless analysis failed with exit code !ERRORLEVEL!.
+  exit /b !ERRORLEVEL!
+)
 
 echo === Headless analysis complete! ===

@@ -15,6 +15,7 @@ for %%I in ("%MAT_DIR%\..") do set "PARENT_DIR=%%~fI"
 if not exist "%PARENT_DIR%" mkdir "%PARENT_DIR%"
 
 set "BASE_VERSION=1.17.0"
+for /f "tokens=3 delims=<>" %%v in ('findstr /c:"<mat.version>" "%ROOT_DIR%\pom.xml" 2^>nul') do set "BASE_VERSION=%%v"
 if not "%MAT_VERSION%"=="" set "BASE_VERSION=%MAT_VERSION%"
 set "VERSION=%BASE_VERSION%.20260601"
 set "ARCHIVE=MemoryAnalyzer-%VERSION%-win32.win32.x86_64.zip"

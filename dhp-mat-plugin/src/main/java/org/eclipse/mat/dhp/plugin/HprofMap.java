@@ -1,10 +1,13 @@
 package org.eclipse.mat.dhp.plugin;
 
+import org.eclipse.mat.dhp.core.memory.MappedBuffers;
+
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
+import java.util.Arrays;
 
 /**
  * Read-only, memory-mapped view of an HPROF file for random access. Object inspection reads a few bytes at an arbitrary
@@ -108,8 +111,16 @@ final class HprofMap implements AutoCloseable {
         }
     }
 
+    /** Closes the file; on Windows (which cannot replace a mapped file) the windows are unmapped too. */
     @Override
     public void close() throws IOException {
+        if (MappedBuffers.mustUnmapOnClose()) {
+            MappedByteBuffer[] ws = windows.clone();
+            Arrays.fill(windows, null);
+            for (MappedByteBuffer b : ws) {
+                MappedBuffers.unmap(b);
+            }
+        }
         file.close();
     }
 }

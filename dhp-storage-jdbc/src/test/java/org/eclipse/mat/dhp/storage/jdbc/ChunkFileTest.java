@@ -42,12 +42,12 @@ class ChunkFileTest {
             assertThat(cf.read(2, 4)).isNull();
             assertThat(cf.read(11, 123_456_789L)).isEqualTo(huge);
 
-            cf.finish();
+            cf.finish(77L);
             assertThat(cf.isReadOnly()).isTrue();
             check(cf, dense, huge, classList);
             assertThatThrownBy(() -> cf.put(2, 1, new byte[1])).isInstanceOf(java.io.IOException.class);
         }
-        try (ChunkFile cf = ChunkFile.open(f, SPARSE)) {
+        try (ChunkFile cf = ChunkFile.open(f, SPARSE, 77L)) {
             check(cf, dense, huge, classList);
             assertThat(cf.chunkCount(2)).isEqualTo(298);
             assertThat(cf.chunkCount(5)).isZero();
@@ -70,11 +70,21 @@ class ChunkFileTest {
     }
 
     @Test
+    void aFileOfAnotherSnapshotIsRejected() throws Exception {
+        File f = new File(dir, "z.chunks");
+        try (ChunkFile cf = ChunkFile.create(f, SPARSE)) {
+            cf.put(2, 0, new byte[]{1});
+            cf.finish(1L);
+        }
+        assertThatThrownBy(() -> ChunkFile.open(f, SPARSE, 2L)).hasMessageContaining("different snapshot");
+    }
+
+    @Test
     void anUnfinishedFileIsRejected() throws Exception {
         File f = new File(dir, "y.chunks");
         try (ChunkFile cf = ChunkFile.create(f, SPARSE)) {
             cf.put(2, 0, new byte[]{1, 2, 3});
         }
-        assertThatThrownBy(() -> ChunkFile.open(f, SPARSE)).isInstanceOf(java.io.IOException.class);
+        assertThatThrownBy(() -> ChunkFile.open(f, SPARSE, 77L)).isInstanceOf(java.io.IOException.class);
     }
 }

@@ -7,6 +7,12 @@ $matDir = if ($env:MAT_HOME) { $env:MAT_HOME } else { Join-Path $rootDir "tools\
 $pluginsDir = Join-Path $matDir "plugins"
 $libDir = Join-Path $rootDir "lib"
 $matVersion = "1.17.0"
+$pomFile = Join-Path $rootDir "pom.xml"
+if (Test-Path $pomFile) {
+    # the pom is the single source of the MAT version
+    $pomVersion = ([xml](Get-Content $pomFile)).project.properties.'mat.version'
+    if ($pomVersion) { $matVersion = $pomVersion }
+}
 
 Write-Host "=== Dynamic Heap Parser: Resolving Eclipse MAT $matVersion Dependencies ==="
 
@@ -52,14 +58,18 @@ if (-not $apiJar -or -not $parserJar -or -not $hprofJar -or -not $reportJar) {
 
 Write-Host "Installing org.eclipse.mat.api ($apiJar)..."
 mvn -B install:install-file -Dfile="$apiJar" -DgroupId="org.eclipse.mat" -DartifactId="org.eclipse.mat.api" -Dversion="$matVersion" -Dpackaging="jar" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "mvn install:install-file failed (exit code $LASTEXITCODE)" }
 
 Write-Host "Installing org.eclipse.mat.parser ($parserJar)..."
 mvn -B install:install-file -Dfile="$parserJar" -DgroupId="org.eclipse.mat" -DartifactId="org.eclipse.mat.parser" -Dversion="$matVersion" -Dpackaging="jar" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "mvn install:install-file failed (exit code $LASTEXITCODE)" }
 
 Write-Host "Installing org.eclipse.mat.hprof ($hprofJar)..."
 mvn -B install:install-file -Dfile="$hprofJar" -DgroupId="org.eclipse.mat" -DartifactId="org.eclipse.mat.hprof" -Dversion="$matVersion" -Dpackaging="jar" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "mvn install:install-file failed (exit code $LASTEXITCODE)" }
 
 Write-Host "Installing org.eclipse.mat.report ($reportJar)..."
 mvn -B install:install-file -Dfile="$reportJar" -DgroupId="org.eclipse.mat" -DartifactId="org.eclipse.mat.report" -Dversion="$matVersion" -Dpackaging="jar" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "mvn install:install-file failed (exit code $LASTEXITCODE)" }
 
 Write-Host "=== All Eclipse MAT $matVersion dependencies installed successfully! ==="

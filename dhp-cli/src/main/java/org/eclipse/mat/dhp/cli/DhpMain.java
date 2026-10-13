@@ -65,7 +65,7 @@ public class DhpMain implements Callable<Integer> {
     @Option(names = {"-m", "--memory", "--memory-budget"}, description = "Memory budget (e.g. 512M, 2G, 4GB, or raw bytes). Defaults to 75%% of JVM -Xmx")
     private String memoryBudgetString;
 
-    @Option(names = {"-t", "--threads", "-w", "--workers"}, description = "Worker threads count")
+    @Option(names = {"-t", "--threads", "-w", "--workers"}, description = "Threads for the parallel phases (sorting, chunk building, dominator ordering). Default: number of CPU cores")
     private Integer threads;
 
     @Option(names = {"--clean", "--drop-existing"}, description = "Clean/drop existing DHP tables in target database before ingestion")
@@ -90,6 +90,10 @@ public class DhpMain implements Callable<Integer> {
     public Integer call() throws Exception {
         if (configFile != null && configFile.exists()) {
             loadConfigProperties(configFile);
+        }
+        if (threads != null && threads > 0) {
+            // all parallel work runs on the common pool (the calling thread helps, hence one less)
+            System.setProperty("java.util.concurrent.ForkJoinPool.common.parallelism", String.valueOf(Math.max(1, threads - 1)));
         }
 
         if (dumpFile == null || !dumpFile.exists()) {
@@ -284,7 +288,9 @@ public class DhpMain implements Callable<Integer> {
                     p.store(fos, "Dynamic Heap Parser (DHP) Descriptor");
                     System.out.println("Exported MAT DHP descriptor: " + targetDhp.getAbsolutePath());
                 } catch (IOException e) {
-                    log.warn("Failed to export DHP descriptor: {}", e.getMessage());
+                    System.err.println("The dump was ingested, but the MAT descriptor " + targetDhp + " could not be written: " + e.getMessage());
+                    System.err.println("Create it by hand (db.url=" + jdbcUrl + ", dump.file=" + dumpFile.getAbsolutePath() + ") or pass --export-dhp <file>.");
+                    return 2;
                 }
             }
 

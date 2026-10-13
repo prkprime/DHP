@@ -1,6 +1,7 @@
 package org.eclipse.mat.dhp.plugin;
 
 import org.eclipse.mat.SnapshotException;
+import org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine;
 import org.eclipse.mat.parser.IObjectReader;
 import org.eclipse.mat.parser.model.AbstractObjectImpl;
 import org.eclipse.mat.parser.model.ClassImpl;
@@ -17,17 +18,17 @@ import org.eclipse.mat.snapshot.model.IPrimitiveArray;
 import org.eclipse.mat.snapshot.model.ObjectReference;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Properties;
 
 /**
- * Eclipse MAT IObjectReader implementation backed by underlying HPROF dump file via RandomAccessFile
- * and indexed positions.
+ * MAT's {@link IObjectReader} for DHP snapshots. The database knows where every object starts in the HPROF file
+ * (the file position column); this reader seeks there through {@link HprofMap} and decodes instance fields, array
+ * headers and array contents on demand, so no object payload is ever kept in the database. It fails with a clear
+ * message, instead of returning zeros, when the dump file has been moved away.
  */
 public class DhpHeapObjectReader implements IObjectReader {
 
@@ -36,29 +37,19 @@ public class DhpHeapObjectReader implements IObjectReader {
     private String dumpProblem;
     private int idSize = 8;
     private final java.util.concurrent.ConcurrentHashMap<Integer, FieldDescriptor[]> layouts = new java.util.concurrent.ConcurrentHashMap<>();
-    private org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine posStorage;
+    private JdbcHeapStorageEngine posStorage;
 
     @Override
     public void open(ISnapshot snapshot) throws SnapshotException, IOException {
-        String hprofPath = (String) snapshot.getSnapshotInfo().getProperty("dhp.hprofPath");
+        org.eclipse.mat.snapshot.SnapshotInfo info = snapshot.getSnapshotInfo();
+        String hprofPath = (String) info.getProperty("dhp.hprofPath");
         if (hprofPath == null || hprofPath.isEmpty()) {
-            hprofPath = snapshot.getSnapshotInfo().getPath();
+            hprofPath = info.getPath();
         }
         File file = new File(hprofPath);
-        File baseDir = file.getParentFile();
-        if (file.exists() && file.getName().toLowerCase().endsWith(".dhp")) {
-            try (FileInputStream fis = new FileInputStream(file)) {
-                Properties props = new Properties();
-                props.load(fis);
-                String dumpPath = props.getProperty("dump.file");
-                if (dumpPath != null && !dumpPath.isBlank()) {
-                    File candidate = new File(dumpPath);
-                    if (!candidate.isAbsolute() && baseDir != null) {
-                        candidate = new File(baseDir, dumpPath);
-                    }
-                    file = candidate;
-                }
-            } catch (Exception ignored) {}
+        DhpDescriptor descriptor = DhpDescriptor.isDescriptor(file) && file.exists() ? DhpDescriptor.read(file) : null;
+        if (descriptor != null && descriptor.hprofFile() != null) {
+            file = descriptor.hprofFile();
         }
         if (file.getName().toLowerCase().endsWith(".gz")) {
             // positions recorded during ingestion refer to the decompressed stream, which cannot be seeked here
@@ -68,42 +59,22 @@ public class DhpHeapObjectReader implements IObjectReader {
         }
         if (dumpProblem == null) {
             this.raf = new HprofMap(file);
-            this.idSize = snapshot.getSnapshotInfo().getIdentifierSize();
-            if (this.idSize <= 0) {
-                this.idSize = 8;
-            }
+            this.idSize = info.getIdentifierSize() > 0 ? info.getIdentifierSize() : 8;
         }
 
-        String jdbcUrl = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.url");
-        String user = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.user");
-        String pass = (String) snapshot.getSnapshotInfo().getProperty("dhp.db.password");
-        if (jdbcUrl == null && snapshot.getSnapshotInfo().getPath().toLowerCase().endsWith(".dhp")) {
-            File propFile = new File(snapshot.getSnapshotInfo().getPath());
-            if (propFile.exists()) {
-                try (FileInputStream fis = new FileInputStream(propFile)) {
-                    Properties props = new Properties();
-                    props.load(fis);
-                    jdbcUrl = props.getProperty("db.url");
-                    user = props.getProperty("db.user", "");
-                    pass = props.getProperty("db.password", "");
-                } catch (Exception ignored) {}
-            }
+        // the factory stores the connection in the snapshot info; a reader opened from a descriptor falls back to it
+        String jdbcUrl = (String) info.getProperty("dhp.db.url");
+        String user = (String) info.getProperty("dhp.db.user");
+        String pass = (String) info.getProperty("dhp.db.password");
+        if (jdbcUrl == null && DhpDescriptor.isDescriptor(new File(info.getPath())) && new File(info.getPath()).exists()) {
+            DhpDescriptor d = DhpDescriptor.read(new File(info.getPath()));
+            jdbcUrl = d.jdbcUrl();
+            user = d.user();
+            pass = d.password();
         }
         if (jdbcUrl != null && !jdbcUrl.isEmpty()) {
-            if (jdbcUrl.startsWith("jdbc:sqlite:") && !jdbcUrl.startsWith("jdbc:sqlite::memory:")) {
-                String sub = jdbcUrl.substring("jdbc:sqlite:".length());
-                File dbFile = new File(sub);
-                if (!dbFile.isAbsolute() && baseDir != null) {
-                    jdbcUrl = "jdbc:sqlite:" + new File(baseDir, sub).getAbsolutePath();
-                }
-            }
             try {
-                try {
-                    Class.forName("org.sqlite.JDBC");
-                } catch (ClassNotFoundException ignored) {}
-                this.posStorage = new org.eclipse.mat.dhp.storage.jdbc.JdbcHeapStorageEngine(
-                        jdbcUrl, user != null ? user : "", pass != null ? pass : "", 64L * 1024 * 1024);
-                System.out.println("[DHP-Reader] Successfully connected to database: " + jdbcUrl);
+                this.posStorage = new JdbcHeapStorageEngine(jdbcUrl, user != null ? user : "", pass != null ? pass : "", 64L * 1024 * 1024);
             } catch (Exception e) {
                 System.err.println("[DHP-Reader] Could not connect to database " + jdbcUrl + ": " + e.getMessage());
             }
@@ -124,17 +95,15 @@ public class DhpHeapObjectReader implements IObjectReader {
             return new InstanceImpl(objectId, address, null, Collections.emptyList());
         }
 
-        // Retrieve file position index if available
-        LongLookup posLookup = (LongLookup) snapshot.getSnapshotInfo().getProperty("dhp.o2pos");
+        // where the object's record starts in the dump (0 for synthetic objects such as the system class loader)
         long filePos = 0L;
-        if (posLookup != null) {
-            try {
-                filePos = posLookup.get(objectId);
-            } catch (Exception ignored) {}
-        } else if (posStorage != null && objectId >= 0) {
+        if (posStorage != null && objectId >= 0) {
             try {
                 filePos = posStorage.getObjectFilePosition(objectId);
-            } catch (Exception ignored) {}
+            } catch (java.sql.SQLException e) {
+                // never show default values for an object whose data could not be located
+                throw new SnapshotException("Cannot look up where object " + objectId + " is stored: " + e.getMessage(), e);
+            }
         }
 
         // If object is an array, return PrimitiveArrayImpl or ObjectArrayImpl with file offset
@@ -228,7 +197,7 @@ public class DhpHeapObjectReader implements IObjectReader {
         } else {
             for (FieldDescriptor fd : layout) {
                 int type = fd.getType();
-                instanceFields.add(new Field(fd.getName(), type, readDefaultOrMockValue(type, snapshot)));
+                instanceFields.add(new Field(fd.getName(), type, defaultValue(type, snapshot)));
             }
         }
 
@@ -240,17 +209,21 @@ public class DhpHeapObjectReader implements IObjectReader {
         }
     }
 
+    /** Size in bytes of a slice of an array, or an error if one Java array cannot hold it. */
+    private static int checkedBytes(int length, int elementSize) throws SnapshotException {
+        long bytes = (long) length * elementSize;
+        if (length < 0 || bytes > Integer.MAX_VALUE - 8) {
+            throw new SnapshotException("Cannot read " + length + " elements of " + elementSize + " bytes at once");
+        }
+        return (int) bytes;
+    }
+
     private static long be(byte[] d, int off, int n) {
         long v = 0;
         for (int i = 0; i < n; i++) {
             v = (v << 8) | (d[off + i] & 0xFFL);
         }
         return v;
-    }
-
-    @FunctionalInterface
-    public interface LongLookup extends java.io.Serializable {
-        long get(int id) throws Exception;
     }
 
     private List<IClass> resolveClassHierarchy(ISnapshot snapshot, IClass clazz) throws SnapshotException {
@@ -264,7 +237,7 @@ public class DhpHeapObjectReader implements IObjectReader {
         return list;
     }
 
-    private Object readDefaultOrMockValue(int type, ISnapshot snapshot) {
+    private Object defaultValue(int type, ISnapshot snapshot) {
         return switch (type) {
             case IObject.Type.BOOLEAN -> Boolean.FALSE;
             case IObject.Type.BYTE -> (byte) 0;
@@ -295,7 +268,7 @@ public class DhpHeapObjectReader implements IObjectReader {
         }
 
         if (array.getInfo() instanceof Long filePos && filePos > 0) {
-            byte[] buffer = new byte[length * elementSize];
+            byte[] buffer = new byte[checkedBytes(length, elementSize)];
             map.copy(filePos + (long) offset * elementSize, buffer, 0, buffer.length);
             if (type == IObject.Type.BYTE) {
                 return buffer;
@@ -331,7 +304,7 @@ public class DhpHeapObjectReader implements IObjectReader {
         }
 
         if (array.getInfo() instanceof Long filePos && filePos > 0) {
-            byte[] buffer = new byte[length * idSize];
+            byte[] buffer = new byte[checkedBytes(length, idSize)];
             map.copy(filePos + (long) offset * idSize, buffer, 0, buffer.length);
             java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(buffer);
             if (idSize == 4) {
