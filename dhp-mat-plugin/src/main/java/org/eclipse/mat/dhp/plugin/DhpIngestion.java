@@ -48,11 +48,14 @@ final class DhpIngestion {
             log.info("Database is empty, streaming the HPROF dump into it: {}", d.hprofFile().getAbsolutePath());
             Pass1ScanParser pass1 = new Pass1ScanParser();
             pass1.scan(d.hprofFile());
+            MemoryGovernor.MemoryMode mode = governor.modeFor(pass1.getUniqueInstanceCount());
             HeapGraph graph;
             try (Pass2ObjectIngester ingester = new Pass2ObjectIngester(pass1, storage, governor)) {
                 graph = ingester.ingest(d.hprofFile());
             }
-            new DominatorTreeEngine(storage).computeAndStore(graph);
+            new DominatorTreeEngine(storage, governor.inboundFileBacked(graph.objectCount(), graph.edgeCount()),
+                    d.hprofFile().getParentFile()).computeAndStore(graph);
+            graph.close();
             return storage;
         } catch (SnapshotException | SQLException | IOException | RuntimeException e) {
             try {

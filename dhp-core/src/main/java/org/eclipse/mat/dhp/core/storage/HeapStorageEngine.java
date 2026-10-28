@@ -46,6 +46,20 @@ public interface HeapStorageEngine extends Closeable {
      */
     void saveDominators(int[] immediateDominator, long[] retainedSizes, int objectCount) throws SQLException;
 
+    /**
+     * Stores the inbound CSR. The default implementation materialises the per-edge values into an array first
+     * (needed by the in-memory test fakes); the JDBC engine streams the values straight into the chunk store.
+     */
+    default void saveInboundEdgesFrom(int[] head, java.util.function.IntUnaryOperator toAt, int objectCount,
+                                      int ignoredSource) throws SQLException {
+        int edges = head[objectCount];
+        int[] to = new int[edges];
+        for (int i = 0; i < edges; i++) {
+            to[i] = toAt.applyAsInt(i);
+        }
+        saveInboundEdges(head, to, objectCount, ignoredSource);
+    }
+
     /** GC roots with object and thread object IDs already resolved. */
     void insertGcRootsBatch(List<HeapRecords.GcRootRecord> gcRoots) throws SQLException;
 

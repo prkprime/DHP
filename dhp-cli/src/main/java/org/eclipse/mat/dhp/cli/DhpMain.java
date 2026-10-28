@@ -83,6 +83,11 @@ public class DhpMain implements Callable<Integer> {
     @Option(names = {"--keep-unreachable"}, description = "Keep objects that are unreachable from GC roots (as MAT does with keep_unreachable_objects). Default: remove them like MAT's default.")
     private boolean keepUnreachable = false;
 
+    @Option(names = {"--memory-mode"}, description = "Memory strategy: auto (default), fast, tight, saver, or extreme. "
+            + "Auto picks the largest that fits the budget; fast keeps everything in heap, tight and below move cold "
+            + "columns (and the dominator inbound edges) to temp files.")
+    private String memoryModeString;
+
     @Option(names = {"--estimate", "-e"}, description = "Run fast structure scan to estimate required heap and disk space, then exit")
     private boolean estimateOnly = false;
 
@@ -170,6 +175,9 @@ public class DhpMain implements Callable<Integer> {
         if (keepUnreachable) {
             System.setProperty("dhp.keep.unreachable", "true");
         }
+        if (memoryModeString != null && !memoryModeString.isBlank()) {
+            System.setProperty("dhp.memory.mode", memoryModeString.trim().toLowerCase());
+        }
         if (addressMapStrategy != null && !addressMapStrategy.isBlank()) {
             System.setProperty("dhp.address.map", addressMapStrategy.trim().toLowerCase());
         }
@@ -238,6 +246,11 @@ public class DhpMain implements Callable<Integer> {
             System.out.println(estimate.banner());
             System.out.println();
 
+            org.eclipse.mat.dhp.core.memory.MemoryGovernor.MemoryMode mode =
+                    governor.modeFor(pass1.getUniqueInstanceCount());
+            System.out.println("   Memory mode: " + mode + (mode != org.eclipse.mat.dhp.core.memory.MemoryGovernor.MemoryMode.FAST
+                    ? " (object columns in temp files, budget-aware)" : " (all structures in heap)"));
+
             System.out.println("[Phase 2/3] Streaming object instances & references into database...");
             long t2 = System.currentTimeMillis();
             org.eclipse.mat.dhp.core.graph.HeapGraph graph;
@@ -249,8 +262,11 @@ public class DhpMain implements Callable<Integer> {
 
             System.out.println("[Phase 3/3] Calculating Dominator Tree & Retained Sizes...");
             long t3 = System.currentTimeMillis();
-            DominatorTreeEngine domEngine = new DominatorTreeEngine(storage);
+            DominatorTreeEngine domEngine = new DominatorTreeEngine(storage,
+                    governor.inboundFileBacked(graph.objectCount(), graph.edgeCount()),
+                    dumpFile.getAbsoluteFile().getParentFile());
             domEngine.computeAndStore(graph);
+            graph.close();
             long p3Time = System.currentTimeMillis() - t3;
             System.out.println(String.format("   Dominator tree and retained sizes computed (%.2f s).", p3Time / 1000.0));
 

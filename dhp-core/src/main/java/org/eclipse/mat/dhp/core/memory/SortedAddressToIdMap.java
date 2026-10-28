@@ -31,6 +31,11 @@ public class SortedAddressToIdMap implements IAddressToIdMap {
     }
 
     public SortedAddressToIdMap(Long2IntOpenHashMap classAddressToId, long[] sortedInstanceAddresses, int instanceCount, int baseInstanceId) {
+        this(classAddressToId, sortedInstanceAddresses, instanceCount, baseInstanceId, true);
+    }
+
+    public SortedAddressToIdMap(Long2IntOpenHashMap classAddressToId, long[] sortedInstanceAddresses, int instanceCount,
+                                int baseInstanceId, boolean withBuckets) {
         this.classAddressToId = classAddressToId != null ? classAddressToId : new Long2IntOpenHashMap();
         this.classAddressToId.defaultReturnValue(-1);
         this.classAddresses = new ClassAddressIndex(this.classAddressToId, baseInstanceId);
@@ -43,7 +48,7 @@ public class SortedAddressToIdMap implements IAddressToIdMap {
         long min = 0;
         long max = -1;
         int s = 0;
-        if (instanceCount >= 4096) {
+        if (withBuckets && instanceCount >= 4096) {
             min = instanceAddresses[0];
             max = instanceAddresses[instanceCount - 1];
             long span = max - min;

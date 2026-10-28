@@ -5,6 +5,7 @@ import org.eclipse.mat.dhp.core.storage.HeapStorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
 import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -22,9 +23,66 @@ public class DominatorTreeEngine {
     private static final Logger log = LoggerFactory.getLogger(DominatorTreeEngine.class);
 
     private final HeapStorageEngine storage;
+    private final boolean fileBackedInbound;
+    private final File tempDir;
+
+    /** Small {@code int} sequence: a heap array or a memory-mapped temp file (for tight-memory modes). */
+    private interface IntSeq extends AutoCloseable {
+        int get(int i);
+
+        void set(int i, int v);
+
+        @Override
+        default void close() {
+        }
+    }
+
+    private static final class InHeap implements IntSeq {
+        final int[] array;
+
+        InHeap(int size) {
+            this.array = new int[size];
+        }
+
+        @Override public int get(int i) { return array[i]; }
+        @Override public void set(int i, int v) { array[i] = v; }
+    }
+
+    private static final class InFile implements IntSeq {
+        final org.eclipse.mat.dhp.core.memory.PagedIntArray storage;
+
+        InFile(org.eclipse.mat.dhp.core.memory.PagedIntArray storage) {
+            this.storage = storage;
+        }
+
+        @Override public int get(int i) { return storage.get(i); }
+        @Override public void set(int i, int v) { storage.set(i, v); }
+        @Override public void close() { storage.close(); }
+    }
 
     public DominatorTreeEngine(HeapStorageEngine storage) {
+        this(storage, false, null);
+    }
+
+    /**
+     * @param fileBackedInbound when true, the inbound CSR (one 4-byte entry per reference) is built in a
+     *        memory-mapped temp file in {@code tempDir} instead of the JVM heap (tight-memory modes).
+     */
+    public DominatorTreeEngine(HeapStorageEngine storage, boolean fileBackedInbound, File tempDir) {
         this.storage = storage;
+        this.fileBackedInbound = fileBackedInbound;
+        this.tempDir = tempDir;
+    }
+
+    private IntSeq newInboundArray(int size) {
+        if (fileBackedInbound) {
+            try {
+                return new InFile(new org.eclipse.mat.dhp.core.memory.PagedIntArray(tempDir, "dhp_inbound_", size));
+            } catch (Exception e) {
+                log.warn("Cannot create file-backed inbound CSR ({}), keeping it in the heap", e.toString());
+            }
+        }
+        return new InHeap(size);
     }
 
     public void computeAndStore(HeapGraph graph) throws SQLException {
@@ -108,7 +166,7 @@ public class DominatorTreeEngine {
             inHead[i + 1] += inHead[i];
         }
         int totalInEdges = inHead[n];
-        int[] inTo = new int[totalInEdges];
+        IntSeq inTo = newInboundArray(totalInEdges);
 
         // Scratch arrays (reused across phases to bound the memory footprint)
         int[] dfsStack = new int[totalVertices];
@@ -123,7 +181,7 @@ public class DominatorTreeEngine {
             inPos[pe.getIntKey()] += pe.getIntValue();
         }
         for (int r : gcRootIds) {
-            inTo[inPos[r]++] = superRoot;
+            inTo.set(inPos[r]++, superRoot);
         }
         for (int u = 0; u < n; u++) {
             int s = starts[u];
@@ -133,13 +191,13 @@ public class DominatorTreeEngine {
                 int end = off + c[off];
                 for (int e = off + 1; e <= end; e++) {
                     int v = c[e];
-                    if (v >= 0 && v < n) inTo[e == off + 1 ? pseudoPos.addTo(v, 1) : inPos[v]++] = u;
+                    if (v >= 0 && v < n) inTo.set(e == off + 1 ? pseudoPos.addTo(v, 1) : inPos[v]++, u);
                 }
             } else if (s < 0) {
                 int[] huge = graph.hugeEdgesOf(u);
                 for (int i = 0; i < huge.length; i++) {
                     int v = huge[i];
-                    if (v >= 0 && v < n) inTo[i == 0 ? pseudoPos.addTo(v, 1) : inPos[v]++] = u;
+                    if (v >= 0 && v < n) inTo.set(i == 0 ? pseudoPos.addTo(v, 1) : inPos[v]++, u);
                 }
             }
         }
@@ -148,7 +206,11 @@ public class DominatorTreeEngine {
         log.info("Inbound CSR built: {} edges in {} ms", totalInEdges, t1 - t0);
 
         // Persist inbound references (superRoot entries are artificial and skipped)
-        storage.saveInboundEdges(inHead, inTo, n, superRoot);
+        if (inTo instanceof InHeap h) {
+            storage.saveInboundEdges(inHead, h.array, n, superRoot);
+        } else {
+            storage.saveInboundEdgesFrom(inHead, inTo::get, n, superRoot);
+        }
         long t2 = System.currentTimeMillis();
         log.info("Inbound references persisted in {} ms", t2 - t1);
 
@@ -233,7 +295,7 @@ public class DominatorTreeEngine {
             int inStart = inHead[w];
             int inEnd = inHead[w + 1];
             for (int idx = inStart; idx < inEnd; idx++) {
-                int v = inTo[idx];
+                int v = inTo.get(idx);
                 if (semi[v] == 0) continue; // Unreachable predecessor
                 int u = eval(v, ancestor, label, semi);
                 if (semi[u] < semi[w]) {
@@ -273,6 +335,7 @@ public class DominatorTreeEngine {
 
         // Inbound graph and DFS scratch are no longer needed: release memory immediately
         inHead = null;
+        inTo.close();
         inTo = null;
         vertex = null;
         parent = null;

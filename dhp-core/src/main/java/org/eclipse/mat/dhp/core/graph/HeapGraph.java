@@ -2,8 +2,12 @@ package org.eclipse.mat.dhp.core.graph;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import org.eclipse.mat.dhp.core.memory.IAddressToIdMap;
+import org.eclipse.mat.dhp.core.memory.MemoryGovernor;
+import org.eclipse.mat.dhp.core.memory.PagedIntArray;
+import org.eclipse.mat.dhp.core.memory.PagedLongArray;
 import org.eclipse.mat.dhp.core.model.HeapRecords;
 
+import java.io.File;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
@@ -17,14 +21,50 @@ import java.util.List;
  * irrelevant and avoids a second pass to re-sort edges into a classic CSR layout.</p>
  *
  * <p>Footprint is about 28 bytes per object plus 4 bytes per edge (plus 4 bytes per object for the degree header).
- * Columns that are only needed to persist the objects are released by {@link #releaseObjectColumns()} so that
- * the dominator phase has the heap to itself.</p>
+ * In the {@link MemoryGovernor.MemoryMode#TIGHT TIGHT} and more restrictive modes the cold per-object columns (class,
+ * size, file position) live in memory-mapped temporary files instead of the JVM heap, which removes about 20 bytes
+ * per object from the heap. Columns that are only needed to persist the objects are released by
+ * {@link #releaseObjectColumns()} so that the dominator phase has the heap to itself.</p>
  */
 public final class HeapGraph {
     private static final int CHUNK_SHIFT = 22;                 // 4M ints (16 MB) per edge chunk
     private static final int CHUNK_SIZE = 1 << CHUNK_SHIFT;
     private static final int CHUNK_MASK = CHUNK_SIZE - 1;
     private static final int HUGE_DEGREE = 1 << 16;            // lists above this are kept out of line
+
+    /** Sequential int column: either a plain heap array or a memory-mapped temp file. */
+    public interface IntColumn {
+        int get(int i);
+
+        void set(int i, int v);
+
+        void close();
+    }
+
+    /** Sequential long column: either a plain heap array or a memory-mapped temp file. */
+    public interface LongColumn {
+        long get(int i);
+
+        void set(int i, long v);
+
+        void close();
+    }
+
+    private static IntColumn heapInt(int[] a) {
+        return new IntColumn() {
+            @Override public int get(int i) { return a[i]; }
+            @Override public void set(int i, int v) { a[i] = v; }
+            @Override public void close() { }
+        };
+    }
+
+    private static LongColumn heapLong(long[] a) {
+        return new LongColumn() {
+            @Override public long get(int i) { return a[i]; }
+            @Override public void set(int i, long v) { a[i] = v; }
+            @Override public void close() { }
+        };
+    }
 
     private int objectCount;
     private int baseInstanceId;
@@ -33,10 +73,11 @@ public final class HeapGraph {
     private long[] reachWords;
     private int[] wordRank;
     private IAddressToIdMap addressMap;
-    private int[] classObjId;
-    private long[] usedSize;
-    private long[] filePosition;
+    private IntColumn classObjId;
+    private LongColumn usedSize;
+    private LongColumn filePosition;
     private BitSet arrayFlags;
+    private final boolean fileBackedColumns;
     private List<HeapRecords.GcRootRecord> gcRoots = List.of();
 
     private int[] edgeStart;
@@ -47,12 +88,17 @@ public final class HeapGraph {
     private long edgeCount;
 
     public HeapGraph(int objectCount, int baseInstanceId, IAddressToIdMap addressMap) {
+        this(objectCount, baseInstanceId, addressMap, null, MemoryGovernor.MemoryMode.FAST);
+    }
+
+    /**
+     * @param tempDir directory for the file-backed columns ({@code null} falls back to heap columns, as does any
+     *                failure to create the temporary files).
+     */
+    public HeapGraph(int objectCount, int baseInstanceId, IAddressToIdMap addressMap, File tempDir, MemoryGovernor.MemoryMode mode) {
         this.objectCount = objectCount;
         this.baseInstanceId = baseInstanceId;
         this.addressMap = addressMap;
-        this.classObjId = new int[objectCount];
-        this.usedSize = new long[objectCount];
-        this.filePosition = new long[objectCount];
         this.arrayFlags = new BitSet(objectCount);
         this.edgeStart = new int[objectCount];
         // Chunk 0 starts with a zero-degree sentinel so that edgeStart == 0 means "no edges".
@@ -60,6 +106,43 @@ public final class HeapGraph {
         this.edgeChunks[0] = new int[firstChunk];
         this.chunkCount = 1;
         this.cursor = 1;
+
+        boolean file = mode != MemoryGovernor.MemoryMode.FAST;
+        if (file) {
+            try {
+                PagedIntArray pc = new PagedIntArray(tempDir, "dhp_col_class_", objectCount);
+                PagedLongArray ps = new PagedLongArray(tempDir, "dhp_col_size_", objectCount);
+                PagedLongArray pp = new PagedLongArray(tempDir, "dhp_col_pos_", objectCount);
+                this.classObjId = new IntColumn() {
+                    @Override public int get(int i) { return pc.get(i); }
+                    @Override public void set(int i, int v) { pc.set(i, v); }
+                    @Override public void close() { pc.close(); }
+                };
+                this.usedSize = new LongColumn() {
+                    @Override public long get(int i) { return ps.get(i); }
+                    @Override public void set(int i, long v) { ps.set(i, v); }
+                    @Override public void close() { ps.close(); }
+                };
+                this.filePosition = new LongColumn() {
+                    @Override public long get(int i) { return pp.get(i); }
+                    @Override public void set(int i, long v) { pp.set(i, v); }
+                    @Override public void close() { pp.close(); }
+                };
+            } catch (Exception e) {
+                // Temporary files unavailable: degrade to heap columns rather than failing the ingestion
+                org.slf4j.LoggerFactory.getLogger(HeapGraph.class)
+                        .warn("Cannot create file-backed object columns ({}), falling back to heap columns", e.toString());
+                this.classObjId = heapInt(new int[objectCount]);
+                this.usedSize = heapLong(new long[objectCount]);
+                this.filePosition = heapLong(new long[objectCount]);
+                file = false;
+            }
+        } else {
+            this.classObjId = heapInt(new int[objectCount]);
+            this.usedSize = heapLong(new long[objectCount]);
+            this.filePosition = heapLong(new long[objectCount]);
+        }
+        this.fileBackedColumns = file;
     }
 
     public int objectCount() {
@@ -85,9 +168,9 @@ public final class HeapGraph {
     // ---------------------------------------------------------------- object columns
 
     public void setObject(int id, int classObj, long size, long position, boolean isArray) {
-        classObjId[id] = classObj;
-        usedSize[id] = size;
-        filePosition[id] = position;
+        classObjId.set(id, classObj);
+        usedSize.set(id, size);
+        filePosition.set(id, position);
         if (isArray) {
             arrayFlags.set(id);
         }
@@ -136,10 +219,10 @@ public final class HeapGraph {
         int j = 0;
         for (int old = reachable.nextSetBit(0); old >= 0 && old < n; old = reachable.nextSetBit(old + 1), j++) {
             oldIds[j] = old;
-            int cls = classObjId[old];
-            classObjId[j] = cls >= 0 ? newIdOf(cls) : cls;
-            usedSize[j] = usedSize[old];
-            filePosition[j] = filePosition[old];
+            int cls = classObjId.get(old);
+            classObjId.set(j, cls >= 0 ? newIdOf(cls) : cls);
+            usedSize.set(j, usedSize.get(old));
+            filePosition.set(j, filePosition.get(old));
             if (arrayFlags.get(old)) {
                 newFlags.set(j);
             }
@@ -178,35 +261,64 @@ public final class HeapGraph {
     }
 
     public int classObjId(int id) {
-        return classObjId[id];
+        return classObjId.get(id);
     }
 
     public long usedSize(int id) {
-        return usedSize[id];
+        return usedSize.get(id);
     }
 
     public long filePosition(int id) {
-        return filePosition[id];
+        return filePosition.get(id);
     }
 
     public boolean isArray(int id) {
         return arrayFlags.get(id);
     }
 
-    /** Releases the columns that are only needed to persist objects (everything except sizes and edges). */
+    /** True when the object columns are memory-mapped temp files instead of heap arrays. */
+    public boolean fileBackedColumns() {
+        return fileBackedColumns;
+    }
+
+    /**
+     * Releases the columns that are only needed to persist objects (everything except sizes and edges). Any
+     * memory-mapped column files are unmapped and deleted. Idempotent.
+     */
     public void releaseObjectColumns() {
-        classObjId = null;
-        filePosition = null;
+        if (classObjId != null) {
+            classObjId.close();
+        }
+        if (filePosition != null) {
+            filePosition.close();
+        }
         arrayFlags = null;
         addressMap = null;
         oldIdOf = null;
         reachWords = null;
         wordRank = null;
+        classObjId = null;
+        filePosition = null;
     }
 
-    /** Releases the shallow size column (the dominator phase reloads it from storage when it needs it). */
+    /**
+     * Releases the shallow size column (the dominator phase reloads it from storage when it needs it). Any
+     * memory-mapped file is unmapped and deleted. Idempotent.
+     */
     public void releaseUsedSizes() {
+        if (usedSize != null) {
+            usedSize.close();
+        }
         usedSize = null;
+    }
+
+    /**
+     * Releases everything still mapped (columns, sizes and the edge log). Call when the graph is no longer needed.
+     */
+    public void close() {
+        releaseObjectColumns();
+        releaseUsedSizes();
+        releaseEdges();
     }
 
     // ---------------------------------------------------------------- edges

@@ -122,6 +122,19 @@ To eliminate out-of-memory errors on massive dumps (e.g. 11GB–100GB dumps with
 - **`ChunkedAddressToIdMap`**: Breaks sorted addresses into 8 MB chunks (1,048,576 longs each) using bit-shifting (`mid >>> 20` and `mid & 0xFFFFF`) to eliminate G1 GC humongous allocation warnings.
 - **`MmapAddressToIdMap`**: Streams the sorted primitive array into an off-heap memory-mapped file on disk, reducing JVM heap consumption to **0 MB** for extreme low-memory environments (e.g. `-Xmx512m` on a 150GB dump).
 
+### Memory Modes (budget-driven, see `MemoryGovernor`)
+
+The governor picks a mode for the ingestion from the budget and the object count; `--memory-mode auto|fast|tight|saver|extreme` forces one. The modes move the cold structures out of the JVM heap and into memory-mapped temp files (created next to the dump, deleted when the phase finishes), so the same dump ingests at much smaller heaps:
+
+| Mode | Structures kept in heap | 11 GB / 47.9M-object dump |
+| :--- | :--- | :--- |
+| `fast` | everything (columns, bucketed address map, inbound CSR) | needs ~2.5-3 GB |
+| `tight` | buckets + addresses; the object columns (~20 B/object) and the dominator inbound CSR become temp files | ~2 GB |
+| `saver` | addresses only (no bucket table) | ~1.6 GB peak |
+| `extreme` | nothing of the above; sorted addresses also go to a temp file (slower lookups) | **1.5 GB peak** (measured: `-Xmx1536m`, 276 s on a 4-core eMMC machine) |
+
+The output is independent of the mode: `MemoryModeParityTest` ingests the same dump in `fast` and `extreme` and asserts identical databases, and the three modes produced functionally identical databases for the 11 GB dump (per-object addresses, classes, sizes, positions, dominators, retained sizes and all reference lists).
+
 ### Object Membership Tracking (`IObjectMembershipSet`)
 - **`BitSetMembershipSet`** (Default): Uses standard `java.util.BitSet` (1 bit per object ID). For 100M objects, memory footprint is **11.9 MB** with sub-nanosecond lookups (~2.9 ns/op).
 - **`RoaringMembershipSet`**: Uses run-compressed `org.roaringbitmap.RoaringBitmap`. Memory footprint is **< 100 KB** for sequential ranges (~35.3 ns/op lookup).
@@ -282,7 +295,7 @@ Timings on the 10.7 GB dump (this laptop, 12 cores, NVMe):
 
 | | native MAT | DHP |
 |---|---|---|
-| index / ingest | 142 s at `-Xmx14g` | 70 s at `-Xmx4g` (68 s at `-Xmx3g`, fails at 2.5g) |
+| index / ingest | 142 s at `-Xmx14g` | 70 s at `-Xmx4g` (68 s at `-Xmx3g`; below that the memory modes step in: `tight`/`saver` file-back the cold columns, so the 11 GB / 47.9M-object dump still ingests at `-Xmx2g` — 271 s, peak 1.6 GB) |
 | disk | 3.1 GB of index files | 5.1 GB database |
 | three standard reports | 271 s at 14 GB | 638 s at a 4 GB MAT heap |
 

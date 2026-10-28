@@ -119,12 +119,17 @@ public class Pass2ObjectIngester implements AutoCloseable {
         int identifierCount = pass1.getUniqueInstanceCount();
         File tempDir = file.getAbsoluteFile().getParentFile();
 
+        org.eclipse.mat.dhp.core.memory.MemoryGovernor.MemoryMode mode = governor.modeFor(identifierCount);
+        log.info("Memory mode for {} objects under a {} budget: {}", identifierCount,
+                org.eclipse.mat.dhp.core.memory.MemoryGovernor.formatBytes(governor.getTotalAllocatedBytes()), mode);
+
         this.addressToId = governor.createAddressMap(
                 new Long2IntOpenHashMap(),
                 allIdentifiers,
                 identifierCount,
                 0,
-                tempDir
+                tempDir,
+                mode
         );
         pass1.releaseSortedInstanceAddresses();
 
@@ -171,7 +176,7 @@ public class Pass2ObjectIngester implements AutoCloseable {
             }
         }
 
-        HeapGraph graph = new HeapGraph(totalExpectedObjects, 0, addressToId);
+        HeapGraph graph = new HeapGraph(totalExpectedObjects, 0, addressToId, tempDir, mode);
         graph.setGcRoots(resolvedRoots);
         this.graph = graph;
 

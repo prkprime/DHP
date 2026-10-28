@@ -207,6 +207,7 @@ java -jar dhp-cli-1.0.0-SNAPSHOT.jar [options]
 | `--clean`, `--drop-existing` | Drop an existing DHP database (and its `.chunks` file) before ingesting. Without it, ingesting into a database that already holds a snapshot is refused. |
 | `-e`, `--estimate` | Scan the dump (Pass 1 only) and print the heap and disk needed, then exit. |
 | `--keep-unreachable` | Keep objects that no GC root reaches. By default they are removed like MAT does (`keep_unreachable_objects` off). |
+| `--memory-mode auto\|fast\|tight\|saver\|extreme` | Memory strategy. `auto` (default) picks the largest that fits the budget; see [Sizing and memory](#sizing-and-memory). |
 | `--export-dhp <file>` | Where to write the MAT descriptor (default `<dump>.dhp`). |
 | `--monitor` | Print JVM heap usage every 3 s and the peak at the end. |
 | `--address-map auto\|sorted\|chunked\|mmap` | Strategy for the address-to-id map, see [internals](#memory-bounded-internals). |
@@ -332,20 +333,26 @@ objects are removed (as in MAT); `--keep-unreachable` keeps them as `UNREACHABLE
 ## Sizing and memory
 
 DHP's heap use follows the **number of objects**, not the size of the file (primitive-array payloads are never loaded).
+The memory mode auto-adjusts to the budget: on this 7.9 GB machine the same 11 GB / 47.9M-object dump ingests at
+`-Xmx3g` (fast mode, peak 2.58 GB) and at `-Xmx2g` (saver mode, peak 1.57 GB, one run took 271 s vs 257 s at 3 g).
+The previously-documented floor was 2.5-3 GB; the new floor for this dump is about 1.5-1.75 GB.
 
 | Dump | Objects | `-Xmx` that works | Ingest time |
 | :--- | ---: | :--- | ---: |
 | 4.0 GB complex synthetic dump | 113M | 4 GB | 36-44 s |
-| 10.7 GB real HotSpot dump | 51.9M | 4 GB (3 GB also works, 2.5 GB fails) | 70 s |
-| 212 MB synthetic dump | 4.5M | 2 GB used here; `--estimate` recommends 512 MB | 8-12 s |
+| 10.7 GB real HotSpot dump | 51.9M | 3-4 GB | 70 s |
+| 11 GB streaming synthetic dump | 47.9M | 3 GB (fast), 2 GB (saver), 1.5 GB (extreme) | 129 s Pass 1 + 127-139 s Pass 2 (this machine) |
+| 212 MB synthetic dump | 4.5M | 2 GB used here; `--estimate` recommends 256-512 MB | 8-12 s |
 
 Rules of thumb:
 
-- Heap: about **55 bytes per object** plus a few hundred MB. 100M objects need about 5.5 GB.
+- Heap: **about 55 bytes per object** in `fast` mode (35 bytes once the columns are file-backed), plus a few hundred MB.
+  100M objects need about 5.5 GB in `fast` mode and about 3.5-4 GB in `tight`+.
 - Disk: `--estimate` prints the number (it assumes up to about 135 bytes per object; the chunk file of the 212 MB dump above is about 80 bytes per object).
-- Run `--estimate` first on a dump you have not seen. It does the 1-2 s per GB Pass 1 only.
-- If you run out of memory anyway: raise `-Xmx`, try `--address-map mmap` (moves the sorted address array off the heap),
-  or `--membership-set roaring`.
+- Run `--estimate` first on a dump you have not seen. It does the 1-2 s per GB Pass 1 only and reports the heap for
+  both the all-in-heap and the `tight` mode, plus the recommended `-Xmx` for each.
+- If you run out of memory anyway: lower the memory mode with `--memory-mode saver` or `--memory-mode extreme`
+  (moves the address array and the remaining columns into temp files), or raise `-Xmx`/`--memory-budget`.
 
 Reading is cheap: opening a snapshot in MAT needs the heap MAT itself wants for its UI and caches (the chunk file is
 memory-mapped, so it lives in the page cache, not on the heap).
@@ -436,18 +443,32 @@ What makes it fast:
 
 ## Memory-bounded internals
 
-DHP keeps per-object structures as primitive arrays (no per-object hash maps, no rehash spikes). The `--memory-budget`
-option steers batch sizes and the address-map strategy; `-Xmx` is the actual limit.
+DHP keeps per-object structures as primitive arrays (no per-object hash maps, no rehash spikes). The
+`--memory-budget` option steers batch sizes, the address-map strategy and the memory mode; `-Xmx` is the actual
+limit. Modes step down as the budget shrinks:
+
+| Mode | What changes versus the previous mode |
+| :--- | :--- |
+| `fast` | everything in the JVM heap (object columns, bucketed address map, inbound CSR) |
+| `tight` | the cold per-object columns (class, shallow size, file position, ~20 B/object) move to memory-mapped temp files; the dominator's inbound CSR moves to a temp file too |
+| `saver` | `tight`, plus the address map drops its bucket table (plain binary search) |
+| `extreme` | `saver`, plus the sorted address array itself lives in a memory-mapped temp file (~0 MB heap) |
+
+`auto` (the default) picks the largest mode whose projected Pass 2 and dominator peaks fit the budget with headroom.
+You can force one with `--memory-mode <mode>`. The temporary column files are created next to the dump and deleted
+when the phase finishes. The changes are invisible to the database: a dump ingested in `extreme` mode produces the
+identical `.db`/`.chunks` files as one ingested in `fast` mode (see `MemoryModeParityTest`).
 
 ### Address-to-id map (`IAddressToIdMap`)
 
 MAT ids are the rank of an object's address, so the map is a sorted array of addresses and an id is the index.
+`SortedAddressToIdMap` adds a small bucket table (about 4 B/object) that narrows every lookup to a few entries.
 
 | Implementation | Use | Memory for 100M objects |
 | :--- | :--- | :--- |
-| `SortedAddressToIdMap` (default) | one sorted `long[]`, binary search | 800 MB |
+| `SortedAddressToIdMap` (default) | one sorted `long[]`, optional bucket table, binary search | 800 MB (plus ~400 MB buckets) |
 | `ChunkedAddressToIdMap` | the same in 8 MB chunks (no humongous G1 allocations) | 800 MB |
-| `MmapAddressToIdMap` (`--address-map mmap`) | the sorted array in a memory-mapped temp file | ~0 MB heap |
+| `MmapAddressToIdMap` (`--address-map mmap`, `extreme` mode) | the sorted array in a memory-mapped temp file | ~0 MB heap |
 | (replaced) fastutil `Long2IntOpenHashMap` | | 3.2 GB, 6.4 GB while rehashing |
 
 The sort is `InPlaceLongSort`, a parallel quicksort with **zero auxiliary arrays** (`Arrays.parallelSort` allocates a

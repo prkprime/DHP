@@ -17,6 +17,7 @@ public final class ResourceEstimator {
             long recommendedMinHeapBytes,
             String recommendedXmx,
             long estimatedDiskBytes,
+            long estimatedTightHeapBytes,
             String banner
     ) {}
 
@@ -35,22 +36,33 @@ public final class ResourceEstimator {
         long n = Math.max(1, uniqueObjectCount);
 
         // 1. Memory Calculation (JVM Heap)
-        // - Address-to-ID mapping: 8 bytes per object (SortedAddressToIdMap primitive long[])
-        // - Dominator Tree phase (the peak memory phase):
-        //     * CSR Graph head pointers: (N + 2) * 4 bytes
-        //     * CSR Graph edges: ~2.5 * N * 4 bytes = 10 * N bytes
-        //     * Lengauer-Tarjan scratch arrays (semi, idom, ancestor, label, dfs/vertex): 5 * N * 4 bytes = 20 * N bytes
-        //     * Retained sizes: N * 8 bytes
-        //     * Class & String descriptors + DFS stack: ~50 MB
-        // Total algorithm footprint: N * (8 + 4 + 10 + 20 + 8) = N * 50 bytes + 50 MB
-        long baseHeapBytes = (n * 50L) + (50L * 1024 * 1024);
+        // Pass 2 stays the peak phase. Per object: sorted addresses 8 B, bucket table 4 B, object columns 20 B,
+        // edge start pointers 4 B, membership bitsets ~0.25 B, plus about 4 B per stored outbound reference
+        // (~2-4 references per object on real dumps) and a ~50 MB fixed baseline (strings, class records, roots,
+        // JVM overhead). The dominator phase reuses the heap the edge log leaves behind and its scratch arrays
+        // (~28 B/object) stay below the Pass 2 footprint on reference-heavy dumps when the inbound CSR is
+        // file-backed, which the engine decides automatically once the reachable counts are known.
+        long avgEdges = Long.getLong("dhp.avg.edges.per.object", 3L);
+        long address = 8L * n;
+        long buckets = 4L * n;
+        long columns = 20L * n;
+        long edgeStart = 4L * n;
+        long bitsets = Math.max(16L * 1024 * 1024, n / 4);
+        long misc = 50L * 1024 * 1024;
+        long edgeLog = 4L * Math.max(1, avgEdges) * n;
+
+        long fastHeapBytes = address + buckets + columns + edgeStart + bitsets + misc + edgeLog;
+        long tightHeapBytes = address + buckets + edgeStart + bitsets + misc + edgeLog;
 
         // Add 35% safety margin for JVM runtime overhead, thread stacks, and G1 GC regions
-        long estimatedPeakHeapBytes = (long) (baseHeapBytes * 1.35);
+        long estimatedPeakHeapBytes = (long) (fastHeapBytes * 1.35);
+        long estimatedTightHeapBytes = (long) (tightHeapBytes * 1.35);
 
         // Recommended -Xmx rounded up to nearest sensible power/gigabyte boundary
         long recommendedMinHeapBytes = roundUpHeap(estimatedPeakHeapBytes);
         String recommendedXmx = formatXmx(recommendedMinHeapBytes);
+        long recommendedTightXmx = roundUpHeap(estimatedTightHeapBytes);
+        String recommendedTight = formatXmx(recommendedTightXmx);
 
         // 2. Disk Space Calculation (SQLite chunked blob store, measured: ~113 bytes per object at ~2.5 edges/object)
         // - object columns (address, class, size, file position, flags): ~28 bytes
@@ -62,7 +74,7 @@ public final class ResourceEstimator {
         long estimatedDiskBytes = baseDiskBytes;
 
         String banner = buildBanner(hprofSizeBytes, uniqueObjectCount, classCount, gcRootCount,
-                estimatedPeakHeapBytes, recommendedXmx, estimatedDiskBytes);
+                estimatedPeakHeapBytes, recommendedXmx, estimatedTightHeapBytes, recommendedTight, estimatedDiskBytes);
 
         return new ResourceEstimate(
                 hprofSizeBytes,
@@ -73,6 +85,7 @@ public final class ResourceEstimator {
                 recommendedMinHeapBytes,
                 recommendedXmx,
                 estimatedDiskBytes,
+                estimatedTightHeapBytes,
                 banner
         );
     }
@@ -109,7 +122,8 @@ public final class ResourceEstimator {
     }
 
     private static String buildBanner(long hprofSizeBytes, int uniqueObjectCount, int classCount, int gcRootCount,
-                                      long estimatedPeakHeap, String recommendedXmx, long estimatedDisk) {
+                                      long estimatedPeakHeap, String recommendedXmx,
+                                      long estimatedTightHeap, String recommendedTight, long estimatedDisk) {
         StringBuilder sb = new StringBuilder();
         String line = "********************************************************************************";
         sb.append(line).append("\n");
@@ -120,8 +134,10 @@ public final class ResourceEstimator {
         sb.append(String.format("* Discovered GC Roots:      %,d\n", gcRootCount));
         sb.append(String.format("* HPROF Dump File Size:     %s\n", formatSize(hprofSizeBytes)));
         sb.append("*\n");
-        sb.append(String.format("* Estimated Peak JVM Heap:  %s\n", formatSize(estimatedPeakHeap)));
+        sb.append(String.format("* Estimated Peak JVM Heap:  %s (all structures in heap)\n", formatSize(estimatedPeakHeap)));
         sb.append(String.format("* RECOMMENDED MINIMUM HEAP: %s (with 35%% safety headroom)\n", recommendedXmx));
+        sb.append(String.format("* In TIGHT mode:            %s -> %s (cold columns in temp files, auto-selected)\n",
+                formatSize(estimatedTightHeap), recommendedTight));
         sb.append(String.format("* RECOMMENDED FREE DISK:    %s (chunked database)\n", formatSize(estimatedDisk)));
         sb.append(line);
         return sb.toString();

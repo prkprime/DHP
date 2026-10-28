@@ -24,7 +24,7 @@
         <junit.jupiter.version>5.10.2</junit.jupiter.version>
         <assertj.version>3.25.3</assertj.version>
         <picocli.version>4.7.5</picocli.version>
-        <sqlite.jdbc.version>3.45.2.0</sqlite.jdbc.version>
+        <sqlite.jdbc.version>3.53.2.0</sqlite.jdbc.version>
         <postgresql.version>42.7.3</postgresql.version>
         <hikari.version>5.1.0</hikari.version>
         <slf4j.version>2.0.12</slf4j.version>

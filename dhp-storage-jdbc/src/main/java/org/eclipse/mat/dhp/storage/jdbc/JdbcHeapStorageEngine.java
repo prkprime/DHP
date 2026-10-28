@@ -947,8 +947,16 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
         log.info("Persisted {} outbound references ({} ms)", g.edgeCount(), System.currentTimeMillis() - t0);
     }
 
-    @Override
     public synchronized void saveInboundEdges(int[] head, int[] to, int n, int ignored) throws SQLException {
+        saveInboundEdgesFrom(head, i -> to[i], n, ignored);
+    }
+
+    /**
+     * Same as {@link #saveInboundEdges(int[], int[], int, int)} but reads the edge targets through a function, which
+     * lets the caller keep the CSR in a memory-mapped temp file instead of a heap array.
+     */
+    @Override
+    public synchronized void saveInboundEdgesFrom(int[] head, java.util.function.IntUnaryOperator toAt, int n, int ignored) throws SQLException {
         long t0 = System.currentTimeMillis();
         int[][] holder = {new int[256]};
         writeEdgeChunks(n, K_IN, K_IN_HUGE, id -> {
@@ -957,13 +965,14 @@ public class JdbcHeapStorageEngine implements HeapStorageEngine {
             if (buf.length < e - s) buf = holder[0] = new int[Math.max(e - s, buf.length * 2)];
             int len = 0;
             for (int i = s; i < e; i++) {
-                if (to[i] != ignored) buf[len++] = to[i];
+                int t = toAt.applyAsInt(i);
+                if (t != ignored) buf[len++] = t;
             }
             return buf;
         }, id -> {
             int len = 0;
             for (int i = head[id], e = head[id + 1]; i < e; i++) {
-                if (to[i] != ignored) len++;
+                if (toAt.applyAsInt(i) != ignored) len++;
             }
             return len;
         });
